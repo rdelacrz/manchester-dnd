@@ -1,0 +1,17 @@
+[package]
+name = "manchester-dnd-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+leptos = { workspace = true, features = ["ssr"] }
+leptos_axum.workspace = true
+manchester-dnd-app = { path = "../app", default-features = false, features = ["ssr"] }
+manchester-dnd-server.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

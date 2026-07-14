@@ -105,6 +105,140 @@ pub enum RepositoryError {
 }
 
 #[derive(Debug, Error)]
+pub enum ApplicationError {
+    #[error("hosted gameplay access is not enabled")]
+    HostedAccessDenied,
+    #[error("exploration command failed validation")]
+    InvalidCommand(#[source] manchester_dnd_core::GameCoreError),
+    #[error("exploration outcome failed validation")]
+    InvalidOutcome(#[source] manchester_dnd_core::GameCoreError),
+    #[error("rules resolution failed")]
+    Rules(#[source] manchester_dnd_core::GameCoreError),
+    #[error("the requested campaign is not the local campaign")]
+    WrongCampaign,
+    #[error("the requested character is not the local hero")]
+    WrongCharacter,
+    #[error("exploration action is not available")]
+    UnknownAction(String),
+    #[error("the campaign is already completed")]
+    CampaignCompleted,
+    #[error("campaign revision conflict: expected {expected}, current revision {current_revision}")]
+    RevisionConflict {
+        expected: u64,
+        current_revision: u64,
+    },
+    #[error("idempotency key was already used for a different command")]
+    IdempotencyConflict,
+    #[error("could not serialize the public command response")]
+    Serialization(#[source] serde_json::Error),
+    #[error("stored command response is invalid")]
+    StoredResponse(#[source] serde_json::Error),
+    #[error("stored local campaign state is inconsistent")]
+    InvalidStoredState,
+    #[error("application persistence operation failed")]
+    Repository(#[source] RepositoryError),
+}
+
+impl ApplicationError {
+    /// Stable code safe to expose to an untrusted browser.
+    pub const fn public_code(&self) -> &'static str {
+        match self {
+            Self::HostedAccessDenied => "hosted_access_denied",
+            Self::InvalidCommand(_) => "invalid_command",
+            Self::WrongCampaign => "campaign_not_found",
+            Self::WrongCharacter => "character_not_found",
+            Self::UnknownAction(_) => "unknown_action",
+            Self::CampaignCompleted => "campaign_completed",
+            Self::RevisionConflict { .. } => "revision_conflict",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::InvalidOutcome(_)
+            | Self::Rules(_)
+            | Self::Serialization(_)
+            | Self::StoredResponse(_)
+            | Self::InvalidStoredState
+            | Self::Repository(_) => "internal_error",
+        }
+    }
+
+    /// Deliberately omits repository, JSON, and rules-engine source details.
+    pub const fn safe_message(&self) -> &'static str {
+        match self {
+            Self::HostedAccessDenied => {
+                "Hosted gameplay is unavailable until authentication is configured."
+            }
+            Self::InvalidCommand(_) => "The exploration command is invalid.",
+            Self::WrongCampaign => "The local campaign could not be found.",
+            Self::WrongCharacter => "The selected character is not available.",
+            Self::UnknownAction(_) => "That exploration action is not available.",
+            Self::CampaignCompleted => "This campaign has already ended.",
+            Self::RevisionConflict { .. } => {
+                "The campaign changed; reload it before trying another action."
+            }
+            Self::IdempotencyConflict => {
+                "This request key was already used for a different action."
+            }
+            Self::InvalidOutcome(_)
+            | Self::Rules(_)
+            | Self::Serialization(_)
+            | Self::StoredResponse(_)
+            | Self::InvalidStoredState
+            | Self::Repository(_) => "The game service is temporarily unavailable.",
+        }
+    }
+
+    pub const fn retryable(&self) -> bool {
+        // Revision conflicts have a defined recovery path: reload the current
+        // view. Internal validation/corruption failures are deterministic, and
+        // repository errors are not retryable until their SQLite code has been
+        // explicitly classified as transient.
+        matches!(self, Self::RevisionConflict { .. })
+    }
+
+    pub const fn current_revision(&self) -> Option<u64> {
+        match self {
+            Self::RevisionConflict {
+                current_revision, ..
+            } => Some(*current_revision),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod application_error_tests {
+    use super::*;
+
+    #[test]
+    fn public_mapping_never_exposes_persistence_details() {
+        let error = ApplicationError::Repository(RepositoryError::NotFound {
+            entity: "campaign session",
+            id: "private-campaign-id".to_owned(),
+        });
+
+        assert_eq!(error.public_code(), "internal_error");
+        assert_eq!(
+            error.safe_message(),
+            "The game service is temporarily unavailable."
+        );
+        assert!(!error.safe_message().contains("private-campaign-id"));
+        assert!(!error.retryable());
+        assert_eq!(error.current_revision(), None);
+    }
+
+    #[test]
+    fn revision_conflict_exposes_only_the_current_revision() {
+        let error = ApplicationError::RevisionConflict {
+            expected: 3,
+            current_revision: 4,
+        };
+
+        assert_eq!(error.public_code(), "revision_conflict");
+        assert_eq!(error.current_revision(), Some(4));
+        assert!(error.retryable());
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum EventPromptError {
     #[error("could not read event prompt path {path}")]
     Io {

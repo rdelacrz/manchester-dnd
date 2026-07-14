@@ -20,7 +20,7 @@ The desired feel is a fast, readable tabletop session rather than an unrestricte
 MVP is a single campaign owner controlling one hero in turn-based play, with one supported rules/content profile: `srd-5.1-cc`. It includes:
 
 - Leptos 0.8 full-stack web UI with server-side rendering and hydration;
-- server-authoritative accounts or an explicit single-user deployment mode;
+- an explicit loopback-only local single-user first deployment; authenticated hosted accounts are a later deployment mode;
 - themed, rules-valid level-1 character creation using at least two original packs;
 - d20 tests, dice expressions, ability modifiers, proficiency, advantage/disadvantage, armor class, hit points, initiative, movement, core turn economy, attacks, damage, healing, rests, and a deliberately documented condition subset;
 - one complete encounter loop and exploration/social checks;

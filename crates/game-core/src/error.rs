@@ -49,6 +49,18 @@ pub enum GameCoreError {
     #[error("invalid campaign session: {reason}")]
     InvalidSession { reason: &'static str },
 
+    #[error("invalid exploration-check command: {reason}")]
+    InvalidExplorationCheckCommand { reason: &'static str },
+
+    #[error("invalid exploration-check outcome: {reason}")]
+    InvalidExplorationCheckOutcome { reason: &'static str },
+
+    #[error("invalid local campaign view: {reason}")]
+    InvalidLocalCampaignView { reason: &'static str },
+
+    #[error("invalid ability-check result: {reason}")]
+    InvalidAbilityCheckResult { reason: &'static str },
+
     #[error("field `{field}` exceeds its {maximum}-character limit")]
     TextFieldTooLong { field: &'static str, maximum: usize },
 

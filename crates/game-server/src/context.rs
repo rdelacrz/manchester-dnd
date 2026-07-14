@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
+    application::GameApplicationService,
     config::AppConfig,
-    error::BootstrapError,
+    error::{ApplicationError, BootstrapError},
     events::{EventPrompt, EventPromptLoader},
     generation::{GenerationProviders, ImageGenerator, TextGenerator},
     gm::GameMasterService,
@@ -13,7 +14,7 @@ use crate::{
 #[derive(Clone)]
 pub struct ServerContext {
     pub config: Arc<AppConfig>,
-    pub repository: SqliteRepository,
+    pub application: GameApplicationService,
     pub text_generator: Arc<dyn TextGenerator>,
     pub image_generator: Arc<dyn ImageGenerator>,
     pub game_master: GameMasterService,
@@ -26,18 +27,24 @@ impl ServerContext {
     }
 
     pub async fn from_config(config: AppConfig) -> Result<Self, BootstrapError> {
+        config.validate_access_mode()?;
         let repository = SqliteRepository::connect(&config.database_url).await?;
         let providers = GenerationProviders::from_profiles(&config.text_llm, &config.image_llm)?;
         let event_prompts = EventPromptLoader.load_dir(&config.event_prompts_dir)?;
         let game_master = GameMasterService::new(providers.text.clone());
+        let application = GameApplicationService::new(config.access_mode, repository);
 
         Ok(Self {
             config: Arc::new(config),
-            repository,
+            application,
             text_generator: providers.text,
             image_generator: providers.image,
             game_master,
             event_prompts: Arc::new(event_prompts),
         })
+    }
+
+    pub async fn health_check(&self) -> Result<(), ApplicationError> {
+        self.application.health_check().await
     }
 }

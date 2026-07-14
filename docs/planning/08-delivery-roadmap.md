@@ -6,6 +6,8 @@ Build vertical slices that can be demonstrated through the real Leptos UI, serve
 
 The sequence below is dependency order, not a calendar estimate. Slices 0–7 together are MVP. The repository already contains part of Slice 0 and a d20 demonstration: the `app`/`frontend`/`server` Leptos workspace, `game-core`/`game-server` crates, SQLite migration/repository, typed LLM profiles, rules types, and server-authoritative demo check. “Deliver” below includes finishing and proving that baseline, not rebuilding it under speculative crate names.
 
+Progress as of 2026-07-14: the walking skeleton now has explicit loopback-only local mode, redacted application errors, liveness/readiness probes, and a persisted Slice 1A exploration command. This does not mark all Slice 0 acceptance criteria complete: browser/hydration manual evidence, CI/artifact secret scanning, broader request limits, and the eventual authenticated hosted boundary remain release work.
+
 ## Slice 0 — Full-stack walking skeleton
 
 **Player value:** the real web application loads reliably and reports actionable configuration/service errors.
@@ -30,6 +32,8 @@ Acceptance:
 ## Slice 1 — One deterministic playable encounter
 
 **Player value:** choose an action, see a real roll and explanation, finish a small encounter, reload it.
+
+**Implemented Slice 1A:** the local page lazily creates/resumes a fixed level-1 hero; `inspect-viaduct-runes` resolves as a server-owned Wisdom (proficient) DC 13 check; a strict command cannot carry mechanics; revision, `AbilityCheckResolved` audit, and idempotency receipt commit atomically; matching retries do not reroll; reload projects the stored result. Initiative, creature state, movement/action turn enforcement, attack/damage, HP mutation, encounter completion, pinned RNG stream/cursor, and authored consequence state remain pending below.
 
 Deliver:
 

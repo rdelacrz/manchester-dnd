@@ -8,7 +8,7 @@ SRD 5.2.1 represents revised rules and terminology published later. It is not an
 
 ## Target authority split
 
-The current foundation implements ability modifiers, validated d20 checks/attacks, action-resource accounting, XP thresholds, numeric level derivation, and an atomic audited XP update. Saving throws, damage, conditions, initiative, equipment, spells, and level-feature choices in the matrix below remain planned engine work; the AI must not simulate them as if they were implemented.
+The current foundation implements ability modifiers, validated d20 checks/attacks, action-resource accounting, XP thresholds, numeric level derivation, and an atomic audited XP update. Slice 1A additionally exposes one persisted authored check: `inspect-viaduct-runes` is Wisdom, proficient, DC 13, with normal roll mode and no situational modifier. Saving throws, damage, conditions, initiative, playable combat, equipment, spells, HP mutation, and level-feature choices in the matrix below remain planned engine work; the AI and UI must not simulate them as if they were implemented.
 
 | Deterministic Rust engine | AI GM |
 | --- | --- |
@@ -32,22 +32,26 @@ resolve(state, validated_command, rng_cursor, ruleset_version)
 
 No wall clock, database, network, model, OS randomness, or UI state is read inside resolution. Commands are intent (`Attack`, `AttemptCheck`, `Move`, `EndTurn`, `TakeRest`, `ChooseLevelFeature`); resolution facts include outcomes such as `AttackResolved`, `DamageApplied`, and `TurnEnded`. MVP writes the resulting authoritative state to revisioned documents and the facts to a turn audit. A later complete event stream may derive state from ordered facts only after equivalence tests prove coverage.
 
+The implemented concrete command is `AttemptExplorationCheckCommand`. Its strict shared schema contains only schema version, campaign/character/action IDs, expected revision, and idempotency key; unknown fields and attempts to submit mechanics are rejected. `GameApplicationService`, outside the pure rules crate, chooses the authored `AbilityCheck`, supplies dice and time, assigns `EventActor::System`, and persists the validated result as `AbilityCheckResolved`. Browser reload reconstructs the latest check from that audit and never rolls again.
+
 Each explanation item identifies a rule key, inputs, modifiers, and result without reproducing long rules prose. This powers a player-facing “why?” panel and conformance tests.
 
 ## Dice and auditability
 
 - Parse a bounded grammar such as `NdS`, optional keep/drop, and signed constants only when a supported mechanic requires it. Reject zero/oversized counts, sides, arithmetic overflow, and unbounded expressions.
-- The server initializes a campaign/encounter RNG from an operating-system CSPRNG. Resolution uses a pinned deterministic PRNG algorithm; algorithm ID, seed material or verifiable seed reference, and cursor are versioned and persisted according to the campaign's visibility policy.
+- The target server initializes a campaign/encounter RNG from an operating-system CSPRNG. Resolution will use a pinned deterministic PRNG algorithm; algorithm ID, seed material or verifiable seed reference, and cursor remain pending persistence work.
 - A `RollRecord` contains roll ID, expression, individual dice, kept dice, modifier components, total, roll purpose, actor/target IDs, advantage state, ruleset version, and RNG cursor range.
 - Clients submit “roll this check,” never dice values. Animation visualizes the committed record.
 - Advantage and disadvantage follow the profile's cancellation/stacking behavior. Attack-roll natural 20/natural 1 handling is distinct from generic ability checks; do not generalize critical rules to all d20 tests.
 - Displaying or rechecking a historic turn consumes no new randomness. A correction writes a new state revision/audit; it never edits a historic roll.
 
+Slice 1A currently records the selected d20, roll mode, ability/proficiency/situational modifiers, DC, total, and success in `AbilityCheckResolved`. It does not yet implement the general dice-expression grammar, pinned PRNG/cursor record, initiative, attack/damage sequence, or HP transitions described by the target above.
+
 A future competitive multiplayer mode can add seed commitment/reveal. It is not an MVP security claim.
 
 ## MVP coverage matrix
 
-“MVP” means implemented, tested, and surfaced in the UI. “Later” is not delegated to the AI.
+This matrix is the MVP target. A row counts as delivered only when it is implemented, tested, and surfaced in the UI; “Later” is not delegated to the AI. At present, only the Slice 1A ability-check path is playable end to end—initiative, combat, damage, and HP mutation are still pending.
 
 | Area | MVP | Later expansion |
 | --- | --- | --- |

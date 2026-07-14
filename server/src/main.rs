@@ -1,4 +1,16 @@
-use axum::Router;
+#![recursion_limit = "256"]
+
+use axum::{
+    Router,
+    extract::Request,
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_SECURITY_POLICY, X_FRAME_OPTIONS},
+    },
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list};
 use manchester_dnd_app::{App, shell};
@@ -18,8 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let configuration = get_configuration(None)?;
+    // Cargo Leptos provides these values as environment variables. Falling
+    // back to workspace metadata also keeps a direct `cargo run` usable.
+    let configuration = get_configuration(Some("Cargo.toml"))?;
     let address = configuration.leptos_options.site_addr;
+    app_config.validate_bind_address(address)?;
     let leptos_options = configuration.leptos_options;
     let routes = generate_route_list(App);
     let server_context = ServerContext::from_config(app_config).await?;
@@ -29,7 +44,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "server dependencies initialized"
     );
 
+    let readiness_context = server_context.clone();
     let router = Router::new()
+        .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
+        .route(
+            "/health/ready",
+            get(move || {
+                let context = readiness_context.clone();
+                async move {
+                    match context.health_check().await {
+                        Ok(()) => StatusCode::NO_CONTENT,
+                        Err(error) => {
+                            tracing::warn!(
+                                code = error.public_code(),
+                                "readiness database check failed"
+                            );
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    }
+                }
+            }),
+        )
         .leptos_routes_with_context(
             &leptos_options,
             routes,
@@ -45,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(leptos_axum::file_and_error_handler(shell))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(deny_framing))
         .with_state(leptos_options);
 
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -52,4 +88,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, router.into_make_service()).await?;
 
     Ok(())
+}
+
+async fn deny_framing(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    add_anti_framing_headers(response.headers_mut());
+    response
+}
+
+fn add_anti_framing_headers(headers: &mut HeaderMap) {
+    // A hostile website must not be able to frame the loopback UI and trick a
+    // player into issuing a same-origin command through clickjacking.
+    headers.append(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_responses_deny_framing() {
+        let mut headers = HeaderMap::new();
+
+        add_anti_framing_headers(&mut headers);
+
+        assert_eq!(
+            headers.get(CONTENT_SECURITY_POLICY),
+            Some(&HeaderValue::from_static("frame-ancestors 'none'"))
+        );
+        assert_eq!(
+            headers.get(X_FRAME_OPTIONS),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+    }
 }

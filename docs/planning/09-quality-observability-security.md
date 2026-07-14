@@ -24,6 +24,8 @@ Correctness is layered: mechanical outcomes must be exact and replayable; model 
 
 Do not assert exact creative prose from a live model in normal CI. Model promotion evaluations run on synthetic/non-private fixtures with schema validity, factual consistency, safety/privacy, latency, and cost thresholds. Keep provider-contract smoke tests opt-in and budgeted.
 
+Current Slice 1A evidence covers strict command/result decoding, tamper rejection, deterministic injected rolls, same-key replay without reroll, concurrent in-process duplicates, changed-key conflicts, stale revisions, transaction rollback, exact stored-result reload, safe error mapping, and loopback Origin/Host checks. Live smoke verification also exercises both health endpoints and commit/reload over HTTP. This is not yet the browser-E2E, process-restart, cross-tenant, rate-limit, body-limit, or pinned-RNG evidence required by the target portfolio.
+
 ### Rules traceability
 
 Maintain a machine-readable matrix:
@@ -75,6 +77,8 @@ Expected adversaries include an unauthenticated internet client, a malicious cam
 ### Controls by boundary
 
 **Browser and HTTP**
+
+The current local boundary is intentionally narrower than the hosted controls below: the binary binds to loopback, responses set CSP `frame-ancestors 'none'` plus `X-Frame-Options: DENY`, both game functions require matching loopback HTTP Host/Origin, and hosted mode fails startup. These browser controls are not authentication and do not defend against another process on the same machine; cookies, user identity, object authorization, CSRF tokens, and remote exposure remain unimplemented.
 
 - Secure, HttpOnly, SameSite cookies; rotation/revocation; short appropriate lifetimes; TLS and strict transport policy.
 - Authentication plus object-level authorization inside every server function; deny by default and test cross-campaign IDs.

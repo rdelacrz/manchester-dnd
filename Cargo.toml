@@ -58,14 +58,15 @@ panic = "abort"
 
 [[workspace.metadata.leptos]]
 name = "manchester-arcana"
+output-name = "manchester-arcana"
 bin-package = "manchester-dnd-web"
 lib-package = "manchester-dnd-frontend"
 site-root = "target/site"
 site-pkg-dir = "pkg"
 style-file = "style/main.css"
 assets-dir = "public"
-site-addr = "127.0.0.1:3000"
-reload-port = 3001
+site-addr = "127.0.0.1:6789"
+reload-port = 7000
 browserquery = "defaults"
 bin-features = []
 bin-default-features = false

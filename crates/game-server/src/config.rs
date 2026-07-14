@@ -1,5 +1,6 @@
 use std::{
     env, fmt,
+    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -14,6 +15,24 @@ const DEFAULT_EVENT_PROMPTS_DIR: &str = "prompts/events/private";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
 const MAX_OUTPUT_TOKENS: u32 = 128_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    LocalSingleUser,
+    Hosted,
+}
+
+impl FromStr for AccessMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" | "local-single-user" | "local_single_user" => Ok(Self::LocalSingleUser),
+            "hosted" => Ok(Self::Hosted),
+            _ => Err("expected local or hosted".to_owned()),
+        }
+    }
+}
 
 /// A secret whose `Debug` and `Display` implementations never reveal its value.
 #[derive(Clone, PartialEq, Eq)]
@@ -202,6 +221,7 @@ impl LlmProfile {
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub access_mode: AccessMode,
     pub database_url: String,
     pub event_prompts_dir: PathBuf,
     pub text_llm: LlmProfile,
@@ -245,6 +265,14 @@ impl AppConfig {
     }
 
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let access_mode = get("APP_ACCESS_MODE")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "local".to_owned())
+            .parse()
+            .map_err(|reason| ConfigError::InvalidValue {
+                name: "APP_ACCESS_MODE",
+                reason,
+            })?;
         let database_url = get("DATABASE_URL")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_DATABASE_URL.to_owned());
@@ -264,11 +292,40 @@ impl AppConfig {
         let image_llm = LlmProfile::from_lookup("image", "IMAGE_LLM", &mut get)?;
 
         Ok(Self {
+            access_mode,
             database_url,
             event_prompts_dir,
             text_llm,
             image_llm,
         })
+    }
+
+    /// Local single-user mode is an explicit deployment boundary, not an
+    /// authentication substitute. Refuse to expose it on a non-loopback bind.
+    pub fn validate_bind_address(&self, address: SocketAddr) -> Result<(), ConfigError> {
+        self.validate_access_mode()?;
+        match self.access_mode {
+            AccessMode::LocalSingleUser if !address.ip().is_loopback() => {
+                return Err(ConfigError::InvalidValue {
+                    name: "LEPTOS_SITE_ADDR",
+                    reason: "local access mode must bind to a loopback address".to_owned(),
+                });
+            }
+            AccessMode::LocalSingleUser | AccessMode::Hosted => {}
+        }
+        Ok(())
+    }
+
+    pub fn validate_access_mode(&self) -> Result<(), ConfigError> {
+        if self.access_mode == AccessMode::Hosted {
+            return Err(ConfigError::InvalidValue {
+                name: "APP_ACCESS_MODE",
+                reason:
+                    "hosted mode is unavailable until authenticated browser sessions are implemented"
+                        .to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -375,8 +432,44 @@ mod tests {
     fn disabled_profiles_need_no_provider_values() {
         let config = AppConfig::from_lookup(|_| None).expect("defaults should be valid");
 
+        assert_eq!(config.access_mode, AccessMode::LocalSingleUser);
         assert_eq!(config.text_llm.backend, LlmBackend::Disabled);
         assert_eq!(config.image_llm.backend, LlmBackend::Disabled);
+    }
+
+    #[test]
+    fn local_mode_requires_a_loopback_bind() {
+        let config = AppConfig::from_lookup(|_| None).expect("defaults should be valid");
+
+        assert!(
+            config
+                .validate_bind_address("127.0.0.1:6789".parse().unwrap())
+                .is_ok()
+        );
+        assert!(
+            config
+                .validate_bind_address("0.0.0.0:6789".parse().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hosted_mode_fails_closed_until_authentication_exists() {
+        let values = HashMap::from([("APP_ACCESS_MODE", "hosted")]);
+        let config = AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string))
+            .expect("hosted mode should parse");
+
+        assert_eq!(config.access_mode, AccessMode::Hosted);
+        assert!(
+            config
+                .validate_bind_address("0.0.0.0:6789".parse().unwrap())
+                .is_err()
+        );
+        assert!(
+            config
+                .validate_bind_address("127.0.0.1:6789".parse().unwrap())
+                .is_err()
+        );
     }
 
     #[test]

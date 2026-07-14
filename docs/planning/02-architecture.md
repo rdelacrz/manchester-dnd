@@ -10,8 +10,8 @@ frontend/            browser/WASM hydration entry point
 server/              Axum SSR binary and static-file integration
 crates/game-core/    framework-independent rules, characters, dice, progression,
                      session DTOs, and declarative AI-GM proposals
-crates/game-server/  server-only configuration, generation, GM orchestration,
-                     event prompts, SQLite repositories, and boundary errors
+crates/game-server/  server-only application orchestration, configuration,
+                     generation, GM, event prompts, SQLite, and boundary errors
 content/             approved versioned rules/content sources
 prompts/             system, theme, and private-event prompt roots
 migrations/          SQLite migrations
@@ -24,20 +24,21 @@ As complexity grows, split feature modules inside these crates before creating m
 
 ## MVP request and turn flow
 
-The current roll demonstration covers browser → Leptos server function → injected server dice → `game-core`. MVP extends that real vertical path as follows; repository, GM service, and configuration modules existing in isolation do not count as wired until this flow is exercised end to end.
+Slice 1A exercises the real persisted path end to end for one authored exploration action:
 
 ```text
-Browser intent
-  → Leptos server function (a public HTTP API)
-  → game-server authorization/local-mode policy and orchestration
-  → optional typed AI intent proposal
-  → game-core validation/resolution using server-supplied dice
-  → revision-checked SQLite save + append-only turn audit
-  → optional saved narration/image generation record
-  → authorized DTO returned to the hydrated UI
+Browser command: campaign/character/action IDs + expected revision + idempotency key
+  → Leptos server function + loopback HTTP Host/Origin gate
+  → GameApplicationService selects trusted rules, actor, time, and dice
+  → game-core validates/resolves the authored ability check
+  → one SQLite transaction advances the session and appends
+    AbilityCheckResolved audit + command receipt
+  → public outcome DTO returned to the hydrated UI
 ```
 
-The current persistence layer atomically creates a campaign with its declared party, atomically commits audited session/XP-character revisions, and stores ordered turn and generated-asset audits. MVP should preserve that working path while adding command idempotency, additional typed mechanical transitions, richer audit records, and durable generation jobs. An append-only domain-event stream and snapshots are an evolution path described in [persistence](05-persistence.md), not a description of today's database.
+`AttemptExplorationCheckCommand` is a strict shared DTO and denies unknown fields. It contains no ability, proficiency, DC, modifier, roll, or success value. `GameApplicationService` maps the sole supported action ID to trusted rules and owns dice, time, audit identity, and the system event actor. The broader flow still needs optional typed AI proposals, combat commands, and saved presentation generation; those are not part of Slice 1A.
+
+The current persistence layer atomically creates a campaign with its declared party, commits audited session/XP-character revisions, and stores ordered turn, generated-asset, and command-receipt records. For the exploration command, the session revision, `AbilityCheckResolved` audit, and bounded response receipt commit together. A matching retry replays the stored response without consuming dice; reuse of the key for a different request fails closed. An append-only domain-event stream and snapshots are an evolution path described in [persistence](05-persistence.md), not a description of today's database.
 
 Only validated `game-core` results may update an authoritative campaign document. Generation can interpret a free-form intent before resolution or present committed facts afterward, but raw model output never becomes trusted state.
 
@@ -76,6 +77,8 @@ Leptos [server functions](https://book.leptos.dev/server/25_server_functions.htm
 
 Mutation DTOs should carry `campaign_session_id`, `expected_revision`, and `idempotency_key`. Revision mismatch returns a conflict plus the newest safe view. Image generation returns a durable job ID once the jobs addition lands rather than holding an HTTP request open.
 
+The implemented first-deployment boundary is narrower than hosted authentication. `APP_ACCESS_MODE=local` requires a loopback bind, all responses deny browser framing, and the current campaign load/mutation functions require an `http` Origin whose loopback authority exactly matches `Host`; missing, HTTPS, remote, or mismatched authorities are rejected. This is a local single-user boundary, not multi-user authorization. `APP_ACCESS_MODE=hosted` fails startup until authenticated browser sessions and campaign authorization are implemented.
+
 ## Runtime configuration
 
 `game-server::AppConfig::load` implements `dotenvy` loading: `APP_ENV_FILE` selects an explicit file; otherwise the nearest `.env` is optional, and existing process variables retain precedence. The Axum startup must call and provide this config before repository/provider/prompt services are used; defining the loader alone is not sufficient wiring. Production injects environment variables and does not require/copy a secret `.env` file.
@@ -83,7 +86,7 @@ Mutation DTOs should carry `campaign_session_id`, `expected_revision`, and `idem
 Implemented profile names are:
 
 ```text
-APP_ENV_FILE, RUST_LOG
+APP_ENV_FILE, APP_ACCESS_MODE, RUST_LOG
 DATABASE_URL, EVENT_PROMPT_DIR
 
 TEXT_LLM_BACKEND, TEXT_LLM_BASE_URL, TEXT_LLM_API_KEY, TEXT_LLM_MODEL
@@ -95,6 +98,8 @@ IMAGE_LLM_TIMEOUT_SECONDS, IMAGE_LLM_SIZE
 
 `TEXT_LLM_*` and `IMAGE_LLM_*` are independent so text and image use different backends/models. MVP accepts the implemented `disabled` and `openai-compatible` backends; disabled is the safe local default. Validate URLs, timeouts, temperature/token bounds, model requirements, SQLite URLs, and prompt roots at startup. Store a non-secret profile fingerprint with retained output.
 
+`APP_ACCESS_MODE` defaults to `local`. Startup accepts local mode only on a loopback `LEPTOS_SITE_ADDR`; selecting `hosted` currently produces a field-specific startup error regardless of bind address. This fail-closed behavior prevents an unauthenticated local build from being exposed as if it were hosted.
+
 Commit `.env.example` with safe disabled/dummy values; ignore `.env*` secrets. Secret wrappers redact `Debug`/`Display`. Configuration changes take effect after restart in MVP. Audited hot routing among pre-approved configurations is later work.
 
 See [`dotenvy`](https://docs.rs/dotenvy/latest/dotenvy/) for runtime-loading behavior.
@@ -105,7 +110,7 @@ Use [`thiserror`](https://docs.rs/thiserror/latest/thiserror/) for typed boundar
 
 - core rules/state errors for invalid scores, levels, actions, targets, transitions, or unsupported mechanics;
 - `ConfigError`, `EventPromptError`, `GenerationError`, `GameMasterError`, and `RepositoryError` in `game-server`;
-- an application/transport mapping with safe code, retryability, and correlation ID.
+- implemented `ApplicationError` mapping with safe code, retryability, optional current revision, and transport correlation ID.
 
 Preserve causal sources internally with `#[source]`/`#[from]`. Client messages must not contain SQL, local paths, prompt text, credentials, provider bodies, or somebody else's identifiers. Expected errors render inline; unexpected failures return a correlation ID and structured redacted log.
 
@@ -117,9 +122,14 @@ Provider adapters receive only minimized approved DTOs and cannot access reposit
 
 ## Persistence and deployment evolution
 
-- **Current/MVP:** one Axum/Leptos server binary; SQLite database at `DATABASE_URL`; local protected prompt directory; local/static assets; optional worker loop in the same deployment when durable jobs arrive.
+- **Current first deployment:** one loopback-only Axum/Leptos server in explicit local single-user mode; SQLite database at `DATABASE_URL`; local protected prompt directory; local/static assets. Hosted mode is disabled at startup until authentication exists.
+- **MVP evolution:** optional worker loop in the same deployment when durable jobs arrive, followed by an authenticated hosted mode only after its security gates pass.
 - **Hosted MVP hardening:** single-writer-aware transactions, WAL/busy-timeout policy, file permissions, consistent backup/restore, bounded worker concurrency, and persistent volume.
 - **Scale trigger:** measured write contention, multi-instance failover needs, or operational limits justify a planned PostgreSQL migration. Add repository compatibility tests and migration/export tooling first.
 - **Later scale:** independently deploy web/workers and move assets to an authorized object store. Introduce a queue or generation service only after database-job/egress pressure warrants it.
 
 Threat controls are in [quality, observability, and security](09-quality-observability-security.md).
+
+## Operational health
+
+The Axum binary exposes `GET /health/live`, which returns success while the process can serve requests, and `GET /health/ready`, which runs the repository `SELECT 1` check and returns service unavailable when SQLite is not ready. Readiness does not call either model provider and therefore measures the authoritative game path rather than optional generation availability.

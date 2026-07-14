@@ -19,12 +19,12 @@ This register prevents unresolved choices from leaking into code as accidental p
 | ADR-P11 | The 2018 Basic Rules PDF is reference-only; distributable rules expression/data comes from the SRD 5.1 CC edition with attribution. | Provenance/release gates reject unlicensed reference material. |
 | ADR-P12 | MVP is turn-based and has one campaign owner controlling one hero. | Invited multi-player character ownership/concurrency is post-MVP. |
 | ADR-P13 | MVP advancement uses the implemented SRD 5.1 XP thresholds and validated XP awards. | Milestone advancement would be a separately versioned campaign policy later. |
+| ADR-P14 | On 2026-07-14, the first implemented deployment was fixed as explicit local single-user mode. | Bind only to loopback HTTP, enforce matching loopback browser Host/Origin, and fail hosted startup until authenticated sessions and campaign authorization exist; this does not protect against another local process. |
 
 ## Unresolved product and policy questions
 
 | ID | Question | Recommended default | Decide by / owner |
 | --- | --- | --- | --- |
-| Q01 | Is the first deployment local single-user, invite-only hosted, or public registration? | Invite-only hosted if remote access is required; otherwise explicit single-user mode. No public registration. | Slice 0 / Product + Security |
 | Q02 | Which exact browsers, devices, accessibility standard, languages, and time zones are supported? | Current stable Firefox/Chromium/Safari desktop/mobile; WCAG 2.2 AA target; English first; store UTC/display local. | Slice 0 / Product + UI |
 | Q03 | Which ability-score generation method ships? | Fixed licensed SRD 5.1 method for predictable creation; add audited random generation later. | Before Slice 2 / Game design |
 | Q04 | Which SRD 5.1 character options and spell list are fully supported in MVP? | One martial and one spell-using path with levels 1–2, plus a deliberately small spell/equipment set; hide everything else. | Before Slice 1 content model / Game design + Rules |

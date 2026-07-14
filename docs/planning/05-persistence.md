@@ -12,16 +12,16 @@ The implemented persistence model is **revisioned JSON documents plus append-onl
 | `characters` | Independently revisioned character document, optionally linked to a campaign session |
 | `turn_audits` | Ordered append-only turn result/audit payload, unique by campaign session and turn number |
 | `generated_assets` | Text/image artifact audit with provider, model, app-owned relative asset key, canonical SHA-256 prompt fingerprint, typed allowlisted metadata, and an optional same-campaign turn link |
+| `command_receipts` | Bounded stored response and canonical request fingerprint keyed by campaign/idempotency key, linked to its same-campaign turn audit |
 
-SQLite foreign keys, JSON validity checks, revision checks, and indexes are enabled in migrations. `SqliteRepository` atomically creates the initial campaign plus its exact declared character roster, then uses expected-revision compare-and-swap for audited event commits. Preserve these contracts as the schema expands.
+SQLite foreign keys, JSON validity checks, revision checks, and indexes are enabled in migrations. `SqliteRepository` atomically creates the initial campaign plus its exact declared character roster, then uses expected-revision compare-and-swap for audited event commits. Slice 1A atomically writes its session snapshot, `AbilityCheckResolved` audit, and command receipt; a receipt response is valid JSON bounded to 65,536 bytes. Preserve these contracts as the schema expands.
 
 Terminology in current code uses **campaign session** for the durable game. If a later product adds “play sessions” (one sitting within a campaign) and browser authentication sessions, rename/version DTOs carefully rather than using one ambiguous `session` field for all three.
 
 ## MVP additions
 
-Add tables only when a delivered slice uses them. Likely additions are:
+Add tables only when a delivered slice uses them. `command_receipts` is now implemented for the exploration-check path. Remaining likely additions are:
 
-- `command_receipts` for idempotency keys, expected/result revision, and safe response reference;
 - `generation_jobs` and attempts for crash-durable asynchronous text/image work;
 - content-pack/source-version pins and campaign safety/progression settings;
 - consent/eligibility metadata using opaque private-source IDs, never raw Markdown by default;
@@ -34,22 +34,22 @@ Keep normalized, query-critical metadata in columns; keep versioned aggregate st
 
 The current `commit_session_event` baseline atomically advances a validated session snapshot, any XP/level character snapshot, and its immutable audit row. It rejects stale revisions, skipped event sequences, mismatched XP summaries, arbitrary session metadata rewrites, and standalone character/session updates. Other mechanical character transitions must gain a typed event plus transaction validation before they are implemented; they must not reuse the XP path.
 
-The complete playable command loop still needs an application service around that repository transaction implementing this sequence:
+`GameApplicationService` now implements this sequence for the one authored local exploration check. Other gameplay mutations must pass through the same boundary before they are exposed:
 
 For a state-changing turn:
 
 1. authenticate/authorize or enforce declared local mode;
 2. parse any free-form intent against a safe view before acquiring a write lock;
 3. begin a bounded SQLite transaction and reload the campaign/character revisions;
-4. reject a stale `expected_revision`, or return the prior result for an existing idempotency key;
+4. return the prior response for a matching idempotency key before checking the now-stale revision, reject changed reuse of the key, otherwise reject a stale `expected_revision`;
 5. run deterministic `game-core` validation/resolution with server-supplied dice;
 6. serialize canonical validated documents and increment revisions atomically;
 7. insert the immutable turn audit and any post-commit generation job in the same transaction;
 8. commit, then return/notify the browser.
 
-Never hold a SQLite write transaction open during a model/network call. Raw model proposals are revalidated against the locked revision. Narration/image failure cannot roll back a committed mechanical turn.
+The implemented command gate prevents concurrent duplicates from consuming dice twice inside one process, while SQLite uniqueness is the persistence backstop. This is not yet a multi-instance write design. Never hold a SQLite write transaction open during a model/network call. Raw model proposals are revalidated against the locked revision. Narration/image failure cannot roll back a committed mechanical turn.
 
-Use a WAL/synchronous policy selected and documented for the deployment, keep transactions short, and bound pool/worker concurrency. One application deployment should own writes in MVP. “Database is locked” is a retryable bounded error, not a reason to drop or duplicate a turn.
+Use a WAL/synchronous policy selected and documented for the deployment, keep transactions short, and bound pool/worker concurrency. One application deployment should own writes in MVP. SQLite busy/locked classification and bounded retry remain pending in Slice 1A: repository failures currently fail closed and are not advertised as retryable. Before multi-writer use, classify only proven transient SQLite codes and preserve the same idempotency key for bounded retries.
 
 ## Document and audit rules
 
@@ -91,6 +91,8 @@ MVP must provide:
 - a machine-readable canonical export of all restorable MVP documents/audits, excluding credentials and raw private source files;
 - explicit archive/deletion behavior and an operator-tested restore path.
 
+Slice 1A currently proves a narrower path: page load lazily creates or resumes the fixed local campaign, reload reads validated documents plus ordered audits, and the latest stored ability-check dice and outcome are projected without rerolling. It is not full event-sourced reconstruction, campaign export, archive/delete, or a process-restart/browser-E2E claim.
+
 A public/shareable recap is later and must be a separately authorized redacted projection. A private export must not include another person's consent record or source Markdown.
 
 ## SQLite operations and recovery
@@ -99,6 +101,7 @@ A public/shareable recap is later and must be a separately authorized redacted p
 - Use SQLite's supported online backup API or a coordinated checkpoint/backup procedure. Do not assume copying a live WAL database file alone is consistent.
 - Encrypt host/volume backups; document whether application-level encryption is required for particularly sensitive fields.
 - Track migration version, database/WAL size, write latency, busy/locked errors, integrity-check results, backup age, and restore-test result.
+- `GET /health/ready` currently checks pool/query connectivity with `SELECT 1`; it does not prove writeability, free disk space, backup health, or provider availability. `GET /health/live` has no dependency check.
 - Test abrupt process termination around save, expired job lease reclamation, duplicate idempotency keys, corrupt/unknown JSON schema, foreign-key violation, disk full, and backup restoration.
 - Deletion/retention documentation covers live database, generated files, diagnostics, exports, and backup expiry.
 

@@ -399,24 +399,10 @@ h2 {
     letter-spacing: 0.04em;
 }
 
-.roll-mode {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-}
-
-.roll-mode button {
-    padding: 0.45rem 0.6rem;
-    border: 1px solid var(--line);
-    background: transparent;
-    color: var(--muted);
-    cursor: pointer;
-    font-size: 0.68rem;
-}
-
-.roll-mode button.selected {
-    border-color: var(--gold);
-    color: var(--gold-bright);
+.save-status {
+    margin: 0 !important;
+    color: var(--muted) !important;
+    font-size: 0.7rem;
 }
 
 .roll-button {
@@ -431,6 +417,28 @@ h2 {
 }
 
 .roll-button:disabled {
+    cursor: wait;
+    opacity: 0.6;
+}
+
+.refresh-button {
+    width: 100%;
+    margin-top: 0.45rem;
+    padding: 0.55rem;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.7rem;
+}
+
+.refresh-button:hover:not(:disabled),
+.refresh-button:focus-visible {
+    border-color: var(--gold);
+    color: var(--ink);
+}
+
+.refresh-button:disabled {
     cursor: wait;
     opacity: 0.6;
 }

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    D20Roll, ExperienceAwardSummary, GameCoreError, Result, RulesetId, Sha256Digest,
-    is_valid_opaque_id,
+    AbilityCheckResult, D20Roll, ExperienceAwardSummary, GameCoreError, Result, RulesetId,
+    Sha256Digest, is_valid_opaque_id,
 };
 
 pub const SESSION_SCHEMA_VERSION: u16 = 1;
@@ -141,6 +141,21 @@ impl SessionEventDto {
                     });
                 }
             }
+            SessionEventPayload::AbilityCheckResolved {
+                character_id,
+                action_id,
+                result,
+            } => {
+                if !matches!(self.actor, EventActor::System)
+                    || !is_valid_opaque_id(character_id)
+                    || !is_valid_opaque_id(action_id)
+                {
+                    return Err(GameCoreError::InvalidSessionEvent {
+                        reason: "ability-check event actor or identifiers are invalid",
+                    });
+                }
+                result.validate()?;
+            }
             SessionEventPayload::GmNarration {
                 text,
                 image_prompt,
@@ -215,6 +230,12 @@ pub enum SessionEventPayload {
         modifier: i32,
         total: i32,
     },
+    AbilityCheckResolved {
+        character_id: String,
+        /// Authored action whose trusted rules definition produced this check.
+        action_id: String,
+        result: AbilityCheckResult,
+    },
     GmNarration {
         text: String,
         image_prompt: Option<String>,
@@ -241,7 +262,25 @@ pub enum SessionEventPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RULESET;
+    use crate::{Ability, AbilityCheck, AbilityScores, Level, Proficiency, RULESET, RollContext};
+
+    fn ability_check_result() -> AbilityCheckResult {
+        let check = AbilityCheck {
+            ability: Ability::Wisdom,
+            proficiency: Proficiency::Proficient,
+            difficulty_class: 13,
+            situational_modifier: 0,
+            roll_context: RollContext::normal(),
+        };
+        let mut dice = |_| 12;
+        check
+            .resolve(
+                &AbilityScores::new(10, 10, 10, 10, 14, 10).unwrap(),
+                Level::new(3).unwrap(),
+                &mut dice,
+            )
+            .unwrap()
+    }
 
     #[test]
     fn session_dto_round_trips_as_json() {
@@ -303,5 +342,55 @@ mod tests {
         };
 
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn ability_check_event_requires_system_actor_and_valid_authored_ids() {
+        let mut event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: "session-1".to_owned(),
+            sequence: 1,
+            occurred_at_unix_ms: 100,
+            actor: EventActor::System,
+            payload: SessionEventPayload::AbilityCheckResolved {
+                character_id: "character-1".to_owned(),
+                action_id: "inspect-rune".to_owned(),
+                result: ability_check_result(),
+            },
+        };
+        event.validate().unwrap();
+
+        event.actor = EventActor::AiGameMaster;
+        assert!(event.validate().is_err());
+
+        event.actor = EventActor::System;
+        let SessionEventPayload::AbilityCheckResolved { action_id, .. } = &mut event.payload else {
+            unreachable!("test event has the expected payload")
+        };
+        *action_id = "forged action".to_owned();
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn ability_check_event_rejects_a_tampered_result() {
+        let mut result = ability_check_result();
+        result.total += 1;
+        let event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: "session-1".to_owned(),
+            sequence: 1,
+            occurred_at_unix_ms: 100,
+            actor: EventActor::System,
+            payload: SessionEventPayload::AbilityCheckResolved {
+                character_id: "character-1".to_owned(),
+                action_id: "inspect-rune".to_owned(),
+                result,
+            },
+        };
+
+        assert!(matches!(
+            event.validate(),
+            Err(GameCoreError::InvalidAbilityCheckResult { .. })
+        ));
     }
 }

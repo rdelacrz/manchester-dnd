@@ -5,6 +5,7 @@
 //! service in this crate only returns proposals; callers must validate and
 //! apply them through the authoritative core domain.
 
+pub mod application;
 pub mod config;
 pub mod context;
 pub mod error;
@@ -13,9 +14,13 @@ pub mod generation;
 pub mod gm;
 pub mod repository;
 
-pub use config::{AppConfig, LlmBackend, LlmProfile, SecretString};
+pub use application::{
+    GameApplicationService, LOCAL_CAMPAIGN_SESSION_ID, LOCAL_CHARACTER_ID,
+    LOCAL_EXPLORATION_ACTION_ID, UnixTimeSource,
+};
+pub use config::{AccessMode, AppConfig, LlmBackend, LlmProfile, SecretString};
 pub use context::ServerContext;
 pub use error::{
-    BootstrapError, ConfigError, EventPromptError, GameMasterError, GenerationError,
-    RepositoryError,
+    ApplicationError, BootstrapError, ConfigError, EventPromptError, GameMasterError,
+    GenerationError, RepositoryError,
 };

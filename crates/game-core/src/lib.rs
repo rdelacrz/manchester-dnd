@@ -12,6 +12,7 @@ mod check;
 mod dice;
 mod digest;
 mod error;
+mod exploration;
 mod identifier;
 mod proficiency;
 mod progression;
@@ -29,6 +30,10 @@ pub use check::{AbilityCheck, AbilityCheckResult, AttackOutcome, AttackRoll, Att
 pub use dice::{D20Roll, DiceSource, RollContext, RollMode, resolve_d20};
 pub use digest::Sha256Digest;
 pub use error::{GameCoreError, Result};
+pub use exploration::{
+    AttemptExplorationCheckCommand, EXPLORATION_CHECK_SCHEMA_VERSION, ExplorationCheckOutcomeDto,
+    LOCAL_CAMPAIGN_VIEW_SCHEMA_VERSION, LocalCampaignViewDto,
+};
 pub use identifier::{MAX_OPAQUE_ID_LEN, is_valid_opaque_id};
 pub use proficiency::Proficiency;
 pub use progression::{Level, XP_THRESHOLDS};

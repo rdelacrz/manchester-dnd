@@ -6,7 +6,7 @@ use manchester_dnd_core::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{
-    Row, SqlitePool,
+    Row, Sqlite, SqlitePool, Transaction,
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
@@ -15,6 +15,7 @@ use crate::error::RepositoryError;
 
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 pub const CHARACTER_SCHEMA_VERSION: u32 = 1;
+const MAX_COMMAND_RESPONSE_JSON_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveOutcome {
@@ -44,6 +45,31 @@ pub struct CampaignCreateOutcome {
 pub struct SessionEventCommitOutcome {
     pub session: SaveOutcome,
     pub characters: Vec<CharacterCommitOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewCommandReceipt {
+    pub(crate) campaign_session_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) command_kind: String,
+    pub(crate) request_fingerprint: Sha256Digest,
+    pub(crate) expected_revision: u64,
+    pub(crate) result_revision: u64,
+    pub(crate) audit_id: String,
+    pub(crate) response_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredCommandReceipt {
+    pub(crate) campaign_session_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) command_kind: String,
+    pub(crate) request_fingerprint: Sha256Digest,
+    pub(crate) expected_revision: u64,
+    pub(crate) result_revision: u64,
+    pub(crate) audit_id: String,
+    pub(crate) response_json: String,
+    pub(crate) created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,9 +167,17 @@ impl SqliteRepository {
             .map_err(RepositoryError::Migration)
     }
 
+    pub(crate) async fn health_check(&self) -> Result<(), RepositoryError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(RepositoryError::Database)?;
+        Ok(())
+    }
+
     /// Atomically creates an initial campaign and its complete declared party.
     /// Subsequent authoritative changes must go through `commit_session_event`.
-    pub async fn create_campaign(
+    pub(crate) async fn create_campaign(
         &self,
         session: &SessionDto,
         characters: &[Character],
@@ -250,16 +284,80 @@ impl SqliteRepository {
         stored.map(validate_stored_character).transpose()
     }
 
+    pub(crate) async fn load_command_receipt(
+        &self,
+        campaign_session_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<StoredCommandReceipt>, RepositoryError> {
+        validate_command_receipt_lookup(campaign_session_id, idempotency_key)?;
+        let row = sqlx::query(
+            "SELECT campaign_session_id, idempotency_key, command_kind,
+                    request_fingerprint, expected_revision, result_revision,
+                    audit_id, response_json, created_at
+             FROM command_receipts
+             WHERE campaign_session_id = ? AND idempotency_key = ?",
+        )
+        .bind(campaign_session_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::Database)?;
+
+        row.map(stored_command_receipt_from_row).transpose()
+    }
+
     /// Commits a post-event session snapshot and its append-only audit row in
     /// one transaction. The optimistic revision and event sequence prevent a
     /// stale caller from skipping or duplicating a turn.
-    pub async fn commit_session_event(
+    #[cfg(test)]
+    pub(crate) async fn commit_session_event(
         &self,
         audit_id: &str,
         session: &SessionDto,
         expected_revision: u64,
         event: &SessionEventDto,
         character_updates: &[CharacterUpdate<'_>],
+    ) -> Result<SessionEventCommitOutcome, RepositoryError> {
+        self.commit_session_event_internal(
+            audit_id,
+            session,
+            expected_revision,
+            event,
+            character_updates,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_session_event_with_receipt(
+        &self,
+        audit_id: &str,
+        session: &SessionDto,
+        expected_revision: u64,
+        event: &SessionEventDto,
+        character_updates: &[CharacterUpdate<'_>],
+        receipt: &NewCommandReceipt,
+    ) -> Result<SessionEventCommitOutcome, RepositoryError> {
+        validate_command_receipt_for_commit(receipt, audit_id, session, expected_revision, event)?;
+        self.commit_session_event_internal(
+            audit_id,
+            session,
+            expected_revision,
+            event,
+            character_updates,
+            Some(receipt),
+        )
+        .await
+    }
+
+    async fn commit_session_event_internal(
+        &self,
+        audit_id: &str,
+        session: &SessionDto,
+        expected_revision: u64,
+        event: &SessionEventDto,
+        character_updates: &[CharacterUpdate<'_>],
+        receipt: Option<&NewCommandReceipt>,
     ) -> Result<SessionEventCommitOutcome, RepositoryError> {
         validate_session(session)?;
         validate_session_event(event)?;
@@ -588,6 +686,10 @@ impl SqliteRepository {
         .await
         .map_err(RepositoryError::Database)?;
 
+        if let Some(receipt) = receipt {
+            insert_command_receipt(&mut transaction, receipt).await?;
+        }
+
         transaction
             .commit()
             .await
@@ -784,6 +886,200 @@ impl SqliteRepository {
             })
             .collect()
     }
+}
+
+async fn insert_command_receipt(
+    transaction: &mut Transaction<'_, Sqlite>,
+    receipt: &NewCommandReceipt,
+) -> Result<(), RepositoryError> {
+    let receipt_id = command_receipt_id(&receipt.campaign_session_id, &receipt.idempotency_key);
+    sqlx::query(
+        "INSERT INTO command_receipts
+         (campaign_session_id, idempotency_key, command_kind, request_fingerprint,
+          expected_revision, result_revision, audit_id, response_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&receipt.campaign_session_id)
+    .bind(&receipt.idempotency_key)
+    .bind(&receipt.command_kind)
+    .bind(receipt.request_fingerprint.as_str())
+    .bind(to_i64(receipt.expected_revision, "expected revision")?)
+    .bind(to_i64(receipt.result_revision, "result revision")?)
+    .bind(&receipt.audit_id)
+    .bind(&receipt.response_json)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| map_insert_error(error, "command receipt", &receipt_id))?;
+    Ok(())
+}
+
+fn stored_command_receipt_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredCommandReceipt, RepositoryError> {
+    let campaign_session_id: String = row
+        .try_get("campaign_session_id")
+        .map_err(RepositoryError::Database)?;
+    let idempotency_key: String = row
+        .try_get("idempotency_key")
+        .map_err(RepositoryError::Database)?;
+    let receipt_id = command_receipt_id(&campaign_session_id, &idempotency_key);
+    let raw_fingerprint: String = row
+        .try_get("request_fingerprint")
+        .map_err(RepositoryError::Database)?;
+    let request_fingerprint =
+        Sha256Digest::new(raw_fingerprint).map_err(|source| RepositoryError::CoreValidation {
+            entity: "command receipt",
+            id: receipt_id.clone(),
+            source,
+        })?;
+    let receipt = StoredCommandReceipt {
+        campaign_session_id,
+        idempotency_key,
+        command_kind: row
+            .try_get("command_kind")
+            .map_err(RepositoryError::Database)?,
+        request_fingerprint,
+        expected_revision: from_i64(
+            row.try_get("expected_revision")
+                .map_err(RepositoryError::Database)?,
+            "expected revision",
+        )?,
+        result_revision: from_i64(
+            row.try_get("result_revision")
+                .map_err(RepositoryError::Database)?,
+            "result revision",
+        )?,
+        audit_id: row.try_get("audit_id").map_err(RepositoryError::Database)?,
+        response_json: row
+            .try_get("response_json")
+            .map_err(RepositoryError::Database)?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(RepositoryError::Database)?,
+    };
+    validate_command_receipt_fields(
+        &receipt.campaign_session_id,
+        &receipt.idempotency_key,
+        &receipt.command_kind,
+        &receipt.request_fingerprint,
+        receipt.expected_revision,
+        receipt.result_revision,
+        &receipt.audit_id,
+        &receipt.response_json,
+    )?;
+    if receipt.created_at.trim().is_empty() || receipt.created_at.len() > 64 {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: receipt_id,
+            reason: "creation timestamp is invalid",
+        });
+    }
+    Ok(receipt)
+}
+
+fn validate_command_receipt_lookup(
+    campaign_session_id: &str,
+    idempotency_key: &str,
+) -> Result<(), RepositoryError> {
+    if !is_valid_opaque_id(campaign_session_id) || !is_valid_opaque_id(idempotency_key) {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: command_receipt_id(campaign_session_id, idempotency_key),
+            reason: "campaign session and idempotency identifiers must be valid",
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_command_receipt_fields(
+    campaign_session_id: &str,
+    idempotency_key: &str,
+    command_kind: &str,
+    request_fingerprint: &Sha256Digest,
+    expected_revision: u64,
+    result_revision: u64,
+    audit_id: &str,
+    response_json: &str,
+) -> Result<(), RepositoryError> {
+    validate_command_receipt_lookup(campaign_session_id, idempotency_key)?;
+    let receipt_id = command_receipt_id(campaign_session_id, idempotency_key);
+    if !is_valid_opaque_id(command_kind) || !is_valid_opaque_id(audit_id) {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: receipt_id,
+            reason: "command kind and audit identifiers must be valid",
+        });
+    }
+    Sha256Digest::new(request_fingerprint.as_str()).map_err(|source| {
+        RepositoryError::CoreValidation {
+            entity: "command receipt",
+            id: receipt_id.clone(),
+            source,
+        }
+    })?;
+    let expected_result_revision = expected_revision
+        .checked_add(1)
+        .ok_or(RepositoryError::NumericRange { field: "revision" })?;
+    if expected_revision == 0 || result_revision != expected_result_revision {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: receipt_id,
+            reason: "result revision must immediately follow a positive expected revision",
+        });
+    }
+    to_i64(expected_revision, "expected revision")?;
+    to_i64(result_revision, "result revision")?;
+    if response_json.is_empty() || response_json.len() > MAX_COMMAND_RESPONSE_JSON_BYTES {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: receipt_id,
+            reason: "response JSON must be present and within the byte limit",
+        });
+    }
+    if serde_json::from_str::<serde_json::Value>(response_json).is_err() {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: receipt_id,
+            reason: "response must contain valid JSON",
+        });
+    }
+    Ok(())
+}
+
+fn validate_command_receipt_for_commit(
+    receipt: &NewCommandReceipt,
+    audit_id: &str,
+    session: &SessionDto,
+    expected_revision: u64,
+    event: &SessionEventDto,
+) -> Result<(), RepositoryError> {
+    validate_command_receipt_fields(
+        &receipt.campaign_session_id,
+        &receipt.idempotency_key,
+        &receipt.command_kind,
+        &receipt.request_fingerprint,
+        receipt.expected_revision,
+        receipt.result_revision,
+        &receipt.audit_id,
+        &receipt.response_json,
+    )?;
+    if receipt.campaign_session_id != session.id
+        || receipt.campaign_session_id != event.session_id
+        || receipt.audit_id != audit_id
+        || receipt.expected_revision != expected_revision
+    {
+        return Err(RepositoryError::InvalidDomainState {
+            entity: "command receipt",
+            id: command_receipt_id(&receipt.campaign_session_id, &receipt.idempotency_key),
+            reason: "receipt must identify the committed session, audit, and revisions",
+        });
+    }
+    Ok(())
+}
+
+fn command_receipt_id(campaign_session_id: &str, idempotency_key: &str) -> String {
+    format!("{campaign_session_id}:{idempotency_key}")
 }
 
 #[derive(Clone, Copy)]
@@ -1010,6 +1306,7 @@ fn event_references_unknown_character(session: &SessionDto, event: &SessionEvent
     }
     match &event.payload {
         SessionEventPayload::PlayerIntent { character_id, .. }
+        | SessionEventPayload::AbilityCheckResolved { character_id, .. }
         | SessionEventPayload::ExperienceAwarded { character_id, .. } => !known(character_id),
         _ => false,
     }
@@ -1189,6 +1486,23 @@ mod tests {
             .expect("in-memory repository should initialize")
     }
 
+    fn command_receipt(
+        idempotency_key: &str,
+        audit_id: &str,
+        expected_revision: u64,
+    ) -> NewCommandReceipt {
+        NewCommandReceipt {
+            campaign_session_id: "session-1".to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            command_kind: "attempt-exploration-check".to_owned(),
+            request_fingerprint: Sha256Digest::from_bytes([0xab; 32]),
+            expected_revision,
+            result_revision: expected_revision + 1,
+            audit_id: audit_id.to_owned(),
+            response_json: r#"{"outcome":"success"}"#.to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn creates_loads_and_rejects_duplicate_sessions() {
         let repository = repository().await;
@@ -1301,6 +1615,203 @@ mod tests {
             .expect("session should exist");
         assert_eq!(stored.value.last_event_sequence, 0);
         assert_eq!(stored.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn command_receipt_round_trips_with_its_event() {
+        let repository = repository().await;
+        let initial = session();
+        repository
+            .create_campaign(&initial, &[character()])
+            .await
+            .expect("campaign should save");
+        let event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: initial.id.clone(),
+            sequence: 1,
+            occurred_at_unix_ms: 5,
+            actor: EventActor::System,
+            payload: SessionEventPayload::SessionStarted,
+        };
+        let mut submitted = initial;
+        submitted.last_event_sequence = 1;
+        submitted.updated_at_unix_ms = 5;
+        let receipt = command_receipt("command-1", "turn-1", 1);
+
+        let committed = repository
+            .commit_session_event_with_receipt("turn-1", &submitted, 1, &event, &[], &receipt)
+            .await
+            .expect("event and receipt should commit atomically");
+        assert_eq!(committed.session.revision, 2);
+
+        let stored = repository
+            .load_command_receipt("session-1", "command-1")
+            .await
+            .expect("receipt lookup should succeed")
+            .expect("receipt should exist");
+        assert_eq!(stored.campaign_session_id, receipt.campaign_session_id);
+        assert_eq!(stored.idempotency_key, receipt.idempotency_key);
+        assert_eq!(stored.command_kind, receipt.command_kind);
+        assert_eq!(stored.request_fingerprint, receipt.request_fingerprint);
+        assert_eq!(stored.expected_revision, receipt.expected_revision);
+        assert_eq!(stored.result_revision, receipt.result_revision);
+        assert_eq!(stored.audit_id, receipt.audit_id);
+        assert_eq!(stored.response_json, receipt.response_json);
+        assert!(!stored.created_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_command_key_rolls_back_the_new_event() {
+        let repository = repository().await;
+        let initial = session();
+        repository
+            .create_campaign(&initial, &[character()])
+            .await
+            .expect("campaign should save");
+        let first_event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: initial.id.clone(),
+            sequence: 1,
+            occurred_at_unix_ms: 5,
+            actor: EventActor::System,
+            payload: SessionEventPayload::SessionStarted,
+        };
+        let mut after_first = initial;
+        after_first.last_event_sequence = 1;
+        after_first.updated_at_unix_ms = 5;
+        repository
+            .commit_session_event_with_receipt(
+                "turn-1",
+                &after_first,
+                1,
+                &first_event,
+                &[],
+                &command_receipt("command-1", "turn-1", 1),
+            )
+            .await
+            .expect("first command should commit");
+
+        let second_event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: after_first.id.clone(),
+            sequence: 2,
+            occurred_at_unix_ms: 6,
+            actor: EventActor::AiGameMaster,
+            payload: SessionEventPayload::GmNarration {
+                text: "The rain answers in a low metallic hum.".to_owned(),
+                image_prompt: None,
+                source_prompt_id: None,
+            },
+        };
+        let mut after_second = after_first;
+        after_second.last_event_sequence = 2;
+        after_second.updated_at_unix_ms = 6;
+        let duplicate = command_receipt("command-1", "turn-2", 2);
+        let error = repository
+            .commit_session_event_with_receipt(
+                "turn-2",
+                &after_second,
+                2,
+                &second_event,
+                &[],
+                &duplicate,
+            )
+            .await
+            .expect_err("duplicate command key must fail");
+        assert!(matches!(
+            error,
+            RepositoryError::AlreadyExists {
+                entity: "command receipt",
+                ..
+            }
+        ));
+
+        let stored = repository
+            .load_campaign_session("session-1")
+            .await
+            .expect("session should load")
+            .expect("session should exist");
+        assert_eq!(stored.revision, 2);
+        assert_eq!(stored.value.last_event_sequence, 1);
+        let events = repository
+            .list_session_events("session-1")
+            .await
+            .expect("events should load");
+        assert_eq!(events.len(), 1);
+        let original_receipt = repository
+            .load_command_receipt("session-1", "command-1")
+            .await
+            .expect("receipt should load")
+            .expect("original receipt should remain");
+        assert_eq!(original_receipt.audit_id, "turn-1");
+        assert_eq!(original_receipt.result_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn receipt_insert_failure_rolls_back_the_event_transaction() {
+        let repository = repository().await;
+        let initial = session();
+        repository
+            .create_campaign(&initial, &[character()])
+            .await
+            .expect("campaign should save");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_receipt
+             BEFORE INSERT ON command_receipts
+             WHEN NEW.idempotency_key = 'force-rollback'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced receipt failure');
+             END",
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("test trigger should install");
+        let event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: initial.id.clone(),
+            sequence: 1,
+            occurred_at_unix_ms: 5,
+            actor: EventActor::System,
+            payload: SessionEventPayload::SessionStarted,
+        };
+        let mut submitted = initial;
+        submitted.last_event_sequence = 1;
+        submitted.updated_at_unix_ms = 5;
+
+        let error = repository
+            .commit_session_event_with_receipt(
+                "turn-1",
+                &submitted,
+                1,
+                &event,
+                &[],
+                &command_receipt("force-rollback", "turn-1", 1),
+            )
+            .await
+            .expect_err("receipt failure must abort the transaction");
+        assert!(matches!(error, RepositoryError::Database(_)));
+
+        let stored = repository
+            .load_campaign_session("session-1")
+            .await
+            .expect("session should load")
+            .expect("session should exist");
+        assert_eq!(stored.revision, 1);
+        assert_eq!(stored.value.last_event_sequence, 0);
+        assert!(
+            repository
+                .list_session_events("session-1")
+                .await
+                .expect("events should load")
+                .is_empty()
+        );
+        assert!(
+            repository
+                .load_command_receipt("session-1", "force-rollback")
+                .await
+                .expect("receipt lookup should succeed")
+                .is_none()
+        );
     }
 
     #[tokio::test]

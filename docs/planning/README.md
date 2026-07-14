@@ -1,6 +1,6 @@
 # Manchester Arcana planning index
 
-Status: working product and engineering plan. Decisions marked **MVP** are the current delivery contract; later items are direction, not promises.
+Status: working product and engineering plan. Decisions marked **MVP** are the current delivery contract; later items are direction, not promises. The full-stack walking-skeleton foundation and Slice 1A persisted exploration check are implemented; remaining Slice 0 acceptance gates and the initiative/combat/damage/HP portion of Slice 1 are pending.
 
 Manchester Arcana is a web-based, AI-GM fantasy role-playing game. It uses a deterministic Rust rules engine based on the 2014-era SRD 5.1 while generative models provide prose, scene ideas, and optional images. The AI proposes; the engine decides.
 
@@ -21,6 +21,7 @@ Manchester Arcana is a web-based, AI-GM fantasy role-playing game. It uses a det
 ## Architectural invariants
 
 - `srd-5.1-cc` is the initial and only MVP ruleset ID. SRD 5.2.1 is a possible future, separate ruleset with separate saves and conformance tests.
+- The first deployment is explicit local single-user mode: loopback HTTP only, with matching `Host`/`Origin` enforcement. Hosted mode fails startup until authentication and campaign authorization are implemented.
 - Every state change is validated and committed by the deterministic Rust engine. Neither a browser nor a model can set authoritative game state directly.
 - A saved campaign pins rules, content, prompt, and payload-schema versions. Loading or showing saved history never calls a model; full event replay is a later evolution.
 - Model credentials, private prompt sources, consent records, and full campaign state remain server-side.

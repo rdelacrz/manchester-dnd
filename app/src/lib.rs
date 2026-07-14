@@ -1,3 +1,5 @@
+mod campaign;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
@@ -5,55 +7,15 @@ use leptos_router::{
     StaticSegment,
     components::{Route, Router, Routes},
 };
-use manchester_dnd_core::{AbilityCheckResult, RollMode};
+use manchester_dnd_core::{
+    AttemptExplorationCheckCommand, EXPLORATION_CHECK_SCHEMA_VERSION, ExplorationCheckOutcomeDto,
+    LocalCampaignViewDto,
+};
 
-#[cfg(feature = "ssr")]
-use manchester_dnd_core::{Ability, AbilityCheck, AbilityScores, Level, Proficiency, RollContext};
-
-#[cfg(feature = "ssr")]
-struct SystemDice;
-
-#[cfg(feature = "ssr")]
-impl manchester_dnd_core::DiceSource for SystemDice {
-    fn roll(&mut self, sides: u16) -> u16 {
-        use rand::Rng;
-
-        rand::rng().random_range(1..=sides)
-    }
-}
-
-/// A small end-to-end rules slice: the browser requests a roll, while the
-/// server supplies entropy and the shared core crate resolves the check.
-#[server]
-pub async fn roll_demo_check(mode: RollMode) -> Result<AbilityCheckResult, ServerFnError> {
-    #[cfg(feature = "ssr")]
-    {
-        let scores = AbilityScores::new(10, 10, 10, 10, 14, 10).map_err(ServerFnError::new)?;
-        let level = Level::new(3).map_err(ServerFnError::new)?;
-        let roll_context = match mode {
-            RollMode::Normal => RollContext::normal(),
-            RollMode::Advantage => RollContext::with_advantage(),
-            RollMode::Disadvantage => RollContext::with_disadvantage(),
-        };
-        let check = AbilityCheck {
-            ability: Ability::Wisdom,
-            proficiency: Proficiency::Proficient,
-            difficulty_class: 13,
-            situational_modifier: 0,
-            roll_context,
-        };
-
-        check
-            .resolve(&scores, level, &mut SystemDice)
-            .map_err(ServerFnError::new)
-    }
-
-    #[cfg(not(feature = "ssr"))]
-    {
-        let _ = mode;
-        unreachable!("the server-function macro replaces this body in browser builds")
-    }
-}
+use crate::campaign::{
+    CampaignLoadResponse, ExplorationCheckResponse, LOCAL_EXPLORATION_ACTION_ID, PublicGameError,
+    attempt_exploration_check, load_local_campaign,
+};
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -95,40 +57,73 @@ pub fn App() -> impl IntoView {
 #[component]
 fn HomePage() -> impl IntoView {
     let selected_theme = RwSignal::new("Canal Warden");
-    let roll_mode = RwSignal::new(RollMode::Normal);
+    let campaign_view = RwSignal::new(None::<LocalCampaignViewDto>);
+    let campaign_loading = RwSignal::new(true);
     let roll_pending = RwSignal::new(false);
-    let roll_summary = RwSignal::new(String::from("No check has been rolled yet."));
+    let retry_command = RwSignal::new(None::<AttemptExplorationCheckCommand>);
+    let roll_summary = RwSignal::new(String::from("Loading the saved local campaign…"));
+
+    Effect::new(move |_| {
+        load_campaign_into(campaign_view, campaign_loading, roll_summary);
+    });
 
     let roll_check = move |_| {
-        let mode = roll_mode.get();
+        let Some(view) = campaign_view.get_untracked() else {
+            roll_summary.set("The campaign is not ready yet.".to_owned());
+            return;
+        };
+        let command =
+            retry_command
+                .get_untracked()
+                .unwrap_or_else(|| AttemptExplorationCheckCommand {
+                    schema_version: EXPLORATION_CHECK_SCHEMA_VERSION,
+                    campaign_session_id: view.campaign_session_id,
+                    character_id: view.character_id,
+                    action_id: LOCAL_EXPLORATION_ACTION_ID.to_owned(),
+                    expected_revision: view.revision,
+                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                });
+        retry_command.set(Some(command.clone()));
         roll_pending.set(true);
+        roll_summary.set("The server is resolving and saving the check…".to_owned());
 
         spawn_local(async move {
-            let summary = match roll_demo_check(mode).await {
-                Ok(result) => {
-                    let dice = match result.roll.second {
-                        Some(second) => format!(
-                            "{} and {} → {}",
-                            result.roll.first, second, result.roll.selected
-                        ),
-                        None => result.roll.selected.to_string(),
-                    };
-                    let outcome = if result.success { "success" } else { "setback" };
-                    format!(
-                        "Rolled {dice}; {} + {} ability + {} proficiency = {} vs DC {} — {outcome}.",
-                        result.roll.selected,
-                        result.ability_modifier,
-                        result.proficiency_modifier,
-                        result.total,
-                        result.difficulty_class,
-                    )
+            match attempt_exploration_check(command).await {
+                Ok(ExplorationCheckResponse::Committed(outcome)) => {
+                    roll_summary.set(format_check(&outcome));
+                    campaign_view.update(|current| {
+                        if let Some(view) = current {
+                            view.revision = outcome.result_revision;
+                            view.last_event_sequence = outcome.event_sequence;
+                            view.latest_check = Some(outcome);
+                        }
+                    });
+                    retry_command.set(None);
                 }
-                Err(error) => format!("The roll could not be completed: {error}"),
-            };
-
-            roll_summary.set(summary);
+                Ok(ExplorationCheckResponse::Rejected(error)) => {
+                    let stale = error.code == "revision_conflict";
+                    roll_summary.set(format_public_error(&error));
+                    if stale || !error.retryable {
+                        retry_command.set(None);
+                    }
+                    if stale {
+                        load_campaign_into(campaign_view, campaign_loading, roll_summary);
+                    }
+                }
+                Err(_) => {
+                    roll_summary.set(
+                        "The request was interrupted. Retry will reuse the same command so it cannot commit twice."
+                            .to_owned(),
+                    );
+                }
+            }
             roll_pending.set(false);
         });
+    };
+
+    let refresh_campaign = move |_| {
+        retry_command.set(None);
+        load_campaign_into(campaign_view, campaign_loading, roll_summary);
     };
 
     view! {
@@ -220,29 +215,49 @@ fn HomePage() -> impl IntoView {
                         <li><span>"03"</span>"Campaigns retain their ruleset version."</li>
                     </ul>
                     <div class="roll-demo">
-                        <p class="roll-label">"Wisdom (Perception) · +4 · DC 13"</p>
-                        <div class="roll-mode" aria-label="Roll mode">
-                            <button
-                                class:selected=move || roll_mode.get() == RollMode::Normal
-                                on:click=move |_| roll_mode.set(RollMode::Normal)
-                            >"Normal"</button>
-                            <button
-                                class:selected=move || roll_mode.get() == RollMode::Advantage
-                                on:click=move |_| roll_mode.set(RollMode::Advantage)
-                            >"Advantage"</button>
-                            <button
-                                class:selected=move || roll_mode.get() == RollMode::Disadvantage
-                                on:click=move |_| roll_mode.set(RollMode::Disadvantage)
-                            >"Disadvantage"</button>
-                        </div>
+                        <p class="roll-label">"Inspect the viaduct runes · Wisdom (Perception)"</p>
+                        <p class="save-status">
+                            {move || campaign_view.get().map_or_else(
+                                || "Campaign unavailable".to_owned(),
+                                |view| format!(
+                                    "{} · {} · saved revision {}",
+                                    view.campaign_title, view.character_name, view.revision
+                                ),
+                            )}
+                        </p>
                         <button
                             class="roll-button"
                             disabled=move || roll_pending.get()
+                                || campaign_loading.get()
+                                || campaign_view.get().is_none()
                             on:click=roll_check
                         >
-                            {move || if roll_pending.get() { "Rolling…" } else { "Roll the d20" }}
+                            {move || if roll_pending.get() {
+                                "Resolving and saving…"
+                            } else if retry_command.get().is_some() {
+                                "Retry the same action"
+                            } else {
+                                "Inspect the runes"
+                            }}
                         </button>
-                        <p class="roll-readout" aria-live="polite">{move || roll_summary.get()}</p>
+                        <button
+                            class="refresh-button"
+                            disabled=move || campaign_loading.get() || roll_pending.get()
+                            on:click=refresh_campaign
+                        >
+                            {move || if campaign_loading.get() {
+                                "Loading save…"
+                            } else {
+                                "Reload saved turn"
+                            }}
+                        </button>
+                        <p
+                            class="roll-readout"
+                            aria-live="polite"
+                            aria-busy=move || roll_pending.get() || campaign_loading.get()
+                        >
+                            {move || roll_summary.get()}
+                        </p>
                     </div>
                 </article>
 
@@ -259,6 +274,72 @@ fn HomePage() -> impl IntoView {
             </section>
         </main>
     }
+}
+
+fn load_campaign_into(
+    campaign_view: RwSignal<Option<LocalCampaignViewDto>>,
+    campaign_loading: RwSignal<bool>,
+    roll_summary: RwSignal<String>,
+) {
+    campaign_loading.set(true);
+    spawn_local(async move {
+        match load_local_campaign().await {
+            Ok(CampaignLoadResponse::Ready(view)) => {
+                let summary = view.latest_check.as_ref().map_or_else(
+                    || {
+                        "The viaduct is waiting. This first action will be rolled and saved by the server."
+                            .to_owned()
+                    },
+                    format_check,
+                );
+                campaign_view.set(Some(view));
+                roll_summary.set(summary);
+            }
+            Ok(CampaignLoadResponse::Rejected(error)) => {
+                campaign_view.set(None);
+                roll_summary.set(format_public_error(&error));
+            }
+            Err(_) => {
+                campaign_view.set(None);
+                roll_summary.set(
+                    "The saved campaign could not be reached. Check the local server and try again."
+                        .to_owned(),
+                );
+            }
+        }
+        campaign_loading.set(false);
+    });
+}
+
+fn format_check(outcome: &ExplorationCheckOutcomeDto) -> String {
+    let result = &outcome.result;
+    let dice = result.roll.second.map_or_else(
+        || result.roll.first.to_string(),
+        |second| {
+            format!(
+                "{} and {} → {}",
+                result.roll.first, second, result.roll.selected
+            )
+        },
+    );
+    let result_label = if result.success { "success" } else { "setback" };
+    format!(
+        "Saved roll {dice}; {} {:+} ability + {} proficiency {:+} situational = {} vs DC {} — {result_label}. Revision {}.",
+        result.roll.selected,
+        result.ability_modifier,
+        result.proficiency_modifier,
+        result.situational_modifier,
+        result.total,
+        result.difficulty_class,
+        outcome.result_revision,
+    )
+}
+
+fn format_public_error(error: &PublicGameError) -> String {
+    format!(
+        "{} [{}; reference {}]",
+        error.message, error.code, error.correlation_id
+    )
 }
 
 #[component]

@@ -13,7 +13,7 @@ Correctness is layered: mechanical outcomes must be exact and replayable; model 
 | RNG/dice | Pinned algorithm known-answer tests; parser limits/overflow; roll-record totals; non-flaky statistical smoke checks separate from exact conformance |
 | Save/history compatibility | Golden campaign/character documents and turn audits from every supported schema/rules/content version; canonical state hashes; migration semantics; event-stream fixtures only after that evolution exists |
 | Content/pack | Schema, dependency, path/digest/provenance, referential integrity, capability reachability, instantiate every offered build/entity |
-| Persistence | Real SQLite migrations/foreign keys/JSON checks, transaction rollback, optimistic conflict, idempotency races, busy/lock handling, backup restore, expired job leases |
+| Persistence | Real PostgreSQL migrations/foreign keys/JSONB constraints, transaction rollback, row-lock/optimistic conflicts, idempotency races, deadlock/serialization handling, backup restore, expired job leases |
 | Application/API | Authentication/authorization per server function, safe error mapping, size/rate limits, CSRF, hidden-field/ID forgery, cancellation/timeouts |
 | Leptos UI | SSR render, hydration with zero warnings, progressive forms, stale-revision recovery, keyboard/focus, accessible names/status updates |
 | Browser E2E | Create → play → roll → reload → level → export; provider degradation; worker restart; two-user isolation |
@@ -24,7 +24,7 @@ Correctness is layered: mechanical outcomes must be exact and replayable; model 
 
 Do not assert exact creative prose from a live model in normal CI. Model promotion evaluations run on synthetic/non-private fixtures with schema validity, factual consistency, safety/privacy, latency, and cost thresholds. Keep provider-contract smoke tests opt-in and budgeted.
 
-Current Slice 1A evidence covers strict command/result decoding, tamper rejection, deterministic injected rolls, same-key replay without reroll, concurrent in-process duplicates, changed-key conflicts, stale revisions, transaction rollback, exact stored-result reload, safe error mapping, and loopback Origin/Host checks. Live smoke verification also exercises both health endpoints and commit/reload over HTTP. This is not yet the browser-E2E, process-restart, cross-tenant, rate-limit, body-limit, or pinned-RNG evidence required by the target portfolio.
+Current Slice 1A evidence covers strict command/result decoding, tamper rejection, deterministic injected rolls, same-key replay without reroll, concurrent in-process duplicates, PostgreSQL row-lock serialization across independent repository handles, changed-key conflicts, stale revisions, transaction rollback, exact stored-result reload, safe error mapping, and loopback Origin/Host checks. Live smoke verification also exercises both health endpoints and commit/reload over HTTP. This is not yet the browser-E2E, process-restart, cross-tenant, rate-limit, body-limit, or pinned-RNG evidence required by the target portfolio.
 
 ### Rules traceability
 
@@ -92,11 +92,11 @@ The current local boundary is intentionally narrower than the hosted controls be
 - Build-time scans of WASM/JS/source maps and rendered bootstrap data for secret canaries/private fields.
 - Deterministic shared rendering to prevent hydration divergence; authorize before loading SSR data and avoid cross-user shared caches.
 
-**Application and SQLite**
+**Application and PostgreSQL**
 
-- Parameterized queries, least-privilege database-file/directory permissions, foreign keys/JSON constraints, expected-revision checks, immutable turn/security audits, integrity hashes, and bounded WAL/busy behavior.
+- Parameterized queries, least-privilege roles, foreign keys/JSONB constraints, deterministic row locking, expected-revision checks, immutable turn/security audits, integrity hashes, and bounded connection/transaction concurrency.
 - Centralized authorization and safe-view construction; providers never receive repository handles.
-- Keep the SQLite/WAL/backup files outside public roots, encrypt sensitive data and backups as policy requires, segregate environments, audit admin access, and test key rotation/consistent restore. PostgreSQL roles are a future scale control, not an MVP dependency.
+- Treat connection URLs as credentials, require TLS across non-local boundaries, segregate environments/roles, audit privileged access, encrypt backups, and test credential rotation plus logical/point-in-time restore as required by the recovery objective.
 
 **Generation and egress**
 

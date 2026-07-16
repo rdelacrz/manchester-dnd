@@ -3,18 +3,16 @@ CREATE TABLE command_receipts (
     idempotency_key TEXT NOT NULL,
     command_kind TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL CHECK (
-        length(request_fingerprint) = 71
-        AND substr(request_fingerprint, 1, 7) = 'sha256:'
-        AND substr(request_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'
+        request_fingerprint ~ '^sha256:[0-9a-f]{64}$'
     ),
-    expected_revision INTEGER NOT NULL CHECK (expected_revision > 0),
-    result_revision INTEGER NOT NULL CHECK (result_revision = expected_revision + 1),
+    expected_revision BIGINT NOT NULL CHECK (expected_revision > 0),
+    result_revision BIGINT NOT NULL CHECK (result_revision = expected_revision + 1),
     audit_id TEXT NOT NULL,
     response_json TEXT NOT NULL CHECK (
-        json_valid(response_json)
-        AND length(CAST(response_json AS BLOB)) BETWEEN 1 AND 65536
+        octet_length(response_json) BETWEEN 1 AND 65536
+        AND jsonb_typeof(response_json::jsonb) IS NOT NULL
     ),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (campaign_session_id, idempotency_key),
     FOREIGN KEY (audit_id, campaign_session_id)
         REFERENCES turn_audits(id, campaign_session_id) ON DELETE CASCADE

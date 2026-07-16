@@ -34,8 +34,8 @@ sqlx = { version = "0.8.6", default-features = false, features = [
     "chrono",
     "json",
     "migrate",
+    "postgres",
     "runtime-tokio-rustls",
-    "sqlite",
     "uuid",
 ] }
 thiserror = "2.0.18"
@@ -45,6 +45,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 uuid = { version = "1.17.0", features = ["js", "serde", "v4"] }
 wasm-bindgen = "0.2.106"
+web-sys = "0.3.83"
 
 manchester-dnd-core = { path = "crates/game-core" }
 manchester-dnd-server = { path = "crates/game-server" }

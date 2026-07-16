@@ -6,6 +6,13 @@ A real-life memory is sensitive source material, not ordinary flavour text. It m
 
 MVP supports administrator-installed Markdown from the private `EVENT_PROMPT_DIR` (default `prompts/events/private`, ignored by Git). It does not accept arbitrary public uploads. Source Markdown is never served to browsers, copied into exports, embedded in images, or sent wholesale to a model.
 
+The deployment-wide `INSPIRATION_ENABLED` gate defaults to `false`. When it is
+false, startup does not read the private source tree at all. A persisted
+campaign opt-in is a second, narrower gate and can never override a disabled
+deployment. A durable global incident switch independently blocks reservations,
+cancels pending work, and quarantines completed private presentations across
+process restarts.
+
 ## Consent model
 
 Consent is specific, reversible, and recorded independently from the Markdown:
@@ -36,7 +43,10 @@ The current loader uses a JSON metadata object between `---` lines followed by a
   "maximum_level": null,
   "cooldown_turns": 20,
   "sensitivity_tags": ["travel-mishap"],
-  "participant_aliases": ["person_a", "person_b"],
+  "participant_aliases": [
+    "participant:11111111111111111111111111111111",
+    "participant:22222222222222222222222222222222"
+  ],
   "enabled": false
 }
 ---
@@ -50,26 +60,29 @@ Two friends missed late transport and improvised a harmless route home.
 Use a harmless carriage detour. Do not preserve names, quotations, dates, or locations.
 ```
 
-The implemented loader denies unknown JSON fields, validates bounded schema/ID/weight/level/label metadata, rejects duplicate IDs, defaults files to disabled, and requires enabled files to declare tags, participant aliases, and a positive cooldown. Selection additionally requires the campaign-level inspiration opt-in plus level, sensitivity, participant-consent, and cooldown eligibility. `participant_aliases` are eligibility keys, not proof of consent; the application must construct the consenting-alias allowlist from independent current consent.
+The `## Fantasy transformation` section is author-facing review context only and is discarded during ingestion. It never becomes a model instruction. The runtime always uses the compiled `high_fiction_distance_v1` transformation policy.
 
-The body is fictionalization guidance treated as untrusted data, not a model/system instruction. Keep it to the minimum facts required. Audience/media permission, expiry, fiction distance, and blocked elements remain campaign/consent policy in v1; adding them to files requires `schema_version: 2` and compatibility tests rather than silently accepting new fields.
+The implemented loader denies unknown JSON fields, validates bounded schema/ID/weight/level/label metadata, quarantines duplicate IDs, defaults files to disabled, and requires enabled files to declare tags, participant aliases, and a positive cooldown. Participant aliases must use `participant:` plus a 32-character lowercase hexadecimal opaque identifier; descriptive names and handles are not accepted. It canonicalizes the configured root, bounds depth/count/file size, rejects traversal, symlinks and special filesystem entries, requires strict UTF-8, and redacts source paths from both normal and debug errors. When the deployment gate is off, startup does not inspect the source tree. Selection additionally requires the campaign-level inspiration opt-in plus level, sensitivity, participant-consent, and cooldown eligibility. `participant_aliases` are eligibility keys, not proof of consent; the application must construct the consenting-alias allowlist from independent current consent.
+
+The loader extracts only one to four bounded, single-line plain-text facts under `## Inspiration`, normalizes whitespace, computes a digest of the exact source bytes, and then discards the raw Markdown. An approved runtime record retains typed eligibility metadata, that digest, the minimized fact brief, and the compiled transformation-policy identifier. A quarantined record retains only a digest-derived opaque ID, the full digest, and a sorted set of closed finding codes. It retains no path, filename, parser message, copied identifier, or source body. Audience/media permission, expiry, and blocked elements remain campaign/consent policy in v1; adding them to files requires `schema_version: 2` and compatibility tests rather than silently accepting new fields.
 
 ## MVP ingestion hardening
 
-The loader/schema/weighted-selector baseline exists in `game-server`. Before enabling real private sources, complete this pipeline:
+The loader now performs deterministic pre-screening for active resources/HTML/code fences/links, common prompt/tool-injection phrases, likely contact handles/email/phone/address/employer markers, direct quotations, and the prohibited sensitive-category vocabulary in Q11. Flagged or malformed candidates are quarantined while structurally safe candidates continue through review. This is deliberately conservative lexical screening, not a claim of complete PII, consent, context, age, or safety detection. It can produce false positives and can miss obfuscated, novel, multilingual, or context-dependent material.
 
-1. Read only configured files beneath a canonical allowlisted root; reject symlinks/path traversal and enforce file/count/size limits.
-2. Parse strict UTF-8 Markdown/front matter into the typed `EventPrompt`; active markup and embedded resources are not interpreted.
-3. Scan for likely direct identifiers and disallowed sensitive categories; quarantine uncertain sources for human review.
-4. Verify participant consent records, allowed campaigns/media, expiry, and source-owner signature/review.
-5. Convert the body into a minimized, neutral fact representation. Preserve the original only in its protected source location.
-6. Register source ID, digest, schema, tags, eligibility metadata, and provenance. Normal game storage does not receive the raw body.
+Before enabling a reviewed private source, use the body-free operator pipeline:
+
+1. Verify source-owner and human-review decisions in the independent durable source registry.
+2. Verify pseudonymous participants and exact campaign/media/expiry consent before activation.
+3. Register source digest/version, provenance, themes, media, participants, sensitivities, and review without copying the raw body into PostgreSQL.
+4. Re-run registration, human review, and consent whenever a changed file produces a new exact-byte digest.
+5. Exercise revocation, deletion, global quarantine, and backup-expiry paths using the [private-inspiration runbook](../operations/private-inspiration-runbook.md).
 
 Changing a file creates a new source digest/version and requires revalidation. Consent is not inferred from Git access or from a contributor saying that something is funny.
 
 ## Random event selection
 
-The `game-server` selector—not the model—controls whether and which inspiration source may be selected from an explicit `EventEligibility` and injected `RandomSource`. MVP must persist the draw/source/cooldown outcome so selection is auditable and reproducible; the current in-memory selector alone does not provide that durability.
+The `game-server` selector—not the model—controls whether and which inspiration source may be selected. The PostgreSQL transaction derives the trusted safe trigger, party level, campaign pins, safety exclusions, verified participants, exact grants, vetoes, cooldown, and deterministic random authority. It persists the canonical eligible-set digest, selected opaque source/version digest, rational draw, algorithm, cursor interval, cooldown, and no-selection reason before source-derived presentation is used. An ineligible set consumes no cursor, and exact request replay returns the same receipt.
 
 1. An authored trigger window opens only at appropriate narrative boundaries, never mid-safety flow or during an incompatible combat state.
 2. Filter by campaign opt-in, all participant consents, audience/media, safety settings, expiry, active source version, cooldown, theme compatibility, recent use, and campaign-specific vetoes.
@@ -98,7 +111,7 @@ Always-visible controls include:
 - veto and regenerate without using the source;
 - disable one source/category or all real-life inspiration for the campaign;
 - report a privacy/safety issue and attach only opaque event/artifact IDs;
-- review who can see campaign recaps and revoke a share link.
+- review the private-campaign audience boundary. Public share links and direct canonical-document sharing do not exist in MVP.
 
 An X-card-style veto is honored first and investigated later. The UI must not ask the player to justify it. A safety intervention is not shown as a failure attributed to a participant.
 
@@ -115,7 +128,16 @@ Generated text is escaped/sanitized before rendering. Generated images pass prov
 - Encrypt sensitive source content and keep decryption access separate from ordinary game workers where practical.
 - Audit source install/update, consent changes, eligibility selection, artifact creation, viewing of restricted diagnostics, revocation, and deletion using opaque IDs.
 - Never place real-life text in metrics, tracing spans, crash reports, analytics labels, support tickets, or model-evaluation corpora.
-- Incident response includes disabling generation globally, invalidating share links, quarantining artifacts, rotating credentials, notifying affected users as policy/law requires, and preserving a minimal investigation audit.
+- Incident response includes disabling generation globally, confirming that no MVP share route exists, quarantining artifacts, rotating credentials, notifying affected users as policy/law requires, and preserving a minimal investigation audit.
+
+The offline `inspiration-admin` binary supplies the current source inventory,
+verification, registration/review, safety setup, grant/revocation, scoped export,
+participant deletion, global switch, and tombstone-expiry workflows. It accepts a
+closed body-free JSON schema only. Participant deletion refuses to run while a
+configured source still contains that pseudonym, then atomically revokes grants,
+quarantines registry sources, cancels pending work, applies artifact policy, and
+retains an opaque 35-day tombstone. See the [operator and incident
+runbook](../operations/private-inspiration-runbook.md).
 
 ## Release gate
 

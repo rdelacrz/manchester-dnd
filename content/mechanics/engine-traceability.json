@@ -1,0 +1,422 @@
+{
+  "engine_traceability_schema": "engine-mechanic-traceability/v1",
+  "ruleset_id": "srd-5.1-cc",
+  "pack_manifest_path": "content/packs/core-mvp/manifest.json",
+  "content_traceability_path": "content/packs/core-mvp/mechanics/traceability.json",
+  "source_documents": [
+    {
+      "document_key": "source-document:official:srd5.1-cc",
+      "title": "System Reference Document 5.1",
+      "version": "5.1",
+      "publisher": "Wizards of the Coast LLC",
+      "official": true,
+      "location": "https://media.dndbeyond.com/compendium-images/srd/5.1/SRD_CC_v5.1.pdf",
+      "landing_page": "https://www.dndbeyond.com/srd",
+      "digest": "sha256:2504d2a0abb0a4d491a939be4f17910a2dde0312570ab8d208080225ccf0a1f0",
+      "license_class": "srd5_1_cc",
+      "license_id": "CC-BY-4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
+      "required_notice_path": "content/packs/core-mvp/notices/NOTICE.txt",
+      "modification_note": "Mechanics are represented as original typed Rust and normalized metadata; SRD prose, art, and layout are not copied.",
+      "source_keys": [
+        "source:srd5.1:ability-score-standard-array",
+        "source:srd5.1:ability-tests-saving-throws",
+        "source:srd5.1:armor-chain-mail",
+        "source:srd5.1:armor-leather",
+        "source:srd5.1:armor-shield",
+        "source:srd5.1:background-sage",
+        "source:srd5.1:background-soldier",
+        "source:srd5.1:class-fighter-levels-1-2",
+        "source:srd5.1:class-wizard-levels-1-2",
+        "source:srd5.1:combat-actions-movement",
+        "source:srd5.1:combat-attacks-range-cover",
+        "source:srd5.1:conditions",
+        "source:srd5.1:damage-healing-death",
+        "source:srd5.1:difficulty-classes",
+        "source:srd5.1:equipment-arcane-focus",
+        "source:srd5.1:equipment-explorers-pack",
+        "source:srd5.1:equipment-inventory-currency",
+        "source:srd5.1:equipment-light-crossbow",
+        "source:srd5.1:equipment-longsword",
+        "source:srd5.1:equipment-scholars-pack",
+        "source:srd5.1:equipment-simple-weapons",
+        "source:srd5.1:equipment-spellbook",
+        "source:srd5.1:fighter-level-1-features",
+        "source:srd5.1:fighter-level-2-features",
+        "source:srd5.1:races-human",
+        "source:srd5.1:rests-class-resources",
+        "source:srd5.1:spell-fire-bolt",
+        "source:srd5.1:spell-light",
+        "source:srd5.1:spell-mage-hand",
+        "source:srd5.1:spell-magic-missile",
+        "source:srd5.1:spell-shield",
+        "source:srd5.1:spell-sleep",
+        "source:srd5.1:wizard-level-1-features",
+        "source:srd5.1:wizard-level-2-features"
+      ]
+    },
+    {
+      "document_key": "source-document:project:mvp-policy-2026-07-14",
+      "title": "MVP product and policy resolutions",
+      "version": "2026-07-14",
+      "publisher": "Manchester Arcana maintainers",
+      "official": false,
+      "location": "docs/planning/12-mvp-policy-resolutions.md",
+      "landing_page": null,
+      "digest": "sha256:f9f21cba7e70f8e7a605681079d399e22cfb0827bda30d0d5e2b4de65997d7a3",
+      "license_class": "original_private_evaluation",
+      "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+      "license_url": null,
+      "required_notice_path": "content/packs/core-mvp/notices/NOTICE.txt",
+      "modification_note": "Private MVP decisions are normalized to stable mechanic identifiers and executable tests.",
+      "source_keys": [
+        "source:original:q04-aftermath",
+        "source:original:q04-canal-warden",
+        "source:original:q04-cleansing-sluice",
+        "source:original:q04-context-objective",
+        "source:original:q04-fixed-encounter",
+        "source:original:q04-primary-objective",
+        "source:original:q04-soot-claw",
+        "source:original:q04-soot-wight",
+        "source:original:q06-story-recovery",
+        "source:original:q07-high-stakes-confirmation"
+      ]
+    },
+    {
+      "document_key": "source-document:project:rules-profile-2026-07-14",
+      "title": "Rules and gameplay profile",
+      "version": "2026-07-14",
+      "publisher": "Manchester Arcana maintainers",
+      "official": false,
+      "location": "docs/planning/03-rules-and-gameplay.md",
+      "landing_page": null,
+      "digest": "sha256:fc9b461393f61390ddc8c19e9a869235edfec0b174009c074d72bdf2f886da20",
+      "license_class": "original_private_evaluation",
+      "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+      "license_url": null,
+      "required_notice_path": "content/packs/core-mvp/notices/NOTICE.txt",
+      "modification_note": "Original closed-world exploration, social, and unsupported-mechanic policies are implemented as typed transitions.",
+      "source_keys": [
+        "source:original:rules-profile-exploration-social",
+        "source:original:rules-profile-unsupported-boundary"
+      ]
+    }
+  ],
+  "implementation_only_mechanics": [
+    {
+      "mechanic_id": "srd-5.1-cc:rule:d20-test-resolution",
+      "source_key": "source:srd5.1:ability-tests-saving-throws",
+      "source_location": "SRD 5.1 CC, Using Ability Scores, Ability Checks and Saving Throws; Combat, Attack Rolls",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::resolve_d20_test",
+        "manchester_dnd_core::rules_matrix::resolve_conditioned_d20_test",
+        "manchester_dnd_core::rules_matrix::combine_roll_context"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::d20_tests_cancel_opposed_sources_and_apply_cover_only_where_relevant",
+        "manchester_dnd_core::rules_matrix::tests::attack_natural_one_and_twenty_are_attack_only_rules"
+      ],
+      "modification_note": "Closed request and resolution types separate ordinary checks, saves, and attack-only natural-roll behavior."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:weapon-attacks-range-cover",
+      "source_key": "source:srd5.1:combat-attacks-range-cover",
+      "source_location": "SRD 5.1 CC, Combat, Making an Attack, Ranged Attacks, Melee Attacks, Cover, and Damage Rolls",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::resolve_weapon_range",
+        "manchester_dnd_core::rules_matrix::resolve_damage_dice",
+        "manchester_dnd_core::rules_matrix::resolve_weapon_attack",
+        "manchester_dnd_core::rules_matrix::resolve_conditioned_weapon_attack"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::exact_weapon_modes_and_ranges_are_closed",
+        "manchester_dnd_core::rules_matrix::tests::derived_weapon_attack_resolves_cover_critical_dice_and_interaction",
+        "manchester_dnd_core::rules_matrix::tests::critical_damage_doubles_dice_but_not_modifier"
+      ],
+      "modification_note": "Only the MVP weapon modes, numeric ranges, cover bands, critical dice, and damage interactions are encoded."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:conditions-and-durations",
+      "source_key": "source:srd5.1:conditions",
+      "source_location": "SRD 5.1 CC, Appendix A: Conditions; Combat, The Order of Combat",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::process_durations",
+        "manchester_dnd_core::rules_matrix::condition_effects"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::reachable_conditions_have_exhaustive_combat_effects",
+        "manchester_dnd_core::rules_matrix::tests::duration_processing_expires_only_at_the_named_boundary_or_sleep_wake_event"
+      ],
+      "modification_note": "The reachable condition subset and named duration boundaries are represented without copying condition prose."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:movement-core-actions-turns",
+      "source_key": "source:srd5.1:combat-actions-movement",
+      "source_location": "SRD 5.1 CC, Combat, Movement and Position, Actions in Combat, Reactions, and Other Activity on Your Turn",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::move_to",
+        "manchester_dnd_core::rules_matrix::stand_from_prone",
+        "manchester_dnd_core::rules_matrix::action_availability",
+        "manchester_dnd_core::rules_matrix::spend_action",
+        "manchester_dnd_core::rules_matrix::apply_core_action",
+        "manchester_dnd_core::rules_matrix::RuntimeTurnState::begin_next_turn",
+        "manchester_dnd_core::rules_matrix::RuntimeTurnState::end_turn"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::movement_and_all_core_actions_are_contextual_and_deterministic",
+        "manchester_dnd_core::rules_matrix::tests::runtime_turn_processes_boundaries_and_resets_exact_resources"
+      ],
+      "modification_note": "Core action and movement availability is a closed deterministic state transition for the MVP turn surface."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:damage-healing-death-saves",
+      "source_key": "source:srd5.1:damage-healing-death",
+      "source_location": "SRD 5.1 CC, Combat, Damage and Healing, Dropping to 0 Hit Points, Death Saving Throws, Stabilizing, and Temporary Hit Points",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::apply_damage",
+        "manchester_dnd_core::rules_matrix::apply_health_condition_changes",
+        "manchester_dnd_core::rules_matrix::apply_healing",
+        "manchester_dnd_core::rules_matrix::grant_temporary_hit_points",
+        "manchester_dnd_core::rules_matrix::resolve_death_save",
+        "manchester_dnd_core::rules_matrix::stabilize"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::health_transitions_hold_for_a_wide_damage_range",
+        "manchester_dnd_core::rules_matrix::tests::damage_interactions_cancel_or_transform_after_dice",
+        "manchester_dnd_core::rules_matrix::tests::death_saves_stabilization_healing_and_story_recovery_follow_q06"
+      ],
+      "modification_note": "Typed health transitions encode the selected SRD-derived damage, healing, zero-HP, stabilization, and death-save mechanics."
+    },
+    {
+      "mechanic_id": "manchester-arcana-policy:v1:rule:q06-story-recovery",
+      "source_key": "source:original:q06-story-recovery",
+      "source_location": "docs/planning/12-mvp-policy-resolutions.md, Q06",
+      "license_class": "original_private_evaluation",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::apply_defeat_recovery"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::death_saves_stabilization_healing_and_story_recovery_follow_q06"
+      ],
+      "modification_note": "The original private-MVP non-terminal defeat policy is kept distinct from SRD-derived death mechanics."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:class-resources-and-rests-levels-1-2",
+      "source_key": "source:srd5.1:rests-class-resources",
+      "source_location": "SRD 5.1 CC, Adventuring, Resting; Classes, Fighter and Wizard class features at levels 1 and 2",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::spend_hit_die",
+        "manchester_dnd_core::rules_matrix::take_short_rest",
+        "manchester_dnd_core::rules_matrix::take_long_rest"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::fighter_resources_second_wind_action_surge_and_rests_transition",
+        "manchester_dnd_core::rules_matrix::tests::wizard_hit_dice_arcane_recovery_and_long_rest_are_bounded",
+        "manchester_dnd_core::rules_matrix::tests::hit_die_spending_exhausts_class_level_modifier_face_and_health_bounds",
+        "manchester_dnd_core::rules_matrix::tests::short_rest_and_arcane_recovery_exhaust_resources_and_fail_atomically",
+        "manchester_dnd_core::rules_matrix::tests::long_rest_exhausts_level_one_two_health_and_resource_recovery"
+      ],
+      "modification_note": "One-die-at-a-time healing decisions, atomic short-rest and Arcane Recovery benefits, and bounded long-rest restoration are encoded for levels one and two but remain outside the live encounter surface; trusted campaign time and interruption policy still belong to a future application bridge."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:inventory-equipment-currency",
+      "source_key": "source:srd5.1:equipment-inventory-currency",
+      "source_location": "SRD 5.1 CC, Equipment, Starting Equipment, Wealth, Armor and Shields, Weapons, and Adventuring Gear",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::Currency",
+        "manchester_dnd_core::rules_matrix::InventoryState",
+        "manchester_dnd_core::rules_matrix::runtime_armor_class"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::inventory_enforces_authored_capacity_and_currency_is_value_preserving"
+      ],
+      "modification_note": "The implementation uses authored MVP capacity and equipment state; it does not claim a complete encumbrance or item-use system."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:spell:light",
+      "source_key": "source:srd5.1:spell-light",
+      "source_location": "SRD 5.1 CC, Spells, Light",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": ["manchester_dnd_core::rules_matrix::resolve_supported_spell"],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::light_and_mage_hand_apply_exact_targeting_without_slots",
+        "manchester_dnd_core::rules_matrix::tests::light_exhausts_target_component_save_and_resource_boundaries"
+      ],
+      "modification_note": "Light is a typed caster-scoped effect resolver with exhaustive touch, object-size, hostile-carrier save, component, action, and no-slot boundaries; persistence and presentation remain unexposed."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:spell:mage-hand",
+      "source_key": "source:srd5.1:spell-mage-hand",
+      "source_location": "SRD 5.1 CC, Spells, Mage Hand",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::resolve_supported_spell",
+        "manchester_dnd_core::rules_matrix::resolve_mage_hand_action",
+        "manchester_dnd_core::rules_matrix::advance_mage_hand_duration",
+        "manchester_dnd_core::rules_matrix::reconcile_mage_hand_distance"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::light_and_mage_hand_apply_exact_targeting_without_slots",
+        "manchester_dnd_core::rules_matrix::tests::mage_hand_separates_cast_control_duration_and_closed_limits"
+      ],
+      "modification_note": "Mage Hand casting, later action-based control, dismissal, duration expiry, range loss, weight, magic-item, and closed-operation limits are distinct typed transitions; persistence and presentation remain unexposed."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:spell:shield",
+      "source_key": "source:srd5.1:spell-shield",
+      "source_location": "SRD 5.1 CC, Spells, Shield",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": ["manchester_dnd_core::rules_matrix::resolve_supported_spell"],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::magic_missile_shield_and_sleep_have_typed_resource_effects",
+        "manchester_dnd_core::rules_matrix::tests::shield_exhausts_trigger_reaction_slot_and_negation_boundaries"
+      ],
+      "modification_note": "Shield is a typed reaction resolver with exhaustive actual-hit, natural-roll, AC, +5 negation, magic-missile, component, slot, reaction, and atomic failure boundaries."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:spell:sleep",
+      "source_key": "source:srd5.1:spell-sleep",
+      "source_location": "SRD 5.1 CC, Spells, Sleep",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": ["manchester_dnd_core::rules_matrix::resolve_supported_spell"],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::magic_missile_shield_and_sleep_have_typed_resource_effects",
+        "manchester_dnd_core::rules_matrix::tests::invalid_spell_target_is_atomic_and_unknown_spells_are_structured",
+        "manchester_dnd_core::rules_matrix::tests::sleep_exhausts_pool_order_immunity_area_and_atomicity"
+      ],
+      "modification_note": "Sleep is a typed 5d8 hit-point-pool and condition resolver with exhaustive range, area, ordering, equality, immunity, unconscious-target, component, resource, candidate-count, and atomic failure boundaries."
+    },
+    {
+      "mechanic_id": "srd-5.1-cc:rule:trusted-difficulty-and-checks",
+      "source_key": "source:srd5.1:difficulty-classes",
+      "source_location": "SRD 5.1 CC, Using Ability Scores, Ability Checks, Typical Difficulty Classes, Skills, and Passive Checks",
+      "license_class": "srd5_1_cc",
+      "implementation_symbols": [
+        "manchester_dnd_core::rules_matrix::map_trusted_difficulty",
+        "manchester_dnd_core::rules_matrix::resolve_trusted_check",
+        "manchester_dnd_core::rules_matrix::passive_skill_value"
+      ],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::difficulty_bands_are_trusted_and_every_high_stakes_kind_requires_confirmation",
+        "manchester_dnd_core::rules_matrix::tests::trusted_skill_check_and_passive_values_use_derived_skill_ability"
+      ],
+      "modification_note": "Trusted closed difficulty bands and derived skills prevent callers from injecting raw mechanics."
+    },
+    {
+      "mechanic_id": "manchester-arcana-policy:v1:rule:q07-high-stakes-confirmation",
+      "source_key": "source:original:q07-high-stakes-confirmation",
+      "source_location": "docs/planning/12-mvp-policy-resolutions.md, Q07",
+      "license_class": "original_private_evaluation",
+      "implementation_symbols": ["manchester_dnd_core::rules_matrix::map_trusted_difficulty"],
+      "test_ids": ["manchester_dnd_core::rules_matrix::tests::difficulty_bands_are_trusted_and_every_high_stakes_kind_requires_confirmation"],
+      "modification_note": "The confirmation requirement is original product policy layered over the source-traced difficulty mapping."
+    },
+    {
+      "mechanic_id": "manchester-arcana-policy:v1:rule:exploration-social-state",
+      "source_key": "source:original:rules-profile-exploration-social",
+      "source_location": "docs/planning/03-rules-and-gameplay.md, Exploration, social, clocks, and objectives",
+      "license_class": "original_private_evaluation",
+      "implementation_symbols": ["manchester_dnd_core::rules_matrix::apply_exploration_social_command"],
+      "test_ids": ["manchester_dnd_core::rules_matrix::tests::exploration_objectives_clocks_attitudes_and_turns_are_closed_transitions"],
+      "modification_note": "Objectives, clocks, and NPC attitude are original closed game-state transitions rather than attributed SRD mechanics."
+    },
+    {
+      "mechanic_id": "manchester-arcana-policy:v1:rule:unsupported-boundary",
+      "source_key": "source:original:rules-profile-unsupported-boundary",
+      "source_location": "docs/planning/03-rules-and-gameplay.md, Rules authority boundary and unsupported mechanics",
+      "license_class": "original_private_evaluation",
+      "implementation_symbols": ["manchester_dnd_core::rules_matrix::unsupported_mechanic"],
+      "test_ids": [
+        "manchester_dnd_core::rules_matrix::tests::invalid_spell_target_is_atomic_and_unknown_spells_are_structured",
+        "manchester_dnd_core::rules_matrix::tests::strict_wire_types_reject_unknown_fields"
+      ],
+      "modification_note": "Unknown mechanics fail as a typed error with authored alternatives and never fall through to narration."
+    }
+  ],
+  "implementation_only_capabilities": [
+    {
+      "capability_id": "rules-matrix.d20-resolution-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["srd-5.1-cc:rule:d20-test-resolution"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.weapon-resolution-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["srd-5.1-cc:rule:weapon-attacks-range-cover"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.conditions-durations-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["srd-5.1-cc:rule:conditions-and-durations"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.core-actions-movement-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["srd-5.1-cc:rule:movement-core-actions-turns"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.health-death-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": [
+        "srd-5.1-cc:rule:damage-healing-death-saves",
+        "manchester-arcana-policy:v1:rule:q06-story-recovery"
+      ],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.class-resources-rests-unexposed-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["srd-5.1-cc:rule:class-resources-and-rests-levels-1-2"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.inventory-equipment-currency-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["srd-5.1-cc:rule:inventory-equipment-currency"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.spells-unexposed-q04-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": [
+        "srd-5.1-cc:spell:light",
+        "srd-5.1-cc:spell:mage-hand",
+        "srd-5.1-cc:spell:shield",
+        "srd-5.1-cc:spell:sleep"
+      ],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.trusted-checks-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": [
+        "srd-5.1-cc:rule:trusted-difficulty-and-checks",
+        "manchester-arcana-policy:v1:rule:q07-high-stakes-confirmation"
+      ],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.exploration-social-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["manchester-arcana-policy:v1:rule:exploration-social-state"],
+      "consuming_content": []
+    },
+    {
+      "capability_id": "rules-matrix.unsupported-boundary-v1",
+      "exposure": "implemented_not_exposed",
+      "mechanic_ids": ["manchester-arcana-policy:v1:rule:unsupported-boundary"],
+      "consuming_content": []
+    }
+  ]
+}

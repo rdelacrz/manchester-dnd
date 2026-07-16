@@ -1,0 +1,409 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  RUSTUP_TOOLCHAIN: 1.90.0
+  DATABASE_URL: postgresql://manchester_arcana:manchester_arcana@127.0.0.1:5432/manchester_arcana
+  APP_ACCESS_MODE: local
+  EVENT_PROMPT_DIR: prompts/events/private
+  TEXT_LLM_BACKEND: disabled
+  IMAGE_LLM_BACKEND: disabled
+
+jobs:
+  rust-quality-and-tests:
+    name: Rust format, Clippy, and workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: manchester_arcana
+          POSTGRES_USER: manchester_arcana
+          POSTGRES_PASSWORD: manchester_arcana
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manchester_arcana -d manchester_arcana"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Check feature-gated one-time legacy importer
+        run: >-
+          cargo clippy --locked -p manchester-dnd-server
+          --features legacy-import --bin legacy-import -- -D warnings
+
+      - name: Run workspace tests against PostgreSQL
+        run: cargo test --locked --workspace
+
+      - name: Run focused penetration boundary portfolio
+        run: scripts/run-penetration-smoke.sh
+
+      - name: Upload penetration boundary evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: penetration-smoke-evidence
+          path: target/release-evidence/penetration-smoke
+          if-no-files-found: error
+          retention-days: 30
+
+  fuzz-smoke:
+    name: Bounded parser and schema fuzz campaigns
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned fuzz Rust toolchain
+        run: rustup toolchain install nightly-2026-06-12 --profile minimal
+
+      - name: Install pinned cargo-fuzz
+        run: cargo +nightly-2026-06-12 install --locked --version 0.13.2 cargo-fuzz
+
+      - name: Run bounded AddressSanitizer fuzz campaigns
+        run: scripts/run-fuzz-smoke.sh
+
+      - name: Upload fuzz logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-smoke-evidence
+          path: target/release-evidence/fuzz-smoke
+          if-no-files-found: error
+          retention-days: 30
+
+  load-soak:
+    name: PostgreSQL concurrency and worker load/soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: manchester_arcana
+          POSTGRES_USER: manchester_arcana
+          POSTGRES_PASSWORD: manchester_arcana
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manchester_arcana -d manchester_arcana"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+
+      - name: Run bounded parallel load/soak contracts
+        run: scripts/run-load-soak.sh
+
+      - name: Upload load/soak measurements
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: load-soak-evidence
+          path: target/release-evidence/load-soak
+          if-no-files-found: error
+          retention-days: 30
+
+  migrations-and-docs:
+    name: Migrations, documentation links, and repository secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: manchester_arcana
+          POSTGRES_USER: manchester_arcana
+          POSTGRES_PASSWORD: manchester_arcana
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manchester_arcana -d manchester_arcana"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-client
+
+      - name: Validate migrations on PostgreSQL
+        run: scripts/validate-migrations.sh
+
+      - name: Validate mechanic source and capability traceability
+        run: |
+          python3 scripts/validate_mechanic_traceability.py
+          python3 -m unittest scripts/tests/test_validate_mechanic_traceability.py
+
+      - name: Validate complete release-asset provenance
+        run: |
+          python3 scripts/validate_release_provenance.py
+          python3 -m unittest scripts/tests/test_validate_release_provenance.py
+
+      - name: Check local documentation links
+        run: scripts/check-doc-links.sh
+
+      - name: Scan checked-in files for credential signatures
+        run: scripts/scan-secrets.sh
+
+  supply-chain:
+    name: Advisory, license, provenance, and reproducible SBOM gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+
+      - name: Install pinned Rust supply-chain tools
+        run: |
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo install --locked --version 0.20.2 cargo-deny
+          cargo install --locked --version 0.5.9 cargo-cyclonedx
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.17.0
+          cache: npm
+
+      - name: Install lockfile-only JavaScript dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run dependency policy and mutation tests
+        run: |
+          python3 -m unittest scripts/tests/test_validate_javascript_dependencies.py
+          scripts/check-release-dependencies.sh
+
+      - name: Generate reproducible CycloneDX and release-asset inventories
+        run: scripts/generate-release-sbom.sh
+
+      - name: Upload release SBOM evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-sbom
+          path: target/release-evidence/sbom
+          if-no-files-found: error
+          retention-days: 30
+
+  release-and-browser-evidence:
+    name: Release SSR/WASM, boundary smoke, and browser matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: manchester_arcana
+          POSTGRES_USER: manchester_arcana
+          POSTGRES_PASSWORD: manchester_arcana
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manchester_arcana -d manchester_arcana"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust and WASM target
+        run: rustup toolchain install 1.90.0 --profile minimal --target wasm32-unknown-unknown
+
+      - name: Install pinned cargo-leptos
+        run: cargo install cargo-leptos --locked --version 0.3.7
+
+      - name: Build production SSR and WASM artifacts
+        run: >-
+          cargo leptos build --release
+          --bin-cargo-args=--locked
+          --lib-cargo-args=--locked
+
+      - name: Build release-only operations helpers used by browser evidence
+        run: cargo build --locked --release -p manchester-dnd-server --bin inspiration-admin
+
+      - name: Install PostgreSQL client for outage evidence
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-client
+
+      - name: Run provider-disabled HTTP and fail-closed smoke
+        env:
+          SMOKE_ADDRESS: 127.0.0.1:6791
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/provider-disabled-smoke
+          SMOKE_DATABASE_OUTAGE: '1'
+        run: |
+          text_canary="MA_TEXT_$(openssl rand -hex 24)"
+          image_canary="MA_IMAGE_$(openssl rand -hex 24)"
+          export TEXT_LLM_API_KEY="$text_canary"
+          export IMAGE_LLM_API_KEY="$image_canary"
+          export SECRET_SCAN_CANARIES="$text_canary"$'\n'"$image_canary"
+          export SECRET_SCAN_REQUIRE_CANARIES=1
+          scripts/provider-disabled-smoke.sh
+          scripts/scan-secrets.sh \
+            target/release/manchester-dnd-web \
+            target/site \
+            "$SMOKE_EVIDENCE_DIR"
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.17.0
+          cache: npm
+
+      - name: Install pinned browser-test dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install pinned Playwright browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Run desktop and mobile SSR, hydration, and accessibility evidence
+        run: npm run test:browser
+
+      - name: Run deterministic-fake narration retry and replay evidence
+        run: npm run test:browser:slice3
+
+      - name: Run private-inspiration live ingestion and consent evidence
+        run: npm run test:browser:slice5
+
+      - name: Run asynchronous scene-image worker and delivery evidence
+        run: npm run test:browser:slice6
+
+      - name: Run consolidated create-to-resume release journey
+        run: npm run test:browser:journey
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slice-0-playwright-report
+          path: |
+            target/playwright/report
+            target/playwright/slice3-report
+            target/playwright/slice5-report
+            target/playwright/slice6-report
+            target/playwright/release-journey-report
+          if-no-files-found: ignore
+          retention-days: 14
+
+  database-recovery-drills:
+    name: PostgreSQL roles, encrypted restore, and operations evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+
+      - name: Start pinned local PostgreSQL
+        run: docker compose up -d --wait postgres
+
+      - name: Create disposable protected RNG key
+        run: |
+          install -d -m 0700 data
+          head -c 32 /dev/urandom > data/rng-master.key
+          chmod 0600 data/rng-master.key
+
+      - name: Run encrypted isolated restore and expiry drill
+        run: scripts/run-database-recovery-drill.sh
+
+      - name: Verify least-privilege role policy
+        run: scripts/check-postgres-role-policy.sh
+
+      - name: Stop disposable PostgreSQL
+        if: ${{ always() }}
+        run: docker compose down --volumes --remove-orphans
+
+  container-build:
+    name: Minimal runtime build, SBOM, vulnerability scan, and provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: manchester_arcana
+          POSTGRES_USER: manchester_arcana
+          POSTGRES_PASSWORD: manchester_arcana
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manchester_arcana -d manchester_arcana"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build pinned multi-stage image
+        run: >-
+          docker build --pull
+          --build-arg VCS_REF=${{ github.sha }}
+          --tag manchester-arcana:${{ github.sha }} .
+
+      - name: Run packaged server and restart smoke
+        run: scripts/run-container-smoke.sh manchester-arcana:${{ github.sha }}
+
+      - name: Install checksum-verified Syft and Grype
+        run: scripts/install-pinned-supply-chain-tools.sh "${RUNNER_TEMP}/supply-chain/bin"
+
+      - name: Validate and scan final nonroot runtime image
+        env:
+          PATH: ${{ runner.temp }}/supply-chain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: scripts/scan-runtime-image.sh manchester-arcana:${{ github.sha }}
+
+      - name: Run release artifact policy mutation tests
+        run: python3 -m unittest scripts/tests/test_release_artifact_policy.py
+
+      - name: Upload runtime SBOM, vulnerability, and provenance evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-container-evidence
+          path: |
+            target/release-evidence/container-scan
+            target/release-evidence/container-smoke
+          if-no-files-found: error
+          retention-days: 30

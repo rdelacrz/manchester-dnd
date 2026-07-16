@@ -14,12 +14,28 @@ leptos_router.workspace = true
 manchester-dnd-core.workspace = true
 manchester-dnd-server = { workspace = true, optional = true }
 serde.workspace = true
+serde_json.workspace = true
 tracing = { workspace = true, optional = true }
 uuid.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { version = "0.4.56", optional = true }
+web-sys = { workspace = true, optional = true, features = [
+    "Headers",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Storage",
+    "Window",
+] }
 
 [features]
 default = []
-hydrate = ["leptos/hydrate"]
+hydrate = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "leptos/hydrate",
+]
 ssr = [
     "dep:http",
     "dep:leptos_axum",

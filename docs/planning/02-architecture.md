@@ -2,7 +2,7 @@
 
 ## Current modular workspace
 
-Manchester Arcana starts as a Rust modular monolith using Leptos 0.8, Axum, SQLx, and SQLite. The implemented workspace is the architectural baseline:
+Manchester Arcana starts as a Rust modular monolith using Leptos 0.8, Axum, SQLx, and PostgreSQL. The implemented workspace is the architectural baseline:
 
 ```text
 app/                 shared Leptos components, routes, and server functions
@@ -11,10 +11,10 @@ server/              Axum SSR binary and static-file integration
 crates/game-core/    framework-independent rules, characters, dice, progression,
                      session DTOs, and declarative AI-GM proposals
 crates/game-server/  server-only application orchestration, configuration,
-                     generation, GM, event prompts, SQLite, and boundary errors
+                     generation, GM, event prompts, PostgreSQL, and boundary errors
 content/             approved versioned rules/content sources
 prompts/             system, theme, and private-event prompt roots
-migrations/          SQLite migrations
+migrations/          PostgreSQL migrations
 public/ and style/    static assets and application styling
 ```
 
@@ -31,7 +31,7 @@ Browser command: campaign/character/action IDs + expected revision + idempotency
   → Leptos server function + loopback HTTP Host/Origin gate
   → GameApplicationService selects trusted rules, actor, time, and dice
   → game-core validates/resolves the authored ability check
-  → one SQLite transaction advances the session and appends
+  → one PostgreSQL transaction locks/advances the session and appends
     AbilityCheckResolved audit + command receipt
   → public outcome DTO returned to the hydrated UI
 ```
@@ -96,7 +96,7 @@ IMAGE_LLM_BACKEND, IMAGE_LLM_BASE_URL, IMAGE_LLM_API_KEY, IMAGE_LLM_MODEL
 IMAGE_LLM_TIMEOUT_SECONDS, IMAGE_LLM_SIZE
 ```
 
-`TEXT_LLM_*` and `IMAGE_LLM_*` are independent so text and image use different backends/models. MVP accepts the implemented `disabled` and `openai-compatible` backends; disabled is the safe local default. Validate URLs, timeouts, temperature/token bounds, model requirements, SQLite URLs, and prompt roots at startup. Store a non-secret profile fingerprint with retained output.
+`TEXT_LLM_*` and `IMAGE_LLM_*` are independent so text and image use different backends/models. MVP accepts the implemented `disabled` and `openai-compatible` backends; disabled is the safe local default. Validate URLs, timeouts, temperature/token bounds, model requirements, PostgreSQL URLs, and prompt roots at startup. Treat `DATABASE_URL` as secret-bearing because it may contain credentials, and store only non-secret profile fingerprints with retained output.
 
 `APP_ACCESS_MODE` defaults to `local`. Startup accepts local mode only on a loopback `LEPTOS_SITE_ADDR`; selecting `hosted` currently produces a field-specific startup error regardless of bind address. This fail-closed behavior prevents an unauthenticated local build from being exposed as if it were hosted.
 
@@ -116,20 +116,20 @@ Preserve causal sources internally with `#[source]`/`#[from]`. Client messages m
 
 ## Generation execution
 
-Text narration may run inline only under a strict deadline, after mechanics are safely saved. Image generation and slow text should use a durable SQLite job table with `queued`, `running`, `succeeded`, `failed`, and `cancelled` states, lease expiry, attempts, and retry time. Until that addition exists, generation is a bounded server operation and must not be described as crash-durable.
+Text narration may run inline only under a strict deadline, after mechanics are safely saved. Image generation and slow text should use a durable PostgreSQL job table with `queued`, `running`, `succeeded`, `failed`, and `cancelled` states, lease expiry, attempts, and retry time. Workers claim jobs with transactional row locking such as `FOR UPDATE SKIP LOCKED`. Until that addition exists, generation is a bounded server operation and must not be described as crash-durable.
 
 Provider adapters receive only minimized approved DTOs and cannot access repositories/files directly. Timeouts, bounded retries, concurrency/cost limits, circuit breaking, and deterministic fallbacks live in `game-server` orchestration.
 
 ## Persistence and deployment evolution
 
-- **Current first deployment:** one loopback-only Axum/Leptos server in explicit local single-user mode; SQLite database at `DATABASE_URL`; local protected prompt directory; local/static assets. Hosted mode is disabled at startup until authentication exists.
+- **Current first deployment:** one loopback-only Axum/Leptos server in explicit local single-user mode; PostgreSQL at secret-bearing `DATABASE_URL`; local protected prompt directory; local/static assets. Hosted mode is disabled at startup until authentication exists.
 - **MVP evolution:** optional worker loop in the same deployment when durable jobs arrive, followed by an authenticated hosted mode only after its security gates pass.
-- **Hosted MVP hardening:** single-writer-aware transactions, WAL/busy-timeout policy, file permissions, consistent backup/restore, bounded worker concurrency, and persistent volume.
-- **Scale trigger:** measured write contention, multi-instance failover needs, or operational limits justify a planned PostgreSQL migration. Add repository compatibility tests and migration/export tooling first.
-- **Later scale:** independently deploy web/workers and move assets to an authorized object store. Introduce a queue or generation service only after database-job/egress pressure warrants it.
+- **Hosted MVP hardening:** bounded connection pools, deterministic row-lock order, expected-revision checks, short transactions, least-privilege roles, encrypted connections, reviewed migrations, consistent backup/restore, and bounded worker concurrency.
+- **Scale trigger:** measured pool saturation, lock contention, database size, read load, queue pressure, or failover requirements justify topology changes such as a managed PostgreSQL service, connection proxy, read replicas, or partitioning—never speculative complexity.
+- **Later scale:** independently deploy web/workers and move assets to an authorized object store. Introduce an external queue or generation service only after PostgreSQL job/egress pressure warrants it.
 
 Threat controls are in [quality, observability, and security](09-quality-observability-security.md).
 
 ## Operational health
 
-The Axum binary exposes `GET /health/live`, which returns success while the process can serve requests, and `GET /health/ready`, which runs the repository `SELECT 1` check and returns service unavailable when SQLite is not ready. Readiness does not call either model provider and therefore measures the authoritative game path rather than optional generation availability.
+The Axum binary exposes `GET /health/live`, which returns success while the process can serve requests, and `GET /health/ready`, which runs the repository `SELECT 1` check and returns service unavailable when PostgreSQL is not ready. Readiness does not call either model provider and therefore measures the authoritative game path rather than optional generation availability.

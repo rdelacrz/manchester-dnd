@@ -1,20 +1,43 @@
 use std::{
     env, fmt,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     str::FromStr,
     time::Duration,
 };
 
+use manchester_dnd_core::{
+    Sha256Digest,
+    hero::{EMBERLINE_THEME_PACK_ID, RAINBOUND_THEME_PACK_ID},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::error::ConfigError;
 
-const DEFAULT_DATABASE_URL: &str = "sqlite://data/manchester-arcana.db";
+const DEFAULT_DATABASE_URL: &str = "postgresql://127.0.0.1/manchester_arcana";
+const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS: u64 = 5_000;
+const DEFAULT_DATABASE_STATEMENT_TIMEOUT_MILLISECONDS: u64 = 30_000;
+const DEFAULT_DATABASE_LOCK_TIMEOUT_MILLISECONDS: u64 = 5_000;
+const DEFAULT_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS: u64 = 15_000;
+const DEFAULT_CONTENT_PACK_ROOT: &str = "content/packs";
+const DEFAULT_CONTENT_THEME_PACK_ID: &str = RAINBOUND_THEME_PACK_ID;
 const DEFAULT_EVENT_PROMPTS_DIR: &str = "prompts/events/private";
+const DEFAULT_IMAGE_ARTIFACT_ROOT: &str = "data/generated-images";
+const DEFAULT_RNG_MASTER_KEY_FILE: &str = "data/rng-master.key";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
 const MAX_OUTPUT_TOKENS: u32 = 128_000;
+const DEFAULT_CAMPAIGN_GENERATION_REQUEST_BUDGET: u64 = 256;
+const DEFAULT_TURN_GENERATION_REQUEST_BUDGET: u64 = 8;
+const DEFAULT_CAMPAIGN_GENERATION_TOKEN_BUDGET: u64 = 4_000_000;
+const DEFAULT_TURN_GENERATION_TOKEN_BUDGET: u64 = 512_000;
+const DEFAULT_CAMPAIGN_GENERATION_LATENCY_BUDGET_MILLISECONDS: u64 = 3_600_000;
+const DEFAULT_TURN_GENERATION_LATENCY_BUDGET_MILLISECONDS: u64 = 600_000;
+const DEFAULT_MAX_CAMPAIGN_GENERATION_CONCURRENCY: u16 = 2;
+const DEFAULT_GENERATION_WORKER_BATCH_SIZE: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
@@ -63,6 +86,7 @@ impl fmt::Display for SecretString {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmBackend {
     Disabled,
+    Fake,
     OpenAiCompatible,
 }
 
@@ -72,8 +96,9 @@ impl FromStr for LlmBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "disabled" | "none" | "off" => Ok(Self::Disabled),
+            "fake" | "deterministic-fake" | "deterministic_fake" => Ok(Self::Fake),
             "openai" | "openai-compatible" | "openai_compatible" => Ok(Self::OpenAiCompatible),
-            _ => Err("expected disabled or openai-compatible".to_owned()),
+            _ => Err("expected disabled, fake, or openai-compatible".to_owned()),
         }
     }
 }
@@ -88,9 +113,130 @@ pub struct LlmProfile {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub default_image_size: Option<String>,
+    /// Operator estimate charged by durable preflight before provider work.
+    /// Disabled and deterministic-fake profiles default explicitly to zero.
+    pub estimated_request_cost_microusd: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationBudgetAllowance {
+    pub requests: u64,
+    pub tokens: u64,
+    pub latency_milliseconds: u64,
+    pub cost_microusd: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationGovernanceConfig {
+    pub campaign: GenerationBudgetAllowance,
+    pub turn: GenerationBudgetAllowance,
+    pub max_campaign_concurrency: u16,
+    pub worker_batch_size: u16,
+}
+
+impl GenerationGovernanceConfig {
+    #[must_use]
+    pub fn non_secret_fingerprint(&self) -> Sha256Digest {
+        let mut hasher = Sha256::new();
+        for value in [
+            "generation-governance/v1".to_owned(),
+            self.campaign.requests.to_string(),
+            self.campaign.tokens.to_string(),
+            self.campaign.latency_milliseconds.to_string(),
+            self.campaign.cost_microusd.to_string(),
+            self.turn.requests.to_string(),
+            self.turn.tokens.to_string(),
+            self.turn.latency_milliseconds.to_string(),
+            self.turn.cost_microusd.to_string(),
+            self.max_campaign_concurrency.to_string(),
+            self.worker_batch_size.to_string(),
+        ] {
+            hash_fingerprint_field(&mut hasher, &value);
+        }
+        Sha256Digest::from_bytes(hasher.finalize().into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationConfigFingerprints {
+    pub text: Sha256Digest,
+    pub image: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseRuntimeConfig {
+    pub max_connections: u32,
+    pub acquire_timeout: Duration,
+    pub statement_timeout: Duration,
+    pub lock_timeout: Duration,
+    pub idle_transaction_timeout: Duration,
+    pub migrate_on_start: bool,
+}
+
+impl Default for DatabaseRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_DATABASE_MAX_CONNECTIONS,
+            acquire_timeout: Duration::from_millis(DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS),
+            statement_timeout: Duration::from_millis(
+                DEFAULT_DATABASE_STATEMENT_TIMEOUT_MILLISECONDS,
+            ),
+            lock_timeout: Duration::from_millis(DEFAULT_DATABASE_LOCK_TIMEOUT_MILLISECONDS),
+            idle_transaction_timeout: Duration::from_millis(
+                DEFAULT_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS,
+            ),
+            migrate_on_start: true,
+        }
+    }
+}
+
+/// Trusted deployment selection for the fixed private-MVP content allowlist.
+/// The root may move between source checkouts and runtime images, but startup
+/// only inspects the three compiled pack directories beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentPackConfig {
+    pub root: PathBuf,
+    pub default_theme_pack_id: String,
 }
 
 impl LlmProfile {
+    /// Produces a stable deployment fingerprint without including credentials.
+    /// Retained generated output stores this value, never the source profile.
+    pub fn non_secret_fingerprint(&self, capability: &str) -> Sha256Digest {
+        let mut hasher = Sha256::new();
+        hash_fingerprint_field(&mut hasher, "generation-profile/v1");
+        hash_fingerprint_field(&mut hasher, capability);
+        hash_fingerprint_field(
+            &mut hasher,
+            match self.backend {
+                LlmBackend::Disabled => "disabled",
+                LlmBackend::Fake => "fake",
+                LlmBackend::OpenAiCompatible => "openai-compatible",
+            },
+        );
+        hash_fingerprint_field(&mut hasher, self.base_url.as_ref().map_or("", Url::as_str));
+        hash_fingerprint_field(&mut hasher, self.model.as_deref().unwrap_or(""));
+        hash_fingerprint_field(&mut hasher, &self.timeout.as_secs().to_string());
+        hash_fingerprint_field(
+            &mut hasher,
+            &self.max_output_tokens.unwrap_or_default().to_string(),
+        );
+        hash_fingerprint_field(
+            &mut hasher,
+            &self.temperature.unwrap_or_default().to_bits().to_string(),
+        );
+        hash_fingerprint_field(
+            &mut hasher,
+            self.default_image_size.as_deref().unwrap_or(""),
+        );
+        hash_fingerprint_field(
+            &mut hasher,
+            &self.estimated_request_cost_microusd.to_string(),
+        );
+        Sha256Digest::from_bytes(hasher.finalize().into())
+    }
+
     fn from_lookup(
         profile: &'static str,
         prefix: &'static str,
@@ -191,6 +337,12 @@ impl LlmProfile {
             None
         };
 
+        let estimated_cost_name = env_name(prefix, "ESTIMATED_REQUEST_COST_MICROUSD");
+        let configured_estimated_cost = parse_optional::<u64>(
+            get(&estimated_cost_name),
+            profile_env_name(prefix, "ESTIMATED_REQUEST_COST_MICROUSD"),
+        )?;
+
         if backend == LlmBackend::OpenAiCompatible {
             if base_url.is_none() {
                 return Err(ConfigError::MissingProfileValue {
@@ -204,6 +356,19 @@ impl LlmProfile {
                     name: profile_env_name(prefix, "MODEL"),
                 });
             }
+            if configured_estimated_cost.is_none() {
+                return Err(ConfigError::MissingProfileValue {
+                    profile,
+                    name: profile_env_name(prefix, "ESTIMATED_REQUEST_COST_MICROUSD"),
+                });
+            }
+            if prefix == "IMAGE_LLM" && configured_estimated_cost == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    name: "IMAGE_LLM_ESTIMATED_REQUEST_COST_MICROUSD",
+                    reason: "must be greater than zero for a paid-capable image provider"
+                        .to_owned(),
+                });
+            }
         }
 
         Ok(Self {
@@ -215,17 +380,56 @@ impl LlmProfile {
             max_output_tokens,
             temperature,
             default_image_size,
+            estimated_request_cost_microusd: configured_estimated_cost.unwrap_or(0),
         })
+    }
+
+    #[must_use]
+    pub fn estimated_request_tokens(&self) -> u64 {
+        match self.backend {
+            LlmBackend::Disabled => 0,
+            LlmBackend::Fake => u64::from(self.max_output_tokens.unwrap_or(2_048)).max(4_096),
+            LlmBackend::OpenAiCompatible => {
+                u64::from(self.max_output_tokens.unwrap_or(2_048)).saturating_add(32_768)
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn estimated_request_latency_milliseconds(&self) -> u64 {
+        match self.backend {
+            LlmBackend::Disabled => 0,
+            LlmBackend::Fake => 100,
+            LlmBackend::OpenAiCompatible => self.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+        }
+    }
+
+    #[must_use]
+    pub const fn estimated_request_units(&self) -> u64 {
+        match self.backend {
+            LlmBackend::Disabled => 0,
+            LlmBackend::Fake | LlmBackend::OpenAiCompatible => 1,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub access_mode: AccessMode,
-    pub database_url: String,
+    pub database_url: SecretString,
+    pub database: DatabaseRuntimeConfig,
+    pub content_packs: ContentPackConfig,
+    /// Deployment-wide private-inspiration gate. Campaign policy is an
+    /// independent, narrower gate and may never override this value.
+    pub inspiration_enabled: bool,
     pub event_prompts_dir: PathBuf,
+    /// Protected, non-public storage for validated scene-image artifacts and
+    /// short-lived quarantine bytes. It must never point into web assets.
+    pub image_artifact_root: PathBuf,
+    pub rng_master_key_file: PathBuf,
     pub text_llm: LlmProfile,
     pub image_llm: LlmProfile,
+    pub generation_governance: GenerationGovernanceConfig,
 }
 
 impl AppConfig {
@@ -276,27 +480,261 @@ impl AppConfig {
         let database_url = get("DATABASE_URL")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_DATABASE_URL.to_owned());
-        if !database_url.starts_with("sqlite:") {
+        if !matches!(
+            Url::parse(&database_url).ok().map(|url| url.scheme().to_owned()),
+            Some(scheme) if matches!(scheme.as_str(), "postgres" | "postgresql")
+        ) {
             return Err(ConfigError::InvalidValue {
                 name: "DATABASE_URL",
-                reason: "only sqlite: URLs are supported".to_owned(),
+                reason: "must be a valid postgres:// or postgresql:// URL".to_owned(),
             });
+        }
+        let database = DatabaseRuntimeConfig {
+            max_connections: parse_generation_limit(
+                &mut get,
+                "DATABASE_MAX_CONNECTIONS",
+                DEFAULT_DATABASE_MAX_CONNECTIONS,
+            )?,
+            acquire_timeout: Duration::from_millis(parse_generation_limit(
+                &mut get,
+                "DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS",
+                DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS,
+            )?),
+            statement_timeout: Duration::from_millis(parse_generation_limit(
+                &mut get,
+                "DATABASE_STATEMENT_TIMEOUT_MILLISECONDS",
+                DEFAULT_DATABASE_STATEMENT_TIMEOUT_MILLISECONDS,
+            )?),
+            lock_timeout: Duration::from_millis(parse_generation_limit(
+                &mut get,
+                "DATABASE_LOCK_TIMEOUT_MILLISECONDS",
+                DEFAULT_DATABASE_LOCK_TIMEOUT_MILLISECONDS,
+            )?),
+            idle_transaction_timeout: Duration::from_millis(parse_generation_limit(
+                &mut get,
+                "DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS",
+                DEFAULT_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS,
+            )?),
+            migrate_on_start: get("DATABASE_MIGRATE_ON_START")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .parse::<bool>()
+                        .map_err(|_| ConfigError::InvalidValue {
+                            name: "DATABASE_MIGRATE_ON_START",
+                            reason: "must be true or false".to_owned(),
+                        })
+                })
+                .transpose()?
+                .unwrap_or(true),
+        };
+        if !(1..=50).contains(&database.max_connections) {
+            return Err(ConfigError::InvalidValue {
+                name: "DATABASE_MAX_CONNECTIONS",
+                reason: "must be between 1 and 50".to_owned(),
+            });
+        }
+        for (name, value, maximum) in [
+            (
+                "DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS",
+                database.acquire_timeout,
+                Duration::from_secs(60),
+            ),
+            (
+                "DATABASE_STATEMENT_TIMEOUT_MILLISECONDS",
+                database.statement_timeout,
+                Duration::from_secs(300),
+            ),
+            (
+                "DATABASE_LOCK_TIMEOUT_MILLISECONDS",
+                database.lock_timeout,
+                Duration::from_secs(60),
+            ),
+            (
+                "DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS",
+                database.idle_transaction_timeout,
+                Duration::from_secs(300),
+            ),
+        ] {
+            if value.is_zero() || value > maximum {
+                return Err(ConfigError::InvalidValue {
+                    name,
+                    reason: format!("must be between 1 and {} milliseconds", maximum.as_millis()),
+                });
+            }
         }
 
         let event_prompts_dir = get("EVENT_PROMPT_DIR")
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_EVENT_PROMPTS_DIR.to_owned())
+            .unwrap_or_else(|| DEFAULT_EVENT_PROMPTS_DIR.to_owned());
+        let event_prompts_dir =
+            parse_bounded_directory_path("EVENT_PROMPT_DIR", &event_prompts_dir)?;
+        let image_artifact_root = get("IMAGE_ARTIFACT_ROOT")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_IMAGE_ARTIFACT_ROOT.to_owned());
+        let image_artifact_root =
+            parse_bounded_directory_path("IMAGE_ARTIFACT_ROOT", &image_artifact_root)?;
+        if image_artifact_root
+            .components()
+            .any(|component| matches!(component.as_os_str().to_str(), Some("public" | "target")))
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "IMAGE_ARTIFACT_ROOT",
+                reason: "must not be inside a public or build-output directory".to_owned(),
+            });
+        }
+        let inspiration_enabled = get("INSPIRATION_ENABLED")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<bool>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        name: "INSPIRATION_ENABLED",
+                        reason: "must be true or false".to_owned(),
+                    })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let rng_master_key_file = get("RNG_MASTER_KEY_FILE")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_RNG_MASTER_KEY_FILE.to_owned())
             .into();
+        let content_pack_root = get("CONTENT_PACK_ROOT")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_CONTENT_PACK_ROOT.to_owned());
+        let content_pack_root = parse_content_pack_root(&content_pack_root)?;
+        let default_theme_pack_id = get("CONTENT_DEFAULT_THEME_PACK_ID")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CONTENT_THEME_PACK_ID.to_owned());
+        if !matches!(
+            default_theme_pack_id.as_str(),
+            RAINBOUND_THEME_PACK_ID | EMBERLINE_THEME_PACK_ID
+        ) {
+            return Err(ConfigError::InvalidValue {
+                name: "CONTENT_DEFAULT_THEME_PACK_ID",
+                reason: "must name one of the two bundled presentation theme packs".to_owned(),
+            });
+        }
 
         let text_llm = LlmProfile::from_lookup("text", "TEXT_LLM", &mut get)?;
         let image_llm = LlmProfile::from_lookup("image", "IMAGE_LLM", &mut get)?;
+        let generation_governance = GenerationGovernanceConfig {
+            campaign: GenerationBudgetAllowance {
+                requests: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_CAMPAIGN_REQUEST_BUDGET",
+                    DEFAULT_CAMPAIGN_GENERATION_REQUEST_BUDGET,
+                )?,
+                tokens: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_CAMPAIGN_TOKEN_BUDGET",
+                    DEFAULT_CAMPAIGN_GENERATION_TOKEN_BUDGET,
+                )?,
+                latency_milliseconds: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_CAMPAIGN_LATENCY_BUDGET_MILLISECONDS",
+                    DEFAULT_CAMPAIGN_GENERATION_LATENCY_BUDGET_MILLISECONDS,
+                )?,
+                cost_microusd: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_CAMPAIGN_COST_BUDGET_MICROUSD",
+                    0,
+                )?,
+            },
+            turn: GenerationBudgetAllowance {
+                requests: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_TURN_REQUEST_BUDGET",
+                    DEFAULT_TURN_GENERATION_REQUEST_BUDGET,
+                )?,
+                tokens: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_TURN_TOKEN_BUDGET",
+                    DEFAULT_TURN_GENERATION_TOKEN_BUDGET,
+                )?,
+                latency_milliseconds: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_TURN_LATENCY_BUDGET_MILLISECONDS",
+                    DEFAULT_TURN_GENERATION_LATENCY_BUDGET_MILLISECONDS,
+                )?,
+                cost_microusd: parse_generation_limit(
+                    &mut get,
+                    "GENERATION_TURN_COST_BUDGET_MICROUSD",
+                    0,
+                )?,
+            },
+            max_campaign_concurrency: parse_generation_limit::<u16>(
+                &mut get,
+                "GENERATION_MAX_CAMPAIGN_CONCURRENCY",
+                DEFAULT_MAX_CAMPAIGN_GENERATION_CONCURRENCY,
+            )?,
+            worker_batch_size: parse_generation_limit::<u16>(
+                &mut get,
+                "GENERATION_WORKER_BATCH_SIZE",
+                DEFAULT_GENERATION_WORKER_BATCH_SIZE,
+            )?,
+        };
+        if generation_governance.max_campaign_concurrency == 0
+            || generation_governance.max_campaign_concurrency > 32
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "GENERATION_MAX_CAMPAIGN_CONCURRENCY",
+                reason: "must be between 1 and 32".to_owned(),
+            });
+        }
+        if generation_governance.worker_batch_size == 0
+            || generation_governance.worker_batch_size > 100
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "GENERATION_WORKER_BATCH_SIZE",
+                reason: "must be between 1 and 100".to_owned(),
+            });
+        }
+        for (name, turn, campaign) in [
+            (
+                "GENERATION_TURN_REQUEST_BUDGET",
+                generation_governance.turn.requests,
+                generation_governance.campaign.requests,
+            ),
+            (
+                "GENERATION_TURN_TOKEN_BUDGET",
+                generation_governance.turn.tokens,
+                generation_governance.campaign.tokens,
+            ),
+            (
+                "GENERATION_TURN_LATENCY_BUDGET_MILLISECONDS",
+                generation_governance.turn.latency_milliseconds,
+                generation_governance.campaign.latency_milliseconds,
+            ),
+            (
+                "GENERATION_TURN_COST_BUDGET_MICROUSD",
+                generation_governance.turn.cost_microusd,
+                generation_governance.campaign.cost_microusd,
+            ),
+        ] {
+            if turn > campaign {
+                return Err(ConfigError::InvalidValue {
+                    name,
+                    reason: "must not exceed the corresponding campaign budget".to_owned(),
+                });
+            }
+        }
 
         Ok(Self {
             access_mode,
-            database_url,
+            database_url: SecretString::new(database_url),
+            database,
+            content_packs: ContentPackConfig {
+                root: content_pack_root,
+                default_theme_pack_id,
+            },
+            inspiration_enabled,
             event_prompts_dir,
+            image_artifact_root,
+            rng_master_key_file,
             text_llm,
             image_llm,
+            generation_governance,
         })
     }
 
@@ -327,6 +765,44 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub fn generation_config_fingerprints(&self) -> GenerationConfigFingerprints {
+        GenerationConfigFingerprints {
+            text: self.text_llm.non_secret_fingerprint("text"),
+            image: self.image_llm.non_secret_fingerprint("image"),
+        }
+    }
+}
+
+fn parse_content_pack_root(raw: &str) -> Result<PathBuf, ConfigError> {
+    parse_bounded_directory_path("CONTENT_PACK_ROOT", raw)
+}
+
+fn parse_bounded_directory_path(name: &'static str, raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = Path::new(raw);
+    if raw.trim() != raw
+        || raw.is_empty()
+        || raw.chars().count() > 4_096
+        || raw.contains('\0')
+        || raw
+            .split(['/', '\\'])
+            .any(|segment| matches!(segment, "." | ".."))
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ConfigError::InvalidValue {
+            name,
+            reason: "must be a bounded normalized directory path without . or .. components"
+                .to_owned(),
+        });
+    }
+    Ok(path.to_owned())
+}
+
+fn hash_fingerprint_field(hasher: &mut Sha256, value: &str) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn load_dotenv_file(path: &Path) -> Result<(), ConfigError> {
@@ -370,6 +846,17 @@ fn parse_base_url(name: &'static str, raw: &str) -> Result<Url, ConfigError> {
             reason: "non-local model endpoints must use HTTPS".to_owned(),
         });
     }
+    if url.host().is_some_and(|host| match host {
+        url::Host::Ipv4(address) => !address.is_loopback(),
+        url::Host::Ipv6(address) => !address.is_loopback(),
+        url::Host::Domain(_) => false,
+    }) {
+        return Err(ConfigError::InvalidValue {
+            name,
+            reason: "direct IP provider endpoints are forbidden except loopback development"
+                .to_owned(),
+        });
+    }
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -401,6 +888,18 @@ where
         .transpose()
 }
 
+fn parse_generation_limit<T>(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    default: T,
+) -> Result<T, ConfigError>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    Ok(parse_optional(get(name), name)?.unwrap_or(default))
+}
+
 fn env_name(prefix: &str, suffix: &str) -> String {
     format!("{prefix}_{suffix}")
 }
@@ -413,11 +912,17 @@ fn profile_env_name(prefix: &'static str, suffix: &'static str) -> &'static str 
         ("TEXT_LLM", "TIMEOUT_SECONDS") => "TEXT_LLM_TIMEOUT_SECONDS",
         ("TEXT_LLM", "MAX_OUTPUT_TOKENS") => "TEXT_LLM_MAX_OUTPUT_TOKENS",
         ("TEXT_LLM", "TEMPERATURE") => "TEXT_LLM_TEMPERATURE",
+        ("TEXT_LLM", "ESTIMATED_REQUEST_COST_MICROUSD") => {
+            "TEXT_LLM_ESTIMATED_REQUEST_COST_MICROUSD"
+        }
         ("IMAGE_LLM", "BACKEND") => "IMAGE_LLM_BACKEND",
         ("IMAGE_LLM", "BASE_URL") => "IMAGE_LLM_BASE_URL",
         ("IMAGE_LLM", "MODEL") => "IMAGE_LLM_MODEL",
         ("IMAGE_LLM", "TIMEOUT_SECONDS") => "IMAGE_LLM_TIMEOUT_SECONDS",
         ("IMAGE_LLM", "SIZE") => "IMAGE_LLM_SIZE",
+        ("IMAGE_LLM", "ESTIMATED_REQUEST_COST_MICROUSD") => {
+            "IMAGE_LLM_ESTIMATED_REQUEST_COST_MICROUSD"
+        }
         _ => unreachable!("profile environment names are defined statically"),
     }
 }
@@ -433,8 +938,106 @@ mod tests {
         let config = AppConfig::from_lookup(|_| None).expect("defaults should be valid");
 
         assert_eq!(config.access_mode, AccessMode::LocalSingleUser);
+        assert_eq!(config.content_packs.root, Path::new("content/packs"));
+        assert_eq!(
+            config.content_packs.default_theme_pack_id,
+            RAINBOUND_THEME_PACK_ID
+        );
         assert_eq!(config.text_llm.backend, LlmBackend::Disabled);
         assert_eq!(config.image_llm.backend, LlmBackend::Disabled);
+        assert_eq!(
+            config.image_artifact_root,
+            Path::new("data/generated-images")
+        );
+        assert!(!config.inspiration_enabled);
+    }
+
+    #[test]
+    fn database_pool_and_timeout_controls_are_bounded_and_field_specific() {
+        let configured = HashMap::from([
+            ("DATABASE_MIGRATE_ON_START", "false"),
+            ("DATABASE_MAX_CONNECTIONS", "7"),
+            ("DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "4000"),
+            ("DATABASE_STATEMENT_TIMEOUT_MILLISECONDS", "25000"),
+            ("DATABASE_LOCK_TIMEOUT_MILLISECONDS", "3000"),
+            ("DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS", "12000"),
+        ]);
+        let config = AppConfig::from_lookup(|name| configured.get(name).map(ToString::to_string))
+            .expect("bounded database controls should parse");
+        assert!(!config.database.migrate_on_start);
+        assert_eq!(config.database.max_connections, 7);
+        assert_eq!(config.database.acquire_timeout, Duration::from_secs(4));
+        assert_eq!(config.database.statement_timeout, Duration::from_secs(25));
+        assert_eq!(config.database.lock_timeout, Duration::from_secs(3));
+        assert_eq!(
+            config.database.idle_transaction_timeout,
+            Duration::from_secs(12)
+        );
+
+        for (name, value) in [
+            ("DATABASE_MAX_CONNECTIONS", "0"),
+            ("DATABASE_MAX_CONNECTIONS", "51"),
+            ("DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "0"),
+            ("DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "60001"),
+            ("DATABASE_STATEMENT_TIMEOUT_MILLISECONDS", "300001"),
+            ("DATABASE_LOCK_TIMEOUT_MILLISECONDS", "60001"),
+            ("DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS", "300001"),
+            ("DATABASE_MIGRATE_ON_START", "yes"),
+        ] {
+            let values = HashMap::from([(name, value)]);
+            let error = AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+                .expect_err("out-of-range database control must fail closed");
+            assert!(error.to_string().contains(name), "{name} must be named");
+        }
+    }
+
+    #[test]
+    fn private_inspiration_deployment_gate_is_explicit_and_strict() {
+        let enabled = HashMap::from([("INSPIRATION_ENABLED", "true")]);
+        let config = AppConfig::from_lookup(|name| enabled.get(name).map(ToString::to_string))
+            .expect("an explicit true value should enable source loading");
+        assert!(config.inspiration_enabled);
+
+        for invalid in ["1", "yes", "TRUE", "on"] {
+            let values = HashMap::from([("INSPIRATION_ENABLED", invalid)]);
+            assert!(
+                AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string)).is_err(),
+                "{invalid} must not be interpreted as consent enablement"
+            );
+        }
+    }
+
+    #[test]
+    fn content_root_moves_but_default_theme_is_allowlisted() {
+        let values = HashMap::from([
+            ("CONTENT_PACK_ROOT", "/opt/manchester-arcana/content/packs"),
+            ("CONTENT_DEFAULT_THEME_PACK_ID", EMBERLINE_THEME_PACK_ID),
+        ]);
+        let config = AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string))
+            .expect("the other bundled theme and a normalized absolute root are valid");
+        assert_eq!(
+            config.content_packs.root,
+            Path::new("/opt/manchester-arcana/content/packs")
+        );
+        assert_eq!(
+            config.content_packs.default_theme_pack_id,
+            EMBERLINE_THEME_PACK_ID
+        );
+
+        for (name, value) in [
+            ("CONTENT_DEFAULT_THEME_PACK_ID", "dev.example.unreviewed"),
+            ("CONTENT_PACK_ROOT", "../outside"),
+            ("CONTENT_PACK_ROOT", "content/./packs"),
+            ("EVENT_PROMPT_DIR", "prompts/../private"),
+            ("IMAGE_ARTIFACT_ROOT", "public/generated-images"),
+            ("IMAGE_ARTIFACT_ROOT", "target/site/images"),
+        ] {
+            let values = HashMap::from([(name, value)]);
+            assert!(
+                AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).is_err(),
+                "{name}={value} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -475,14 +1078,20 @@ mod tests {
     #[test]
     fn profiles_are_independently_configurable_and_secrets_are_redacted() {
         let values = HashMap::from([
+            (
+                "DATABASE_URL",
+                "postgresql://db-user:database-super-secret@db.example.test/game",
+            ),
             ("TEXT_LLM_BACKEND", "openai-compatible"),
             ("TEXT_LLM_BASE_URL", "https://text.example.test/v1/"),
             ("TEXT_LLM_API_KEY", "text-super-secret"),
             ("TEXT_LLM_MODEL", "narrator"),
+            ("TEXT_LLM_ESTIMATED_REQUEST_COST_MICROUSD", "250"),
             ("IMAGE_LLM_BACKEND", "openai"),
             ("IMAGE_LLM_BASE_URL", "https://images.example.test/api/"),
             ("IMAGE_LLM_API_KEY", "image-super-secret"),
             ("IMAGE_LLM_MODEL", "illustrator"),
+            ("IMAGE_LLM_ESTIMATED_REQUEST_COST_MICROUSD", "500"),
         ]);
 
         let config = AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string))
@@ -491,9 +1100,17 @@ mod tests {
 
         assert_eq!(config.text_llm.model.as_deref(), Some("narrator"));
         assert_eq!(config.image_llm.model.as_deref(), Some("illustrator"));
+        assert!(!debug.contains("database-super-secret"));
         assert!(!debug.contains("text-super-secret"));
         assert!(!debug.contains("image-super-secret"));
         assert!(debug.contains("[REDACTED]"));
+
+        let fingerprints = config.generation_config_fingerprints();
+        let encoded = serde_json::to_string(&fingerprints).unwrap();
+        assert!(!encoded.contains("database-super-secret"));
+        assert!(!encoded.contains("text-super-secret"));
+        assert!(!encoded.contains("image-super-secret"));
+        assert_ne!(fingerprints.text, fingerprints.image);
     }
 
     #[test]
@@ -516,5 +1133,72 @@ mod tests {
         assert!(parse_base_url("TEXT_LLM_BASE_URL", "http://example.test/v1").is_err());
         assert!(parse_base_url("TEXT_LLM_BASE_URL", "http://127.0.0.1:11434/v1").is_ok());
         assert!(parse_base_url("TEXT_LLM_BASE_URL", "https://example.test/v1").is_ok());
+        assert!(parse_base_url("IMAGE_LLM_BASE_URL", "https://169.254.169.254/v1").is_err());
+    }
+
+    #[test]
+    fn paid_capable_image_provider_requires_a_nonzero_cost_estimate() {
+        let values = HashMap::from([
+            ("IMAGE_LLM_BACKEND", "openai-compatible"),
+            ("IMAGE_LLM_BASE_URL", "https://images.example.test/v1/"),
+            ("IMAGE_LLM_MODEL", "illustrator"),
+            ("IMAGE_LLM_ESTIMATED_REQUEST_COST_MICROUSD", "0"),
+        ]);
+        assert!(AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string)).is_err());
+    }
+
+    #[test]
+    fn generation_governance_limits_are_explicit_bounded_and_fingerprinted() {
+        let values = HashMap::from([
+            ("GENERATION_CAMPAIGN_REQUEST_BUDGET", "20"),
+            ("GENERATION_TURN_REQUEST_BUDGET", "3"),
+            ("GENERATION_CAMPAIGN_TOKEN_BUDGET", "200000"),
+            ("GENERATION_TURN_TOKEN_BUDGET", "20000"),
+            ("GENERATION_CAMPAIGN_LATENCY_BUDGET_MILLISECONDS", "90000"),
+            ("GENERATION_TURN_LATENCY_BUDGET_MILLISECONDS", "10000"),
+            ("GENERATION_CAMPAIGN_COST_BUDGET_MICROUSD", "5000"),
+            ("GENERATION_TURN_COST_BUDGET_MICROUSD", "500"),
+            ("GENERATION_MAX_CAMPAIGN_CONCURRENCY", "1"),
+            ("GENERATION_WORKER_BATCH_SIZE", "7"),
+        ]);
+        let configured =
+            AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string)).unwrap();
+        assert_eq!(configured.generation_governance.campaign.requests, 20);
+        assert_eq!(configured.generation_governance.turn.tokens, 20_000);
+        assert_eq!(configured.generation_governance.worker_batch_size, 7);
+
+        let defaults = AppConfig::from_lookup(|_| None).unwrap();
+        assert_ne!(
+            configured.generation_governance.non_secret_fingerprint(),
+            defaults.generation_governance.non_secret_fingerprint()
+        );
+
+        let invalid = HashMap::from([
+            ("GENERATION_CAMPAIGN_REQUEST_BUDGET", "2"),
+            ("GENERATION_TURN_REQUEST_BUDGET", "3"),
+        ]);
+        assert!(matches!(
+            AppConfig::from_lookup(|name| invalid.get(name).map(ToString::to_string)),
+            Err(ConfigError::InvalidValue {
+                name: "GENERATION_TURN_REQUEST_BUDGET",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn paid_provider_profile_requires_an_operator_cost_estimate() {
+        let values = HashMap::from([
+            ("TEXT_LLM_BACKEND", "openai-compatible"),
+            ("TEXT_LLM_BASE_URL", "https://text.example.test/v1"),
+            ("TEXT_LLM_MODEL", "bounded-model"),
+        ]);
+        assert!(matches!(
+            AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string)),
+            Err(ConfigError::MissingProfileValue {
+                name: "TEXT_LLM_ESTIMATED_REQUEST_COST_MICROUSD",
+                ..
+            })
+        ));
     }
 }

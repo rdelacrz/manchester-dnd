@@ -1,0 +1,74 @@
+{
+  "pack_schema": "content-pack/v1",
+  "id": "dev.manchester-arcana.core-mvp",
+  "version": "1.0.0",
+  "digest": "sha256:c62468355cc42f51b433fc19b8b32869b35cd308e9a937a6b8bea6df7dcfb7ca",
+  "display_name": "Manchester Arcana private MVP core",
+  "categories": ["rules_compendium", "adventure", "character_content", "creature_content"],
+  "compatible_rulesets": ["srd-5.1-cc"],
+  "required_engine_capabilities": [
+    "advancement.class.fighter.level-2",
+    "advancement.class.wizard.level-2",
+    "check.basic",
+    "combat.attack",
+    "combat.damage",
+    "combat.initiative",
+    "combat.movement",
+    "combat.turns",
+    "creator.ability.standard-array",
+    "creator.ancestry.human",
+    "creator.background.sage",
+    "creator.background.soldier",
+    "creator.class.fighter",
+    "creator.class.wizard",
+    "creator.equipment.mvp-q04",
+    "creator.spell-selection.wizard-q04",
+    "encounter.class-actions.fighter-q04",
+    "encounter.context-action",
+    "encounter.fixed-q04",
+    "encounter.objectives",
+    "encounter.spells.live-q04",
+    "encounter.transition",
+    "health.death-saves",
+    "health.hit-points",
+    "health.story-recovery",
+    "health.temporary-hit-points",
+    "rng.chacha20-v1"
+  ],
+  "dependencies": [],
+  "license": {
+    "license_id": "LicenseRef-Mixed-See-Provenance",
+    "license_url": null,
+    "notice_path": "notices/NOTICE.txt",
+    "allowed_content_license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation", "LicenseRef-Mixed-See-Provenance"]
+  },
+  "provenance_manifest": "provenance.json",
+  "provenance_digest": "sha256:819a764b88b6cc54069a78adfb06987cd5bb7c9ea9cc65a2fe48ac8e9a8267a6",
+  "content_roots": ["definitions", "mechanics", "notices"],
+  "files": [
+    {
+      "path": "definitions/characters.json",
+      "digest": "sha256:b2b704b19b67ae9fd9fcc84c1d131f938ce5473a5be5bdaea7b0241ef1c2cd01",
+      "kind": "content",
+      "provenance_key": "prov:core:file-characters"
+    },
+    {
+      "path": "definitions/encounter.json",
+      "digest": "sha256:3cf58af99a34dab2a09a40d298071b786edf5a7a18d675fa27192c11f69ef36c",
+      "kind": "content",
+      "provenance_key": "prov:core:file-encounter"
+    },
+    {
+      "path": "mechanics/traceability.json",
+      "digest": "sha256:415d6f11e6b9fbb2f19545d38e17534436e171cf455d1fcbf6c5cce764a5f86a",
+      "kind": "mechanics_traceability",
+      "provenance_key": "prov:core:file-traceability"
+    },
+    {
+      "path": "notices/NOTICE.txt",
+      "digest": "sha256:11dfb9345312891087523131e21dde469d57bc76c6f1ed9dd7879e89097fcf12",
+      "kind": "notice",
+      "provenance_key": "prov:core:file-notice"
+    }
+  ]
+}

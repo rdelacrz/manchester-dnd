@@ -1,0 +1,292 @@
+{
+  "schema": "manchester-arcana/release-provenance/v1",
+  "digest_algorithm": "sha256",
+  "distribution_profile": "private-mvp-only",
+  "distribution_blockers": [
+    "Q15-public-code-and-original-content-license",
+    "Q16-private-evaluation-and-distribution-approval"
+  ],
+  "scope_note": "Complete checked-in runtime asset inventory. Generated scene artifacts carry per-artifact database provenance and are not release files. Runtime-private event sources are excluded and must never be distributed.",
+  "sources": {
+    "manchester-arcana-private": {
+      "author": "Manchester Arcana maintainers",
+      "rightsholder": "Manchester Arcana maintainers, subject to Q15 ownership review",
+      "version": "private MVP 0.1.0",
+      "source_url": null,
+      "original_work": true,
+      "ownership_note": "Original private-evaluation work; no public distribution grant is claimed until Q15/Q16 are resolved."
+    },
+    "srd-5.1-cc": {
+      "author": "Wizards of the Coast LLC",
+      "rightsholder": "Wizards of the Coast LLC",
+      "version": "System Reference Document 5.1",
+      "source_url": "https://media.dndbeyond.com/compendium-images/srd/5.1/SRD_CC_v5.1.pdf",
+      "original_work": false,
+      "retrieved_or_reviewed": "2026-07-14"
+    }
+  },
+  "licenses": {
+    "CC-BY-4.0": {
+      "terms": "Creative Commons Attribution 4.0 International; preserve the exact SRD attribution in THIRD_PARTY_NOTICES.md and the in-app legal view.",
+      "terms_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
+      "public_distribution_allowed": true
+    },
+    "LicenseRef-Manchester-Arcana-Private-Evaluation": {
+      "terms": "Private evaluation only. No public code, content, branding, or redistribution license is granted pending Q15/Q16.",
+      "terms_url": null,
+      "public_distribution_allowed": false
+    }
+  },
+  "assets": [
+    {
+      "path": "content/mechanics/engine-traceability.json",
+      "class": "rules_traceability",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "e78afed1fb1a2ccedd701589a55bd355ae557e405da6cd721a57a321825aed44",
+      "transformations": ["Maps reachable engine mechanics to official SRD section locators, implementation symbols, tests, UI consumers, and capability IDs without copying rules prose."],
+      "campaign_pack_references": ["ruleset:srd-5.1-cc", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/core-mvp/definitions/characters.json",
+      "class": "rule_content",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "b2b704b19b67ae9fd9fcc84c1d131f938ce5473a5be5bdaea7b0241ef1c2cd01",
+      "transformations": ["Selected level 1–2 mechanics are normalized to stable IDs and closed capabilities; bundled descriptions are original summaries."],
+      "campaign_pack_references": ["ruleset:srd-5.1-cc", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/core-mvp/definitions/encounter.json",
+      "class": "rule_content",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "3cf58af99a34dab2a09a40d298071b786edf5a7a18d675fa27192c11f69ef36c",
+      "transformations": ["Original Canal Warden and Soot Wight encounter data composes source-traced mechanics without copying SRD prose."],
+      "campaign_pack_references": ["ruleset:srd-5.1-cc", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/core-mvp/manifest.json",
+      "class": "pack_manifest",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "6817f0b38eaa3c369e4d76c8c19e29302e65d4ae2b801f54e77a2632137d15f6",
+      "transformations": ["Original machine-readable pack inventory, compatibility contract, dependency pins, capability declaration, and content digests."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/core-mvp/mechanics/traceability.json",
+      "class": "rules_traceability",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "415d6f11e6b9fbb2f19545d38e17534436e171cf455d1fcbf6c5cce764a5f86a",
+      "transformations": ["Original traceability metadata links mechanics to source locators, implementation, tests, consumers, and closed engine capabilities."],
+      "campaign_pack_references": ["ruleset:srd-5.1-cc", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/core-mvp/notices/NOTICE.txt",
+      "class": "pack_notice",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "11dfb9345312891087523131e21dde469d57bc76c6f1ed9dd7879e89097fcf12",
+      "transformations": ["Pack-local notice preserves the exact SRD attribution and identifies original software/data modifications."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/core-mvp/provenance.json",
+      "class": "pack_provenance",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "819a764b88b6cc54069a78adfb06987cd5bb7c9ea9cc65a2fe48ac8e9a8267a6",
+      "transformations": ["Original per-file and per-subject provenance records preserve source, rights, license, modification, reviewer, and stable subject identifiers."],
+      "campaign_pack_references": ["ruleset:srd-5.1-cc", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/emberline-archive/manifest.json",
+      "class": "pack_manifest",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "d423b07d4cba57fd5763074ce199ee91780280bc5f0ba082fd6d0be27250d199",
+      "transformations": ["Original machine-readable theme-pack inventory, compatibility contract, capability declaration, and content digests."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.emberline-archive@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/emberline-archive/notices/NOTICE.txt",
+      "class": "pack_notice",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "acd1050d27ff841046ff563dd0e59b2be9fa47366f46bf766978588d66063d4b",
+      "transformations": ["Original private-evaluation pack notice."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.emberline-archive@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/emberline-archive/provenance.json",
+      "class": "pack_provenance",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "aacbaa118f3722c277d1b75600cf210769c93d1557aa5a3f6c2f3495ab9f547d",
+      "transformations": ["Original per-file provenance records preserve rights, terms, modification, reviewer, and stable pack references."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.emberline-archive@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/emberline-archive/themes/tokens.json",
+      "class": "theme_tokens",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "a0508f230f470ea4f09260a5964fbddab2b0d7ef25e886840f834aabe8bce01f",
+      "transformations": ["Original theme tokens and non-visual accessibility descriptions; no generated or third-party media."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.emberline-archive@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/rainbound-borough/manifest.json",
+      "class": "pack_manifest",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "147e333c2a9fd88a28e68bc1977907c92627851c07b1d6fb13878590bd36af37",
+      "transformations": ["Original machine-readable theme-pack inventory, compatibility contract, capability declaration, and content digests."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.rainbound-borough@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/rainbound-borough/notices/NOTICE.txt",
+      "class": "pack_notice",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "9070750e0cb9a18ee15c3232900b8307aabcdb26220bab29c88c4d255c61885a",
+      "transformations": ["Original private-evaluation pack notice."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.rainbound-borough@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/rainbound-borough/provenance.json",
+      "class": "pack_provenance",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "7342a8f584562e2c742f782ad205d8bbeff02706fae0235c49773cf10b7ef63c",
+      "transformations": ["Original per-file provenance records preserve rights, terms, modification, reviewer, and stable pack references."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.rainbound-borough@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/packs/rainbound-borough/themes/tokens.json",
+      "class": "theme_tokens",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "eccf9c1a7dac8c315f91500751fab93a9178ff6bd9eed4072aa0d565f7baa8f0",
+      "transformations": ["Original theme tokens and non-visual accessibility descriptions; no generated or third-party media."],
+      "campaign_pack_references": ["pack:dev.manchester-arcana.rainbound-borough@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "content/srd-5.1/README.md",
+      "class": "legal_notice",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "f2bf1e223aa090698a4b4a44c88f0fc1f9d284d5cf4d583126e3bd6553fcf16c",
+      "transformations": ["Original repository boundary documentation records the SRD source, license, allowed derivation, and exclusion of verbatim rules text."],
+      "campaign_pack_references": ["ruleset:srd-5.1-cc", "application:legal"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/events/README.md",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "5d1993a5a6addba6f3489ea60e0e0b707b46ba35160ad6f91933391a5c1e9bf9",
+      "transformations": ["Original operator documentation for the runtime-private event-source boundary and deterministic ingestion contract."],
+      "campaign_pack_references": ["application:private-inspiration"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/events/examples/carriage-detour.md",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "4398ffc873d3ffa9a3cc66a3bb0d7474fdc4d3a252ead7206eeb5e2a907363fc",
+      "transformations": ["Original synthetic example used to demonstrate event Markdown parsing without real-world personal data."],
+      "campaign_pack_references": ["application:private-inspiration", "fixture:carriage-detour"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/system/game-master.md",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "4c118b276a739237fe7f9aabafeaf0317fd3a4b8d2a8948605a805b46d2d47f3",
+      "transformations": ["Original mechanics-first game-master policy prompt with typed-output, privacy, safety, and no-client-authority constraints."],
+      "campaign_pack_references": ["application:typed-gm", "ruleset:srd-5.1-cc"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/system/typed-game-master-v1.txt",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "81222ecade5382ef6b4c791b90c128d3848d12ea9c39cf8a77a64309528e42bb",
+      "transformations": ["Original versioned typed-GM system contract kept byte-stable for fingerprinting and replay evidence."],
+      "campaign_pack_references": ["application:typed-gm", "prompt-version:typed-game-master-v1"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/themes/canal-warden.md",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "06670d4e14e96009e606b3c9700fe3895a66de64c2fb21f0ba276e9332dfeac1",
+      "transformations": ["Original theme layer constrained to presentation and prohibited from changing canonical mechanics."],
+      "campaign_pack_references": ["theme:canal-warden", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/themes/clockwork-troubadour.md",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "0e6bc4b41178e8c64518d4441ac6b161217163aedceb676ff0c8760b0ebb4b6d",
+      "transformations": ["Original theme layer constrained to presentation and prohibited from changing canonical mechanics."],
+      "campaign_pack_references": ["theme:clockwork-troubadour", "pack:dev.manchester-arcana.emberline-archive@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "prompts/themes/rainbound-occultist.md",
+      "class": "prompt",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "9b11b9add4fcda4722f55e53906abe48722cab47b740be4abd5c176603e66d8a",
+      "transformations": ["Original theme layer constrained to presentation and prohibited from changing canonical mechanics."],
+      "campaign_pack_references": ["theme:rainbound-occultist", "pack:dev.manchester-arcana.rainbound-borough@1.0.0"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "style/main.css",
+      "class": "style",
+      "source_ids": ["manchester-arcana-private"],
+      "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "d6ada9b6f1b540f8096320aae7125d20009a88c67fe129dd58bafbe06fe7dcfa",
+      "transformations": ["Original responsive CSS using only system font families; no font, icon, image, audio, or third-party stylesheet assets are bundled."],
+      "campaign_pack_references": ["application:all"],
+      "public_distribution_allowed": false
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "class": "legal_notice",
+      "source_ids": ["srd-5.1-cc", "manchester-arcana-private"],
+      "license_ids": ["CC-BY-4.0", "LicenseRef-Manchester-Arcana-Private-Evaluation"],
+      "sha256": "8df5230f865e07be5e908eac5927e59cf8cb9911e41412e9742d829a00445806",
+      "transformations": ["Preserves the exact SRD 5.1 attribution and describes the software/data adaptation boundary."],
+      "campaign_pack_references": ["application:legal", "ruleset:srd-5.1-cc", "pack:dev.manchester-arcana.core-mvp@1.0.0"],
+      "public_distribution_allowed": false
+    }
+  ]
+}

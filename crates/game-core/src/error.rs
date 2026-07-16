@@ -49,6 +49,9 @@ pub enum GameCoreError {
     #[error("invalid campaign session: {reason}")]
     InvalidSession { reason: &'static str },
 
+    #[error("invalid campaign provenance pins: {reason}")]
+    InvalidCampaignPins { reason: &'static str },
+
     #[error("invalid exploration-check command: {reason}")]
     InvalidExplorationCheckCommand { reason: &'static str },
 

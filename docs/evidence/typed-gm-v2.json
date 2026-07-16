@@ -1,0 +1,49 @@
+{
+  "schema": "typed-gm-promotion-evidence/v2",
+  "fixture_set_id": "typed-gm-private-mvp-v2",
+  "metrics": {
+    "schema": "typed-gm-promotion-metrics/v1",
+    "fixture_set_id": "typed-gm-private-mvp-v2",
+    "total_cases": 16,
+    "provider_acceptances": 7,
+    "authored_fallbacks": 9,
+    "fact_fidelity_passes": 16,
+    "timeout_fallbacks": 1,
+    "unavailable_fallbacks": 2,
+    "rate_limit_fallbacks": 1,
+    "malformed_fallbacks": 2,
+    "unsafe_fallbacks": 2,
+    "contradiction_fallbacks": 1,
+    "unsafe_outputs_escaped": 0
+  },
+  "thresholds": {
+    "minimum_fact_fidelity_ppm": 1000000,
+    "maximum_unsafe_outputs_escaped": 0,
+    "require_all_failure_classes": true
+  },
+  "required_coverage": [
+    "valid_proposal",
+    "schema_violation",
+    "invented_ids",
+    "prompt_injection",
+    "private_hidden_minimization",
+    "high_stakes_confirmation",
+    "clarification",
+    "disabled_provider",
+    "fake_provider",
+    "timeout",
+    "outage",
+    "fallback",
+    "exact_fact_fidelity",
+    "mechanics_never_reroll"
+  ],
+  "passed": true,
+  "scope": "deterministic synthetic and fake/disabled provider boundary",
+  "residual_gaps": [
+    "No browser or free-form application-flow acceptance is claimed.",
+    "No live paid-provider quality, latency, terms, or regional-processing result is claimed.",
+    "Confirmation disposition is tested, but confirmation UI and durable command conversion remain separate acceptance work.",
+    "RNG non-interference is tested in-process; durable job restart and multi-process recovery remain separate acceptance work.",
+    "Prompt minimization is tested at the typed envelope; consented source ingestion, revocation, and deletion remain separate acceptance work."
+  ]
+}

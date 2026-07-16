@@ -10,8 +10,13 @@ axum.workspace = true
 leptos = { workspace = true, features = ["ssr"] }
 leptos_axum.workspace = true
 manchester-dnd-app = { path = "../app", default-features = false, features = ["ssr"] }
+manchester-dnd-core.workspace = true
 manchester-dnd-server.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3.31"

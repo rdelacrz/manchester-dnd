@@ -1,0 +1,169 @@
+{
+  "content_schema": "content-document/v1",
+  "document_id": "manchester-arcana-content:v1:document:q04-encounter",
+  "entries": [
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:encounter:soot-wight-at-viaduct",
+      "kind": "encounter",
+      "availability": "active",
+      "display_name": "Ash beneath the viaduct",
+      "description": "A fixed two-participant encounter where canal controls can strip away the creature's protective soot.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["check.basic", "combat.initiative", "combat.movement", "combat.turns", "encounter.fixed-q04", "health.death-saves", "health.story-recovery", "rng.chacha20-v1"],
+      "references": ["manchester-arcana-content:v1:hero:canal-warden", "manchester-arcana-content:v1:creature:soot-wight", "manchester-arcana-content:v1:context:release-cleansing-sluice", "manchester-arcana-content:v1:objective:defeat-soot-wight", "manchester-arcana-content:v1:objective:release-cleansing-sluice", "manchester-arcana-content:v1:scene:viaduct-aftermath"],
+      "source_key": "source:original:q04-fixed-encounter",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [
+        {"type": "engine_policy", "capability": "check.basic"},
+        {"type": "engine_policy", "capability": "combat.initiative"},
+        {"type": "engine_policy", "capability": "combat.movement"},
+        {"type": "engine_policy", "capability": "combat.turns"},
+        {"type": "engine_policy", "capability": "encounter.fixed-q04"},
+        {"type": "engine_policy", "capability": "health.death-saves"},
+        {"type": "engine_policy", "capability": "health.story-recovery"},
+        {"type": "engine_policy", "capability": "rng.chacha20-v1"},
+        {"type": "composes", "content_ids": ["manchester-arcana-content:v1:hero:canal-warden", "manchester-arcana-content:v1:creature:soot-wight", "manchester-arcana-content:v1:context:release-cleansing-sluice", "manchester-arcana-content:v1:objective:defeat-soot-wight", "manchester-arcana-content:v1:objective:release-cleansing-sluice", "manchester-arcana-content:v1:scene:viaduct-aftermath"]}
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:hero:canal-warden",
+      "kind": "character",
+      "availability": "active",
+      "display_name": "Canal Warden",
+      "description": "An original level-one defender assigned to keep the old waterworks safe.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["health.hit-points", "health.temporary-hit-points"],
+      "references": ["srd-5.1-cc:attack:canal-warden-longsword"],
+      "source_key": "source:original:q04-canal-warden",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [
+        {"type": "engine_policy", "capability": "health.hit-points"},
+        {"type": "engine_policy", "capability": "health.temporary-hit-points"},
+        {"type": "offers", "content_ids": ["srd-5.1-cc:attack:canal-warden-longsword"]}
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:creature:soot-wight",
+      "kind": "creature",
+      "availability": "active",
+      "display_name": "Soot Wight",
+      "description": "An original ash-formed canal predator with a temporary veil that clean water can disperse.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["health.hit-points", "health.temporary-hit-points"],
+      "references": ["manchester-arcana-content:v1:attack:soot-claw"],
+      "source_key": "source:original:q04-soot-wight",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [
+        {"type": "engine_policy", "capability": "health.hit-points"},
+        {"type": "engine_policy", "capability": "health.temporary-hit-points"},
+        {"type": "offers", "content_ids": ["manchester-arcana-content:v1:attack:soot-claw"]}
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "srd-5.1-cc:attack:canal-warden-longsword",
+      "kind": "attack",
+      "availability": "active",
+      "display_name": "Warden's longsword strike",
+      "description": "The fixed hero's close-range slashing attack, resolved entirely by the Rust encounter policy.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["combat.attack", "combat.damage"],
+      "references": [],
+      "source_key": "source:srd5.1:equipment-longsword",
+      "license_class": "srd5_1_cc",
+      "provenance_key": "prov:core:subjects-srd",
+      "effects": [
+        {"type": "engine_policy", "capability": "combat.attack"},
+        {"type": "engine_policy", "capability": "combat.damage"}
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:attack:soot-claw",
+      "kind": "attack",
+      "availability": "active",
+      "display_name": "Soot claw",
+      "description": "The original creature's short-range necrotic attack, resolved by a reviewed Rust policy.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["combat.attack", "combat.damage"],
+      "references": [],
+      "source_key": "source:original:q04-soot-claw",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [
+        {"type": "engine_policy", "capability": "combat.attack"},
+        {"type": "engine_policy", "capability": "combat.damage"}
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:context:release-cleansing-sluice",
+      "kind": "action",
+      "availability": "active",
+      "display_name": "Release the cleansing sluice",
+      "description": "A nearby control sends clear water through the channel and removes the creature's temporary protection.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["encounter.context-action", "health.temporary-hit-points"],
+      "references": ["manchester-arcana-content:v1:objective:release-cleansing-sluice"],
+      "source_key": "source:original:q04-cleansing-sluice",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [
+        {"type": "engine_policy", "capability": "encounter.context-action"},
+        {"type": "engine_policy", "capability": "health.temporary-hit-points"},
+        {"type": "composes", "content_ids": ["manchester-arcana-content:v1:objective:release-cleansing-sluice"]}
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:objective:defeat-soot-wight",
+      "kind": "objective",
+      "availability": "active",
+      "display_name": "Clear the viaduct",
+      "description": "End the immediate danger by defeating the ash-formed creature.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["encounter.objectives"],
+      "references": [],
+      "source_key": "source:original:q04-primary-objective",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [{"type": "engine_policy", "capability": "encounter.objectives"}]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:objective:release-cleansing-sluice",
+      "kind": "objective",
+      "availability": "active",
+      "display_name": "Wash away the soot veil",
+      "description": "Optional objective: reach and release the water control before the encounter ends.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["encounter.objectives"],
+      "references": [],
+      "source_key": "source:original:q04-context-objective",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [{"type": "engine_policy", "capability": "encounter.objectives"}]
+    },
+    {
+      "schema_version": 1,
+      "id": "manchester-arcana-content:v1:scene:viaduct-aftermath",
+      "kind": "scene",
+      "availability": "active",
+      "display_name": "Viaduct aftermath",
+      "description": "A deterministic return point that records victory or defeat before exploration resumes.",
+      "ruleset_id": "srd-5.1-cc",
+      "required_engine_capabilities": ["encounter.transition"],
+      "references": [],
+      "source_key": "source:original:q04-aftermath",
+      "license_class": "original_private_evaluation",
+      "provenance_key": "prov:core:subjects-q04",
+      "effects": [{"type": "engine_policy", "capability": "encounter.transition"}]
+    }
+  ]
+}

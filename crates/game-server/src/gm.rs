@@ -384,6 +384,10 @@ fn event_references_unknown_character(event: &SessionEventDto, known: &BTreeSet<
     }
     match &event.payload {
         SessionEventPayload::PlayerIntent { character_id, .. }
+        | SessionEventPayload::ExplorationSocialResolved {
+            command: manchester_dnd_core::AttemptSocialInteractionCommand { character_id, .. },
+            ..
+        }
         | SessionEventPayload::ExperienceAwarded { character_id, .. } => {
             !known.contains(character_id.as_str())
         }

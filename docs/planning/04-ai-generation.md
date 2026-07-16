@@ -20,7 +20,7 @@ TextGenerator.generate_text(TextGenerationRequest) -> TextGenerationResponse
 ImageGenerator.generate_image(ImageGenerationRequest) -> ImageGenerationResponse
 ```
 
-`OpenAiCompatibleGenerator` implements both traits; disabled adapters keep local development deterministic and prevent accidental paid calls. Durable submit/poll jobs are an application wrapper to add for asynchronous images, not part of the current provider trait. Later adapters should declare structured-output, image-size, seed, moderation, and usage capabilities.
+`OpenAiCompatibleGenerator` implements both traits; deterministic fake and disabled adapters keep CI/local development network-free and prevent accidental paid calls. The application now wraps illustration calls in durable PostgreSQL jobs with leases, retries, cancellation, governance receipts, artifact validation, and protected delivery; that orchestration remains deliberately outside the provider trait. Later adapters should declare structured-output, image-size, seed, moderation, and usage capabilities.
 
 Startup configuration comes from the independent `TEXT_LLM_*` and `IMAGE_LLM_*` profiles loaded through `dotenvy`: backend, base URL, API key, model, timeout, text temperature/output tokens, and image size. No provider/model is hard-coded into `game-core`. Credentials never enter fingerprints, logs, client DTOs, or saved prompts.
 
@@ -55,7 +55,7 @@ The implemented tagged effects deliberately avoid raw mechanical authority:
 
 MVP must still strengthen the application layer before accepting an effect: authenticate/authorize the caller; map difficulty/reward tiers through campaign rules; confirm engine capability and the locked revision; enforce hidden information/safety; and convert each accepted effect through `game-core`. Excessive text and unsupported mechanics fail closed. At most a bounded repair attempt is allowed; then use a fallback or focused clarification.
 
-As more purposes arrive, introduce separate versioned `ActionProposal`, constrained `CheckProposal`, `SceneProposal`, and typed `ImageBrief` DTOs rather than overloading `AiGmProposal` compatibly in place.
+As more purposes arrive, introduce separate versioned `ActionProposal`, constrained `CheckProposal`, and `SceneProposal` DTOs rather than overloading `AiGmProposal` compatibly in place. Illustration already uses its own closed, versioned `ImageBrief` reconstructed from a committed encounter audit.
 
 Raw model JSON is diagnostic data, not authoritative state or a turn audit. A validated core/application result or saved presentation artifact is the durable result.
 
@@ -98,28 +98,31 @@ The model can propose a new scene, NPC, clock, reward category, or check. The ap
 
 Images are optional presentation artifacts, never input to rules resolution.
 
-1. A committed scene creates an on-demand or rate-limited automatic image request.
-2. The server builds an `ImageBrief` from public fictional facts and the active style pack. It excludes private source prose, real names, contact data, and real-person likeness descriptions.
-3. Policy validation/moderation runs before provider submission and after receipt where supported.
-4. After the planned durable SQLite job table/worker is added, it generates the image, verifies content type/dimensions/size, removes unsafe metadata, computes a content hash, stores the original plus web variants, and records provenance. Until then, generation is not crash-durable.
-5. The UI shows a stable placeholder and status, then swaps in the result with an authored/generated text alternative. Failure never blocks the turn.
+1. After a committed encounter, the player may make a manual image request. Automatic generation is not an MVP capability.
+2. The server reconstructs a closed `ImageBrief` from engine-authored visible fictional facts in the committed audit. It excludes player/narration text, private source material, names, contact data, hidden state, and real-person likeness descriptions.
+3. Policy and governance validation run transactionally before enqueue. The worker recomputes the brief and fingerprints before submission; provider rejection and application validation failures fail closed.
+4. A durable PostgreSQL job is leased by the illustration worker. Provider bytes enter quarantine, are signature/format/dimension/pixel checked, re-encoded to metadata-free PNG originals and bounded variants, hashed, and stored beneath a non-public protected root with provenance.
+5. Only campaign-authorized selected web/thumbnail variants are delivered. Provider URLs and originals have no delivery route.
+6. The UI shows a stable placeholder and queued/running/retry/rejected/unavailable/cancelled status, then swaps in the verified result with authored alt text. Failure never blocks the turn or save.
 
 MVP supports one scene-image purpose and one configured provider at a time. Later support may include character portraits, maps, consistent-reference workflows, and provider routing, after rights, likeness, and safety review.
 
 ## Failure, retries, and idempotency
 
-The existing adapter supplies request timeouts, response-size bounds, status mapping, and disabled fallbacks. MVP orchestration must add:
+The adapter and durable orchestration supply:
 
-- Every call has a deadline, cancellation path, idempotency key, bounded exponential retry, and maximum attempt count.
+- Every illustration call has a deadline, cancellation path, idempotency key, lease heartbeat/expiry, bounded exponential retry, and maximum attempt count.
 - Retry transport failures and explicit provider throttling; do not blindly retry policy rejection or a consistently invalid schema.
 - Circuit-break a failing provider and expose a non-alarming degraded-mode indicator.
 - Narration fallback is fact-based templates; intent fallback is structured UI/clarification; image fallback is the pack's licensed placeholder.
 - A duplicate completion cannot append a second turn/correction audit or overwrite an approved artifact unexpectedly.
-- Users can retry presentation generation, but a retry cannot reroll or modify the resolved turn.
+- Users can request one image replacement, but an exact retry or replacement cannot reroll or modify the resolved turn.
+
+The scene-image worker additionally rejects provider-returned URLs rather than fetching them, follows no HTTP redirects, uses only the startup-approved provider origin, applies per-campaign concurrency and circuit limits, and stores no full prompt body.
 
 ## Cost and latency controls
 
-- Per-purpose token/pixel limits, per-turn and per-campaign monetary budgets, concurrency quotas, and account rate limits.
+- Image governance enforces three requests per rolling 24 hours, ten per campaign lifetime, one initial plus one replacement per committed scene, one running job per campaign, bounded pixels/bytes, and the configured monetary hard cap. The loopback MVP's sole owner/campaign is also its account boundary; hosted accounts remain disabled.
 - Compact recent context plus stored summaries; summaries are presentation context and cannot replace authoritative documents/turn audits.
 - Cache only requests safe to share under the same campaign/revision/configuration; default cache scope is one campaign.
 - Track queue time, provider latency, validation/repair rate, tokens/images, estimated cost, fallback rate, and user regeneration rate without high-cardinality private text labels.

@@ -1,0 +1,60 @@
+[package]
+name = "manchester-arcana-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde = "=1.0.228"
+serde_json = "=1.0.150"
+manchester-dnd-core = { path = "../../crates/game-core" }
+manchester-dnd-server = { path = "../../crates/game-server", features = ["fuzzing"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "dice_expressions"
+path = "fuzz_targets/dice_expressions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durable_json"
+path = "fuzz_targets/durable_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_and_event_ingestion"
+path = "fuzz_targets/pack_and_event_ingestion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_output"
+path = "fuzz_targets/model_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_boundaries"
+path = "fuzz_targets/image_boundaries.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "public_inputs"
+path = "fuzz_targets/public_inputs.rs"
+test = false
+doc = false
+bench = false

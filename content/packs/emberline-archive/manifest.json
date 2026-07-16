@@ -1,0 +1,51 @@
+{
+  "pack_schema": "content-pack/v1",
+  "id": "dev.manchester-arcana.emberline-archive",
+  "version": "1.0.0",
+  "digest": "sha256:ce755fdef1521fbb4821cddc2d16ee0c1f7797bb58d9153bfe3a2e9afa695ac3",
+  "display_name": "Emberline Archive",
+  "categories": ["theme"],
+  "compatible_rulesets": ["srd-5.1-cc"],
+  "required_engine_capabilities": [
+    "advancement.class.fighter.level-2",
+    "advancement.class.wizard.level-2",
+    "creator.ability.standard-array",
+    "creator.ancestry.human",
+    "creator.background.sage",
+    "creator.background.soldier",
+    "creator.class.fighter",
+    "creator.class.wizard",
+    "creator.equipment.mvp-q04",
+    "creator.spell-selection.wizard-q04"
+  ],
+  "dependencies": [
+    {
+      "id": "dev.manchester-arcana.core-mvp",
+      "version": "1.0.0",
+      "digest": "sha256:c62468355cc42f51b433fc19b8b32869b35cd308e9a937a6b8bea6df7dcfb7ca"
+    }
+  ],
+  "license": {
+    "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+    "license_url": null,
+    "notice_path": "notices/NOTICE.txt",
+    "allowed_content_license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"]
+  },
+  "provenance_manifest": "provenance.json",
+  "provenance_digest": "sha256:aacbaa118f3722c277d1b75600cf210769c93d1557aa5a3f6c2f3495ab9f547d",
+  "content_roots": ["notices", "themes"],
+  "files": [
+    {
+      "path": "notices/NOTICE.txt",
+      "digest": "sha256:acd1050d27ff841046ff563dd0e59b2be9fa47366f46bf766978588d66063d4b",
+      "kind": "notice",
+      "provenance_key": "prov:emberline:file-notice"
+    },
+    {
+      "path": "themes/tokens.json",
+      "digest": "sha256:a0508f230f470ea4f09260a5964fbddab2b0d7ef25e886840f834aabe8bce01f",
+      "kind": "theme_tokens",
+      "provenance_key": "prov:emberline:file-tokens"
+    }
+  ]
+}

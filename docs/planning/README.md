@@ -10,13 +10,14 @@ Manchester Arcana is a web-based, AI-GM fantasy role-playing game. It uses a det
 2. [System architecture](02-architecture.md) — crate boundaries, Leptos 0.8 SSR/hydration, server APIs, configuration, and errors.
 3. [Rules and gameplay](03-rules-and-gameplay.md) — SRD 5.1 coverage, authoritative resolution, rolls, actions, combat, and advancement.
 4. [AI generation](04-ai-generation.md) — provider abstraction, structured proposals, text/image flows, fallbacks, and cost controls.
-5. [Persistence](05-persistence.md) — SQLite documents/audits, save/resume, migrations, versioning, and scale evolution.
+5. [Persistence](05-persistence.md) — PostgreSQL documents/audits, concurrency, save/resume, migrations, versioning, and recovery.
 6. [Consent, privacy, and safety](06-consent-privacy-safety.md) — safe use of real-life-inspired Markdown prompts and player controls.
 7. [Characters and content packs](07-characters-and-content-packs.md) — themed creation and independently versioned content.
 8. [Delivery roadmap](08-delivery-roadmap.md) — vertical slices and acceptance criteria.
 9. [Quality, observability, and security](09-quality-observability-security.md) — verification strategy and operational gates.
 10. [Licensing and provenance](10-licensing-and-provenance.md) — SRD use, attribution, trademarks, and generated-asset provenance.
-11. [Decision register](11-decision-register.md) — accepted decisions and unresolved product questions.
+11. [Decision register](11-decision-register.md) — accepted architectural decisions and resolution status.
+12. [MVP policy resolutions](12-mvp-policy-resolutions.md) — exact private-MVP product, safety, retention, and release choices.
 
 ## Architectural invariants
 

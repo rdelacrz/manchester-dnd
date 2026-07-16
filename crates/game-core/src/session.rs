@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AbilityCheckResult, D20Roll, ExperienceAwardSummary, GameCoreError, Result, RulesetId,
-    Sha256Digest, is_valid_opaque_id,
+    AbilityCheckResult, AttemptSocialInteractionCommand, CommitEncounterCommand,
+    CommittedEncounterOutcomeDto, D20Roll, ExperienceAwardSummary, GameCoreError, Result,
+    RulesetId, Sha256Digest, SocialInteractionOutcomeDto, is_valid_opaque_id,
 };
+
+use crate::encounter::SOOT_WIGHT_POLICY_ID;
 
 pub const SESSION_SCHEMA_VERSION: u16 = 1;
 const MAX_SESSION_TITLE_CHARS: usize = 200;
@@ -68,6 +71,33 @@ pub enum EventActor {
     Player { character_id: String },
     AiGameMaster,
     System,
+}
+
+/// Immutable provenance for an authoritative encounter mutation.
+///
+/// `LegacySystem` is only the serde default for events written before command-origin recording
+/// existed. New application commits use `Player` or the pinned deterministic policy variant.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EncounterCommandOrigin {
+    #[default]
+    LegacySystem,
+    Player,
+    DeterministicPolicy {
+        policy_id: String,
+    },
+}
+
+impl EncounterCommandOrigin {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::LegacySystem | Self::Player => Ok(()),
+            Self::DeterministicPolicy { policy_id } if policy_id == SOOT_WIGHT_POLICY_ID => Ok(()),
+            Self::DeterministicPolicy { .. } => Err(GameCoreError::InvalidSessionEvent {
+                reason: "encounter command policy provenance is invalid",
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +186,47 @@ impl SessionEventDto {
                 }
                 result.validate()?;
             }
+            SessionEventPayload::ExplorationSocialResolved { command, outcome } => {
+                command.validate()?;
+                outcome.validate()?;
+                if !matches!(self.actor, EventActor::System)
+                    || command.campaign_session_id != self.session_id
+                    || outcome.campaign_session_id != self.session_id
+                    || command.character_id != outcome.character_id
+                    || command.action_id != outcome.action_id
+                    || command.expected_revision.checked_add(1) != Some(outcome.result_revision)
+                    || outcome.event_sequence != self.sequence
+                {
+                    return Err(GameCoreError::InvalidSessionEvent {
+                        reason: "social event envelope, revisions, or identities do not match",
+                    });
+                }
+            }
+            SessionEventPayload::EncounterResolved {
+                command,
+                outcome,
+                command_origin,
+            } => {
+                command.validate()?;
+                outcome.validate()?;
+                command_origin.validate()?;
+                if !matches!(command_origin, EncounterCommandOrigin::LegacySystem) {
+                    outcome.validate_player_action_boundary()?;
+                }
+                if !matches!(self.actor, EventActor::System)
+                    || command.campaign_session_id != self.session_id
+                    || outcome.campaign_session_id != self.session_id
+                    || outcome.event_sequence != self.sequence
+                    || command.expected_campaign_revision.checked_add(1)
+                        != Some(outcome.result_campaign_revision)
+                    || command.command.encounter_id != outcome.resolution.encounter_id
+                    || command.command.expected_revision != outcome.resolution.previous_revision
+                {
+                    return Err(GameCoreError::InvalidSessionEvent {
+                        reason: "encounter event envelope, revisions, or state do not match",
+                    });
+                }
+            }
             SessionEventPayload::GmNarration {
                 text,
                 image_prompt,
@@ -236,6 +307,16 @@ pub enum SessionEventPayload {
         action_id: String,
         result: AbilityCheckResult,
     },
+    ExplorationSocialResolved {
+        command: AttemptSocialInteractionCommand,
+        outcome: Box<SocialInteractionOutcomeDto>,
+    },
+    EncounterResolved {
+        command: CommitEncounterCommand,
+        outcome: Box<CommittedEncounterOutcomeDto>,
+        #[serde(default)]
+        command_origin: EncounterCommandOrigin,
+    },
     GmNarration {
         text: String,
         image_prompt: Option<String>,
@@ -262,7 +343,15 @@ pub enum SessionEventPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ability, AbilityCheck, AbilityScores, Level, Proficiency, RULESET, RollContext};
+    use crate::{
+        Ability, AbilityCheck, AbilityScores, DiceExpression, DiceRoll,
+        ENCOUNTER_COMMIT_SCHEMA_VERSION, Level, ModifierComponent, Proficiency, RULESET,
+        RollContext, RollMetadata, RollMode, RollRecord,
+        encounter::{
+            EncounterCommand, EncounterIntent, EncounterRollMode, EncounterRollPurpose,
+            EncounterState, LethalityPolicy, OpeningConsequence, legal_actions, resolve_encounter,
+        },
+    };
 
     fn ability_check_result() -> AbilityCheckResult {
         let check = AbilityCheck {
@@ -280,6 +369,104 @@ mod tests {
                 &mut dice,
             )
             .unwrap()
+    }
+
+    fn encounter_event() -> SessionEventDto {
+        let state = EncounterState::new(
+            LethalityPolicy::StoryRecovery,
+            OpeningConsequence::RunesUnderstood,
+        );
+        let nested = EncounterCommand::new(1, "encounter-start", EncounterIntent::StartEncounter);
+        let mut values = [20_u16, 1].into_iter();
+        let resolution =
+            resolve_encounter(&state, &nested, &mut |_| values.next().unwrap()).unwrap();
+        let mut cursor = 0_u64;
+        let roll_records = resolution
+            .rolls
+            .iter()
+            .map(|raw| {
+                let cursor_before = cursor;
+                cursor += u64::try_from(raw.individual_dice.len()).unwrap();
+                let expression = raw.expression.parse::<DiceExpression>().unwrap();
+                let roll = DiceRoll {
+                    expression,
+                    rolled_dice: raw
+                        .individual_dice
+                        .iter()
+                        .map(|die| u32::from(die.value))
+                        .collect(),
+                    kept_dice: raw
+                        .kept_die_indices
+                        .iter()
+                        .map(|index| u32::from(raw.individual_dice[usize::from(*index)].value))
+                        .collect(),
+                    total: raw.total,
+                    roll_mode: match raw.mode {
+                        EncounterRollMode::Normal => RollMode::Normal,
+                        EncounterRollMode::Advantage => RollMode::Advantage,
+                        EncounterRollMode::Disadvantage => RollMode::Disadvantage,
+                    },
+                    cursor_before,
+                    cursor_after: cursor,
+                };
+                let purpose = match raw.purpose {
+                    EncounterRollPurpose::Initiative => "encounter:initiative",
+                    EncounterRollPurpose::Attack => "encounter:attack",
+                    EncounterRollPurpose::Damage => "encounter:damage",
+                    EncounterRollPurpose::Healing => "encounter:healing",
+                    EncounterRollPurpose::SleepHitPoints => "encounter:sleep-hit-points",
+                    EncounterRollPurpose::HitDie => "encounter:hit-die",
+                    EncounterRollPurpose::DeathSave => "encounter:death-save",
+                };
+                RollRecord::from_roll(
+                    roll,
+                    RollMetadata {
+                        roll_id: format!("roll:session-1:2:{}", raw.sequence),
+                        purpose: purpose.to_owned(),
+                        actor_id: raw.actor_id.clone(),
+                        target_id: raw.target_id.clone(),
+                        ruleset: RULESET,
+                        seed_reference: "seed:test".to_owned(),
+                    },
+                    raw.modifiers
+                        .iter()
+                        .map(|modifier| ModifierComponent {
+                            name: modifier.source_id.clone(),
+                            value: i32::from(modifier.value),
+                        })
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let command = CommitEncounterCommand {
+            schema_version: ENCOUNTER_COMMIT_SCHEMA_VERSION,
+            campaign_session_id: "session-1".to_owned(),
+            expected_campaign_revision: 2,
+            command: nested,
+        };
+        let outcome = CommittedEncounterOutcomeDto {
+            schema_version: ENCOUNTER_COMMIT_SCHEMA_VERSION,
+            campaign_session_id: "session-1".to_owned(),
+            result_campaign_revision: 3,
+            event_sequence: 2,
+            result_hero_revision: None,
+            legal_actions: legal_actions(&resolution.state).unwrap(),
+            resolution,
+            roll_records,
+        };
+        SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: "session-1".to_owned(),
+            sequence: 2,
+            occurred_at_unix_ms: 200,
+            actor: EventActor::System,
+            payload: SessionEventPayload::EncounterResolved {
+                command,
+                outcome: Box::new(outcome),
+                command_origin: EncounterCommandOrigin::Player,
+            },
+        }
     }
 
     #[test]
@@ -392,5 +579,82 @@ mod tests {
             event.validate(),
             Err(GameCoreError::InvalidAbilityCheckResult { .. })
         ));
+    }
+
+    #[test]
+    fn encounter_event_round_trips_with_a_strict_validated_envelope() {
+        let event = encounter_event();
+        event.validate().unwrap();
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionEventDto>(&encoded).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn legacy_encounter_event_without_command_origin_still_decodes() {
+        let mut json = serde_json::to_value(encounter_event()).unwrap();
+        json.pointer_mut("/payload")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("command_origin");
+
+        let decoded = serde_json::from_value::<SessionEventDto>(json).unwrap();
+        let SessionEventPayload::EncounterResolved { command_origin, .. } = &decoded.payload else {
+            unreachable!("fixture is an encounter event")
+        };
+        assert_eq!(command_origin, &EncounterCommandOrigin::LegacySystem);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn encounter_event_rejects_unpinned_policy_origin() {
+        let mut event = encounter_event();
+        let SessionEventPayload::EncounterResolved { command_origin, .. } = &mut event.payload
+        else {
+            unreachable!("fixture is an encounter event")
+        };
+        *command_origin = EncounterCommandOrigin::DeterministicPolicy {
+            policy_id: "policy:forged".to_owned(),
+        };
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn encounter_event_rejects_envelope_state_and_roll_mismatches() {
+        let mut wrong_session = encounter_event();
+        wrong_session.session_id = "session-2".to_owned();
+        assert!(wrong_session.validate().is_err());
+
+        let mut wrong_sequence = encounter_event();
+        wrong_sequence.sequence = 3;
+        assert!(wrong_sequence.validate().is_err());
+
+        let mut wrong_encounter_revision = encounter_event();
+        let SessionEventPayload::EncounterResolved { command, .. } =
+            &mut wrong_encounter_revision.payload
+        else {
+            unreachable!()
+        };
+        command.command.expected_revision = 2;
+        assert!(wrong_encounter_revision.validate().is_err());
+
+        let mut forged_state = encounter_event();
+        let SessionEventPayload::EncounterResolved { outcome, .. } = &mut forged_state.payload
+        else {
+            unreachable!()
+        };
+        outcome.resolution.state.revision = 99;
+        assert!(forged_state.validate().is_err());
+
+        let mut forged_roll = encounter_event();
+        let SessionEventPayload::EncounterResolved { outcome, .. } = &mut forged_roll.payload
+        else {
+            unreachable!()
+        };
+        outcome.roll_records[0].total += 1;
+        assert!(forged_roll.validate().is_err());
     }
 }

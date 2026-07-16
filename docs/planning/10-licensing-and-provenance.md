@@ -95,4 +95,30 @@ CI should fail on missing provenance entries, unknown license identifiers, missi
 4. reviews product name, marketing screenshots, compatibility language, and credits;
 5. signs a license/provenance report retained with the release artifact.
 
+The implemented mechanic gate is `python3 scripts/validate_mechanic_traceability.py`.
+It joins the active core-pack declarations and
+`content/packs/core-mvp/mechanics/traceability.json` to the versioned source registry
+in `content/mechanics/engine-traceability.json`. The gate fails when:
+
+- an active content entry lacks a source, implementation, real Rust test, consumer,
+  or advertised capability;
+- the manifest capability set differs from the capabilities reachable through active
+  content;
+- a source key is missing, duplicated, unused, carries an inconsistent license class,
+  or resolves to a stale local digest;
+- the approved SRD 5.1 document URL, version, SHA-256 digest, CC BY 4.0 legal-code
+  link, modification statement, or required notice changes;
+- a named Rust implementation/test symbol does not exist, or a public resolver/test
+  in the bounded `rules_matrix` module is not represented; or
+- an implementation-only capability claims a content consumer or appears in the
+  pack manifest before an application/encounter integration makes it reachable.
+
+The CI gate deliberately does not download the SRD. It checks the reviewed official
+document pin and leaves the independent archive comparison to the human release step
+above. It also does not replace legal review or prove that an implementation conforms
+to every source rule; it proves that the declared, bounded mechanic surface has no
+missing traceability link. See the
+[mechanic traceability evidence](../evidence/mechanic-traceability-gate.md) for scope,
+negative tests, and current integration gaps.
+
 Licensing decisions that remain open are tracked in the [decision register](11-decision-register.md).

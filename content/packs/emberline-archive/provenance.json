@@ -1,0 +1,49 @@
+{
+  "provenance_schema": "content-provenance/v1",
+  "pack_id": "dev.manchester-arcana.emberline-archive",
+  "pack_version": "1.0.0",
+  "entries": [
+    {
+      "provenance_key": "prov:emberline:file-tokens",
+      "path": "themes/tokens.json",
+      "digest": "sha256:a0508f230f470ea4f09260a5964fbddab2b0d7ef25e886840f834aabe8bce01f",
+      "subject_ids": [],
+      "origin": "original",
+      "title": "Emberline Archive accessible presentation tokens",
+      "creator": "Manchester Arcana maintainers",
+      "rightsholder": "Manchester Arcana maintainers",
+      "source_locator": "original:emberline-archive-theme",
+      "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+      "license_url": null,
+      "required_notice": "Retain notices/NOTICE.txt.",
+      "modification_note": "Original design tokens and accessibility descriptions; no generated or third-party assets.",
+      "created_or_retrieved_at": "2026-07-14",
+      "reviewer": "project-maintainer",
+      "review_status": "approved",
+      "ruleset_ids": ["srd-5.1-cc"],
+      "pack_id": "dev.manchester-arcana.emberline-archive",
+      "pack_version": "1.0.0"
+    },
+    {
+      "provenance_key": "prov:emberline:file-notice",
+      "path": "notices/NOTICE.txt",
+      "digest": "sha256:acd1050d27ff841046ff563dd0e59b2be9fa47366f46bf766978588d66063d4b",
+      "subject_ids": [],
+      "origin": "original",
+      "title": "Emberline Archive private-evaluation notice",
+      "creator": "Manchester Arcana maintainers",
+      "rightsholder": "Manchester Arcana maintainers",
+      "source_locator": "original:emberline-archive-notice",
+      "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+      "license_url": null,
+      "required_notice": "Retain this file.",
+      "modification_note": "Original pack notice.",
+      "created_or_retrieved_at": "2026-07-14",
+      "reviewer": "project-maintainer",
+      "review_status": "approved",
+      "ruleset_ids": ["srd-5.1-cc"],
+      "pack_id": "dev.manchester-arcana.emberline-archive",
+      "pack_version": "1.0.0"
+    }
+  ]
+}

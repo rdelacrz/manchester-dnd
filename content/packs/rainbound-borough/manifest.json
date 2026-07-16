@@ -1,0 +1,51 @@
+{
+  "pack_schema": "content-pack/v1",
+  "id": "dev.manchester-arcana.rainbound-borough",
+  "version": "1.0.0",
+  "digest": "sha256:9b92fc08979605e05d2f3213e1c8e2df62cc24a55ee294f292418b00a94f7a61",
+  "display_name": "Rainbound Borough",
+  "categories": ["theme"],
+  "compatible_rulesets": ["srd-5.1-cc"],
+  "required_engine_capabilities": [
+    "advancement.class.fighter.level-2",
+    "advancement.class.wizard.level-2",
+    "creator.ability.standard-array",
+    "creator.ancestry.human",
+    "creator.background.sage",
+    "creator.background.soldier",
+    "creator.class.fighter",
+    "creator.class.wizard",
+    "creator.equipment.mvp-q04",
+    "creator.spell-selection.wizard-q04"
+  ],
+  "dependencies": [
+    {
+      "id": "dev.manchester-arcana.core-mvp",
+      "version": "1.0.0",
+      "digest": "sha256:c62468355cc42f51b433fc19b8b32869b35cd308e9a937a6b8bea6df7dcfb7ca"
+    }
+  ],
+  "license": {
+    "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+    "license_url": null,
+    "notice_path": "notices/NOTICE.txt",
+    "allowed_content_license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"]
+  },
+  "provenance_manifest": "provenance.json",
+  "provenance_digest": "sha256:7342a8f584562e2c742f782ad205d8bbeff02706fae0235c49773cf10b7ef63c",
+  "content_roots": ["notices", "themes"],
+  "files": [
+    {
+      "path": "notices/NOTICE.txt",
+      "digest": "sha256:9070750e0cb9a18ee15c3232900b8307aabcdb26220bab29c88c4d255c61885a",
+      "kind": "notice",
+      "provenance_key": "prov:rainbound:file-notice"
+    },
+    {
+      "path": "themes/tokens.json",
+      "digest": "sha256:eccf9c1a7dac8c315f91500751fab93a9178ff6bd9eed4072aa0d565f7baa8f0",
+      "kind": "theme_tokens",
+      "provenance_key": "prov:rainbound:file-tokens"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+# Narrow runtime exceptions only. The release scanner independently proves
+# that the affected libc entry points are absent from the application binary,
+# requires exactly these three suppressed matches, and blocks every new high or
+# critical result. See docs/security/runtime-vulnerability-exceptions.md.
+ignore:
+  - vulnerability: CVE-2026-5450
+    fix-state: wont-fix
+    package:
+      name: libc6
+      version: 2.41-12+deb13u3
+      type: deb
+  - vulnerability: CVE-2026-5928
+    fix-state: wont-fix
+    package:
+      name: libc6
+      version: 2.41-12+deb13u3
+      type: deb
+  - vulnerability: CVE-2026-5435
+    fix-state: wont-fix
+    package:
+      name: libc6
+      version: 2.41-12+deb13u3
+      type: deb

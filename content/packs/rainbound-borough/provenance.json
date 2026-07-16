@@ -1,0 +1,49 @@
+{
+  "provenance_schema": "content-provenance/v1",
+  "pack_id": "dev.manchester-arcana.rainbound-borough",
+  "pack_version": "1.0.0",
+  "entries": [
+    {
+      "provenance_key": "prov:rainbound:file-tokens",
+      "path": "themes/tokens.json",
+      "digest": "sha256:eccf9c1a7dac8c315f91500751fab93a9178ff6bd9eed4072aa0d565f7baa8f0",
+      "subject_ids": [],
+      "origin": "original",
+      "title": "Rainbound Borough accessible presentation tokens",
+      "creator": "Manchester Arcana maintainers",
+      "rightsholder": "Manchester Arcana maintainers",
+      "source_locator": "original:rainbound-borough-theme",
+      "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+      "license_url": null,
+      "required_notice": "Retain notices/NOTICE.txt.",
+      "modification_note": "Original design tokens and accessibility descriptions; no generated or third-party assets.",
+      "created_or_retrieved_at": "2026-07-14",
+      "reviewer": "project-maintainer",
+      "review_status": "approved",
+      "ruleset_ids": ["srd-5.1-cc"],
+      "pack_id": "dev.manchester-arcana.rainbound-borough",
+      "pack_version": "1.0.0"
+    },
+    {
+      "provenance_key": "prov:rainbound:file-notice",
+      "path": "notices/NOTICE.txt",
+      "digest": "sha256:9070750e0cb9a18ee15c3232900b8307aabcdb26220bab29c88c4d255c61885a",
+      "subject_ids": [],
+      "origin": "original",
+      "title": "Rainbound Borough private-evaluation notice",
+      "creator": "Manchester Arcana maintainers",
+      "rightsholder": "Manchester Arcana maintainers",
+      "source_locator": "original:rainbound-borough-notice",
+      "license_id": "LicenseRef-Manchester-Arcana-Private-Evaluation",
+      "license_url": null,
+      "required_notice": "Retain this file.",
+      "modification_note": "Original pack notice.",
+      "created_or_retrieved_at": "2026-07-14",
+      "reviewer": "project-maintainer",
+      "review_status": "approved",
+      "ruleset_ids": ["srd-5.1-cc"],
+      "pack_id": "dev.manchester-arcana.rainbound-borough",
+      "pack_version": "1.0.0"
+    }
+  ]
+}

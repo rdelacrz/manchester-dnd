@@ -1,0 +1,166 @@
+{
+  "schema": "typed-gm-evaluation-corpus/v2",
+  "fixture_set_id": "typed-gm-private-mvp-v2",
+  "cases": [
+    {
+      "case_id": "valid-action-proposal",
+      "behavior": "valid_action",
+      "purpose": "interpret_player_intent",
+      "expected_source": "provider",
+      "expected_disposition": "convert_to_engine_command",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["valid_proposal"]
+    },
+    {
+      "case_id": "valid-scene-proposal",
+      "behavior": "valid_scene",
+      "purpose": "interpret_player_intent",
+      "expected_source": "provider",
+      "expected_disposition": "convert_to_engine_command",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["valid_proposal"]
+    },
+    {
+      "case_id": "high-stakes-check-requires-confirmation",
+      "behavior": "high_stakes_check",
+      "purpose": "interpret_player_intent",
+      "expected_source": "provider",
+      "expected_disposition": "require_player_confirmation",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["valid_proposal", "high_stakes_confirmation"]
+    },
+    {
+      "case_id": "ambiguous-intent-clarification",
+      "behavior": "clarification",
+      "purpose": "interpret_player_intent",
+      "expected_source": "provider",
+      "expected_disposition": "ask_clarification",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["valid_proposal", "clarification"]
+    },
+    {
+      "case_id": "exact-fact-narration",
+      "behavior": "valid_narration",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "provider",
+      "expected_disposition": "presentation_only",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["valid_proposal", "exact_fact_fidelity"]
+    },
+    {
+      "case_id": "minimized-private-hidden-context",
+      "behavior": "valid_narration",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "provider",
+      "expected_disposition": "presentation_only",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["private_hidden_minimization", "exact_fact_fidelity"]
+    },
+    {
+      "case_id": "unknown-schema-field",
+      "behavior": "unknown_field",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "malformed",
+      "expected_attempts": 2,
+      "coverage": ["schema_violation", "fallback"]
+    },
+    {
+      "case_id": "unsupported-schema-version",
+      "behavior": "wrong_schema_version",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "malformed",
+      "expected_attempts": 2,
+      "coverage": ["schema_violation", "fallback"]
+    },
+    {
+      "case_id": "invented-action-id",
+      "behavior": "invented_action_id",
+      "purpose": "interpret_player_intent",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "unsafe",
+      "expected_attempts": 2,
+      "coverage": ["invented_ids", "fallback"]
+    },
+    {
+      "case_id": "hostile-output-prompt-exfiltration",
+      "behavior": "hostile_output",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "unsafe",
+      "expected_attempts": 2,
+      "coverage": ["prompt_injection", "private_hidden_minimization", "fallback"]
+    },
+    {
+      "case_id": "contradictory-narration-facts",
+      "behavior": "contradictory_facts",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "contradiction",
+      "expected_attempts": 2,
+      "coverage": ["exact_fact_fidelity", "mechanics_never_reroll", "fallback"]
+    },
+    {
+      "case_id": "disabled-provider",
+      "behavior": "disabled",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "unavailable",
+      "expected_attempts": 1,
+      "coverage": ["disabled_provider", "fallback"]
+    },
+    {
+      "case_id": "provider-deadline-timeout",
+      "behavior": "timeout",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "timeout",
+      "expected_attempts": 1,
+      "coverage": ["timeout", "fallback"]
+    },
+    {
+      "case_id": "provider-outage",
+      "behavior": "outage",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "unavailable",
+      "expected_attempts": 1,
+      "coverage": ["outage", "fallback"]
+    },
+    {
+      "case_id": "provider-rate-limit",
+      "behavior": "rate_limit",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "authored_fallback",
+      "expected_disposition": "presentation_only",
+      "expected_failure": "rate_limit",
+      "expected_attempts": 1,
+      "coverage": ["fallback"]
+    },
+    {
+      "case_id": "deterministic-fake-provider",
+      "behavior": "fake",
+      "purpose": "narrate_committed_facts",
+      "expected_source": "provider",
+      "expected_disposition": "presentation_only",
+      "expected_failure": null,
+      "expected_attempts": 1,
+      "coverage": ["fake_provider", "exact_fact_fidelity"]
+    }
+  ]
+}

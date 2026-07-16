@@ -27,7 +27,7 @@ MVP is a single campaign owner controlling one hero in turn-based play, with one
 - deterministic event resolution and visible roll audit records;
 - AI-generated GM text through a dynamically configured provider, plus provider-independent deterministic fallback text;
 - asynchronous, on-demand scene image generation, with a placeholder/fallback when unavailable;
-- SQLite-backed save/resume, ordered turn audit/history, and export of a campaign record;
+- PostgreSQL-backed save/resume, ordered turn audit/history, and export of a campaign record;
 - SRD 5.1 XP advancement from level 1 to level 2, using the implemented validated progression types;
 - opt-in ingestion of locally administered real-life-inspired Markdown events with consent, eligibility, redaction, and veto controls;
 - `dotenvy`-loaded development configuration, production environment-variable support, and typed `thiserror` error families;

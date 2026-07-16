@@ -176,8 +176,14 @@ impl OpenAiCompatibleGenerator {
             url::Host::Ipv4(address) => address.is_loopback(),
             url::Host::Ipv6(address) => address.is_loopback(),
         });
+        let unsafe_direct_ip = base_url.host().is_some_and(|host| match host {
+            url::Host::Ipv4(address) => !address.is_loopback(),
+            url::Host::Ipv6(address) => !address.is_loopback(),
+            url::Host::Domain(_) => false,
+        });
         if !matches!(base_url.scheme(), "http" | "https")
             || (base_url.scheme() == "http" && !safe_http_host)
+            || unsafe_direct_ip
             || !base_url.username().is_empty()
             || base_url.password().is_some()
             || base_url.query().is_some()
@@ -338,21 +344,7 @@ impl ImageGenerator for OpenAiCompatibleGenerator {
         &self,
         request: ImageGenerationRequest,
     ) -> Result<ImageGenerationResponse, GenerationError> {
-        if request.prompt.trim().is_empty()
-            || request.prompt.chars().count() > MAX_IMAGE_PROMPT_CHARS
-            || request.count == 0
-            || request.count > MAX_IMAGES_PER_REQUEST
-            || [&request.size, &request.quality, &request.style]
-                .into_iter()
-                .flatten()
-                .any(|value| {
-                    value.trim().is_empty() || value.chars().count() > MAX_PROVIDER_OPTION_CHARS
-                })
-        {
-            return Err(GenerationError::InvalidConfiguration(format!(
-                "image prompt must contain 1 to {MAX_IMAGE_PROMPT_CHARS} characters and count must be between 1 and {MAX_IMAGES_PER_REQUEST}"
-            )));
-        }
+        validate_image_request(&request)?;
         let endpoint = self.endpoint("images/generations")?;
         let body = image_request_body(&self.model, &request, self.default_image_size.as_deref());
         let response = self.send(self.client.post(endpoint).json(&body)).await?;
@@ -397,6 +389,25 @@ fn validate_text_request(request: &TextGenerationRequest) -> Result<(), Generati
     Ok(())
 }
 
+fn validate_image_request(request: &ImageGenerationRequest) -> Result<(), GenerationError> {
+    if request.prompt.trim().is_empty()
+        || request.prompt.chars().count() > MAX_IMAGE_PROMPT_CHARS
+        || request.count == 0
+        || request.count > MAX_IMAGES_PER_REQUEST
+        || [&request.size, &request.quality, &request.style]
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                value.trim().is_empty() || value.chars().count() > MAX_PROVIDER_OPTION_CHARS
+            })
+    {
+        return Err(GenerationError::InvalidConfiguration(format!(
+            "image prompt must contain 1 to {MAX_IMAGE_PROMPT_CHARS} characters and count must be between 1 and {MAX_IMAGES_PER_REQUEST}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct DisabledTextGenerator;
 
@@ -425,6 +436,223 @@ impl ImageGenerator for DisabledImageGenerator {
     }
 }
 
+/// Deterministic, network-free provider used by CI, demos, and degraded play.
+#[derive(Debug, Default)]
+pub struct FakeTextGenerator;
+
+#[async_trait]
+impl TextGenerator for FakeTextGenerator {
+    async fn generate_text(
+        &self,
+        request: TextGenerationRequest,
+    ) -> Result<TextGenerationResponse, GenerationError> {
+        validate_text_request(&request)?;
+        let text = match request.response_format {
+            TextResponseFormat::Text => {
+                "The rain eases. The committed facts remain unchanged, and the way ahead is clear."
+                    .to_owned()
+            }
+            TextResponseFormat::JsonObject => fake_json_response(&request),
+        };
+        Ok(TextGenerationResponse {
+            text,
+            model: Some("deterministic-fake-v1".to_owned()),
+            finish_reason: Some("stop".to_owned()),
+            usage: TokenUsage::default(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FakeImageGenerator;
+
+#[async_trait]
+impl ImageGenerator for FakeImageGenerator {
+    async fn generate_image(
+        &self,
+        request: ImageGenerationRequest,
+    ) -> Result<ImageGenerationResponse, GenerationError> {
+        validate_image_request(&request)?;
+        // Valid metadata-free 1x1 PNG. The artifact worker still treats it as
+        // untrusted and runs the normal decode/validation/storage pipeline.
+        const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        Ok(ImageGenerationResponse {
+            images: (0..request.count)
+                .map(|_| GeneratedImage {
+                    url: None,
+                    base64_data: Some(PNG_1X1.to_owned()),
+                    revised_prompt: None,
+                })
+                .collect(),
+        })
+    }
+}
+
+fn fake_json_response(request: &TextGenerationRequest) -> String {
+    let envelope = request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ChatRole::User)
+        .and_then(|message| serde_json::from_str::<Value>(&message.content).ok());
+    if let Some(envelope) = envelope.as_ref()
+        && envelope.get("required_base").is_some()
+    {
+        return fake_typed_gm_response(envelope);
+    }
+    let required = envelope.and_then(|value| value.get("required_output").cloned());
+    let Some(required) = required else {
+        return json!({
+            "schema_version": 1,
+            "status": "deterministic_fallback",
+            "text": "No provider-specific output was required."
+        })
+        .to_string();
+    };
+    json!({
+        "schema_version": required
+            .get("proposal_schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1),
+        "proposal_id": required
+            .get("proposal_id")
+            .and_then(Value::as_str)
+            .unwrap_or("fake:proposal"),
+        "session_id": required
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("local-campaign"),
+        "based_on_event_sequence": required
+            .get("based_on_event_sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        "narrative": {
+            "text": "The rain eases. The committed result stands, and the next safe choices are yours.",
+            "image_prompt": null,
+            "choices": []
+        },
+        "effects": []
+    })
+    .to_string()
+}
+
+fn fake_typed_gm_response(envelope: &Value) -> String {
+    let base = envelope
+        .get("required_base")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let task = envelope.get("task").and_then(Value::as_str).unwrap_or("");
+    if task == "narrate_committed_facts" {
+        let suffix = base
+            .get("proposal_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.rsplit(':').next())
+            .unwrap_or("fallback")
+            .chars()
+            .take(24)
+            .collect::<String>();
+        return json!({
+            "type": "narration",
+            "base": base,
+            "narration_id": format!("fake:narration:{suffix}"),
+            "text": "Rain catches the lantern light as the recorded result settles into the scene. The committed mechanics remain exactly as resolved.",
+            "claimed_facts": envelope
+                .get("authoritative_mechanical_facts")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        })
+        .to_string();
+    }
+
+    let legal_ids = envelope
+        .pointer("/legal_ids/action_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let public_facts = envelope
+        .pointer("/untrusted_data/committed_public_facts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let intent = envelope
+        .pointer("/untrusted_data/player_intent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let wanted = [
+        (["attack", "hit", "strike"].as_slice(), "attack"),
+        (["sluice", "gate", "release"].as_slice(), "sluice"),
+        (["move", "approach", "toward", "closer"].as_slice(), "move"),
+        (["begin", "start", "initiative"].as_slice(), "initiative"),
+        (["end", "wait", "pass"].as_slice(), "end the current turn"),
+        (["death", "save"].as_slice(), "death save"),
+    ]
+    .into_iter()
+    .find_map(|(intent_words, label_word)| {
+        intent_words
+            .iter()
+            .any(|word| intent.contains(word))
+            .then_some(label_word)
+    });
+    let selected = wanted.and_then(|label_word| {
+        public_facts.iter().find_map(|fact| {
+            let id = fact.get("fact_id")?.as_str()?;
+            let summary = fact.get("summary")?.as_str()?.to_ascii_lowercase();
+            let legal = legal_ids.iter().any(|legal| legal.as_str() == Some(id));
+            (legal && summary.contains(label_word)).then_some(id.to_owned())
+        })
+    });
+    let selected = selected.or_else(|| {
+        (legal_ids.len() == 1)
+            .then(|| {
+                legal_ids
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .flatten()
+    });
+    if let Some(action_id) = selected {
+        return json!({
+            "type": "action",
+            "base": base,
+            "action_id": action_id,
+            "target_id": null,
+            "rationale": "The deterministic fake matched the player's words to one currently legal action ID.",
+        })
+        .to_string();
+    }
+
+    let choices = legal_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .take(4)
+        .enumerate()
+        .map(|(index, action_id)| {
+            let label = public_facts
+                .iter()
+                .find(|fact| fact.get("fact_id").and_then(Value::as_str) == Some(action_id))
+                .and_then(|fact| fact.get("summary"))
+                .and_then(Value::as_str)
+                .and_then(|summary| summary.strip_prefix("Currently legal action: "))
+                .and_then(|summary| summary.split(". Use exactly action ID").next())
+                .unwrap_or("Choose this legal action");
+            json!({
+                "choice_id": format!("fake:choice:{index}"),
+                "label": label,
+                "action_id": action_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "clarification",
+        "base": base,
+        "question": "Which of the current authored actions best matches what you want to do?",
+        "choices": choices,
+    })
+    .to_string()
+}
+
 pub struct GenerationProviders {
     pub text: Arc<dyn TextGenerator>,
     pub image: Arc<dyn ImageGenerator>,
@@ -442,6 +670,7 @@ impl GenerationProviders {
 pub fn text_provider(profile: &LlmProfile) -> Result<Arc<dyn TextGenerator>, GenerationError> {
     match profile.backend {
         LlmBackend::Disabled => Ok(Arc::new(DisabledTextGenerator)),
+        LlmBackend::Fake => Ok(Arc::new(FakeTextGenerator)),
         LlmBackend::OpenAiCompatible => Ok(Arc::new(OpenAiCompatibleGenerator::new(profile)?)),
     }
 }
@@ -449,6 +678,7 @@ pub fn text_provider(profile: &LlmProfile) -> Result<Arc<dyn TextGenerator>, Gen
 pub fn image_provider(profile: &LlmProfile) -> Result<Arc<dyn ImageGenerator>, GenerationError> {
     match profile.backend {
         LlmBackend::Disabled => Ok(Arc::new(DisabledImageGenerator)),
+        LlmBackend::Fake => Ok(Arc::new(FakeImageGenerator)),
         LlmBackend::OpenAiCompatible => Ok(Arc::new(OpenAiCompatibleGenerator::new(profile)?)),
     }
 }
@@ -587,6 +817,15 @@ fn parse_chat_response(bytes: &[u8]) -> Result<TextGenerationResponse, Generatio
             total_tokens: usage.total_tokens,
         },
     })
+}
+
+/// Exercises both untrusted provider-response decoders without network I/O.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_provider_responses(bytes: &[u8]) {
+    if bytes.len() <= MAX_IMAGE_RESPONSE_BYTES {
+        let _ = parse_chat_response(bytes);
+        let _ = parse_image_response(bytes);
+    }
 }
 
 #[derive(Deserialize)]
@@ -801,5 +1040,75 @@ mod tests {
             max_output_tokens: None,
         };
         assert!(validate_text_request(&too_large).is_err());
+    }
+
+    #[test]
+    fn fake_typed_gm_selects_only_allowlisted_actions_and_replays_facts() {
+        let base = json!({
+            "schema_version": 1,
+            "proposal_id": "typed-gm:abcdef",
+            "session_id": "local-campaign",
+            "based_on_revision": 2,
+            "based_on_event_sequence": 1,
+            "prompt_template_id": "prompt:typed-gm-turn:v1",
+            "policy_id": "policy:private-mvp:v1",
+            "config_fingerprint": manchester_dnd_core::Sha256Digest::from_bytes([3; 32]),
+        });
+        let interpretation = json!({
+            "task": "interpret_player_intent",
+            "required_base": base,
+            "legal_ids": { "action_ids": ["encounter-action:attack:0"] },
+            "untrusted_data": {
+                "player_intent": "strike the creature",
+                "committed_public_facts": [{
+                    "fact_id": "encounter-action:attack:0",
+                    "summary": "Currently legal action: Attack Soot Wight. Use exactly action ID encounter-action:attack:0."
+                }]
+            }
+        });
+        let action: Value = serde_json::from_str(&fake_typed_gm_response(&interpretation)).unwrap();
+        assert_eq!(action["type"], "action");
+        assert_eq!(action["action_id"], "encounter-action:attack:0");
+
+        let facts = json!([{"type":"outcome","outcome_id":"attack:hit"}]);
+        let narration = json!({
+            "task": "narrate_committed_facts",
+            "required_base": interpretation["required_base"].clone(),
+            "authoritative_mechanical_facts": facts,
+        });
+        let narrated: Value = serde_json::from_str(&fake_typed_gm_response(&narration)).unwrap();
+        assert_eq!(narrated["type"], "narration");
+        assert_eq!(narrated["claimed_facts"], facts);
+    }
+
+    #[tokio::test]
+    async fn fake_providers_are_deterministic_bounded_and_network_free() {
+        let request = TextGenerationRequest {
+            messages: vec![ChatMessage::user(
+                r#"{"required_output":{"proposal_schema_version":1,"proposal_id":"gm:1:test","session_id":"session:1","based_on_event_sequence":7}}"#,
+            )],
+            response_format: TextResponseFormat::JsonObject,
+            temperature: None,
+            max_output_tokens: None,
+        };
+        let first = FakeTextGenerator
+            .generate_text(request.clone())
+            .await
+            .unwrap();
+        let replay = FakeTextGenerator.generate_text(request).await.unwrap();
+        assert_eq!(first, replay);
+        let json: Value = serde_json::from_str(&first.text).unwrap();
+        assert_eq!(json["session_id"], "session:1");
+        assert_eq!(json["based_on_event_sequence"], 7);
+
+        let image = FakeImageGenerator
+            .generate_image(ImageGenerationRequest::one("A rain-dark arch"))
+            .await
+            .unwrap();
+        assert_eq!(image.images.len(), 1);
+        let bytes = BASE64_STANDARD
+            .decode(image.images[0].base64_data.as_deref().unwrap())
+            .unwrap();
+        assert!(has_supported_image_signature(&bytes));
     }
 }

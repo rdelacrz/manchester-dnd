@@ -1,10 +1,17 @@
 /target/
+/tests/fuzz/artifacts/
+/tests/fuzz/target/
+/node_modules/
+/playwright-report/
+/test-results/
 **/.env
 **/.env.*
 !/.env.example
 /data/*
 !/data/.gitkeep
 /generated/
+**/__pycache__/
+/.runtime-private/
 /graphify-out/
 /prompts/events/private/*
 !/prompts/events/private/.gitkeep

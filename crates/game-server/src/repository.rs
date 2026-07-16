@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Duration};
+use std::str::FromStr;
 
 use manchester_dnd_core::{
     Character, EventActor, SESSION_SCHEMA_VERSION, SessionDto, SessionEventDto,
@@ -6,14 +6,70 @@ use manchester_dnd_core::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
+    PgPool, Postgres, Row, Transaction,
     migrate::Migrator,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    postgres::{PgConnectOptions, PgPoolOptions, PgRow},
 };
 
-use crate::error::RepositoryError;
+use crate::{config::DatabaseRuntimeConfig, error::RepositoryError};
 
-static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+mod governance;
+mod hero;
+mod images;
+mod inspiration;
+pub mod jobs;
+#[cfg(feature = "legacy-import")]
+mod legacy;
+mod lifecycle;
+mod operations;
+mod pins;
+mod presentations;
+mod recaps;
+pub use governance::{
+    GENERATION_GOVERNANCE_SCHEMA_VERSION, GenerationBudgetDimension,
+    GenerationBudgetRejectionMetric, GenerationBudgetScope, GenerationBudgetStatus,
+    GenerationBudgetStatusLine, GenerationBudgetTotals, GenerationCleanupOutcome,
+    GenerationGovernanceReceipt, GenerationGovernanceState, GenerationMetricBucket,
+    GenerationMetricsSnapshot, NewGenerationGovernanceReceipt,
+};
+pub(crate) use hero::{
+    EncounterHeroUpdate, HeroCharacterMutationCommand, HeroCreationCommitMetadata,
+    HeroReceiptScope, NewEncounterRewardClaim, NewHeroCommandReceipt, StoredHeroCommandReceipt,
+};
+pub use hero::{HeroAuditPayload, StoredHeroAudit};
+pub use images::{
+    AuthorizedSceneImageVariant, NewSceneImageArtifact, NewSceneImageQuarantine,
+    SceneImageArtifact, SceneImageCleanupCandidate, SceneImageRequestCounts, SceneImageVariant,
+};
+#[cfg(feature = "legacy-import")]
+pub use legacy::{
+    LEGACY_IMPORT_SCHEMA_VERSION, LegacyImportCounts, LegacyImportError, LegacyImportReport,
+    import_legacy_sqlite,
+};
+pub use lifecycle::{
+    CAMPAIGN_EXPORT_SCHEMA_VERSION, CAMPAIGN_HISTORY_DEFAULT_LIMIT, CAMPAIGN_HISTORY_MAX_LIMIT,
+    CAMPAIGN_LIFECYCLE_SCHEMA_VERSION, CampaignLifecycleCommand, CampaignLifecycleOutcome,
+    CampaignLifecycleState, CampaignPlaySession, CampaignPrivateExportV1, CampaignSummary,
+    CampaignTurnHistoryItem, CampaignTurnHistoryPage, DeleteCampaignCommand, EndPlaySessionCommand,
+    PreparedCampaignDeletion, RestoreCampaignExportCommand, StartPlaySessionCommand,
+};
+pub use operations::{
+    CompleteRecoveryManifest, DATABASE_OPERATIONS_SNAPSHOT_SCHEMA_VERSION,
+    DATABASE_RECOVERY_MANIFEST_SCHEMA_VERSION, DatabaseOperationsSnapshot,
+    DatabaseRecoveryManifest, GenerationBudgetDenialCount, GenerationQueueStateCount,
+    OperationalOutcomeCount, RecoveryArtifactFileEntry, RecoveryCampaignManifestEntry,
+    RecoveryManifestError, RecoveryMigrationManifestEntry, VerifiedRecoveryFile,
+};
+pub use pins::StoredCampaignPins;
+pub use presentations::{
+    GeneratedTextPresentation, GeneratedTextPresentationReceipt, GeneratedTextPresentationReplay,
+    GeneratedTextPresentationSnapshot, GeneratedTextPresentationSource,
+    MAX_TEXT_PRESENTATION_VERSIONS, NewGeneratedTextPresentation, NewTypedIntentCommandReceipt,
+    TextPresentationStoreError, TypedIntentCommandReceipt, TypedIntentReceiptState,
+};
+pub use recaps::{CampaignPrivateRecap, GeneratePrivateRecapCommand, PRIVATE_RECAP_SCHEMA_VERSION};
+
+pub(crate) static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 pub const CHARACTER_SCHEMA_VERSION: u32 = 1;
 const MAX_COMMAND_RESPONSE_JSON_BYTES: usize = 64 * 1024;
 
@@ -45,6 +101,7 @@ pub struct CampaignCreateOutcome {
 pub struct SessionEventCommitOutcome {
     pub session: SaveOutcome,
     pub characters: Vec<CharacterCommitOutcome>,
+    pub hero_character: Option<SaveOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +145,7 @@ pub struct TurnAudit<T> {
     pub campaign_session_id: String,
     pub turn_number: u64,
     pub actor_id: Option<String>,
+    pub correlation_id: Option<String>,
     pub schema_version: u32,
     pub payload: T,
     pub created_at: String,
@@ -134,30 +192,69 @@ pub struct GeneratedAssetAudit {
 }
 
 #[derive(Debug, Clone)]
-pub struct SqliteRepository {
-    pool: SqlitePool,
+pub struct PostgresRepository {
+    pool: PgPool,
 }
 
-impl SqliteRepository {
-    pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
-        let options = SqliteConnectOptions::from_str(database_url)
+#[derive(Default)]
+struct CommitMetadata<'a> {
+    receipt: Option<&'a NewCommandReceipt>,
+    correlation_id: Option<&'a str>,
+}
+
+struct CommitUpdates<'a> {
+    characters: &'a [CharacterUpdate<'a>],
+    hero: Option<EncounterHeroUpdate<'a>>,
+}
+
+impl PostgresRepository {
+    pub async fn connect(
+        database_url: &str,
+        runtime: DatabaseRuntimeConfig,
+    ) -> Result<Self, RepositoryError> {
+        let options = PgConnectOptions::from_str(database_url)
             .map_err(RepositoryError::InvalidDatabaseUrl)?
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
-        let max_connections = if database_url.contains(":memory:") {
-            1
-        } else {
-            5
-        };
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
+            .application_name("manchester-arcana");
+        let pool = PgPoolOptions::new()
+            .max_connections(runtime.max_connections)
+            .acquire_timeout(runtime.acquire_timeout)
+            .after_connect(move |connection, _metadata| {
+                Box::pin(async move {
+                    for (name, value) in [
+                        ("statement_timeout", runtime.statement_timeout),
+                        ("lock_timeout", runtime.lock_timeout),
+                        (
+                            "idle_in_transaction_session_timeout",
+                            runtime.idle_transaction_timeout,
+                        ),
+                    ] {
+                        sqlx::query("SELECT set_config($1, $2, false)")
+                            .bind(name)
+                            .bind(format!("{}ms", value.as_millis()))
+                            .execute(&mut *connection)
+                            .await?;
+                    }
+                    sqlx::query(
+                        "SELECT set_config('default_transaction_isolation', 'read committed', false)",
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await
             .map_err(RepositoryError::Database)?;
         let repository = Self { pool };
-        repository.migrate().await?;
+        if runtime.migrate_on_start {
+            repository.migrate().await?;
+        }
         Ok(repository)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     pub async fn migrate(&self) -> Result<(), RepositoryError> {
@@ -203,8 +300,8 @@ impl SqliteRepository {
         let session_row = sqlx::query(
             "INSERT INTO campaign_sessions
              (id, schema_version, revision, payload_json)
-             VALUES (?, ?, 1, ?)
-             RETURNING updated_at",
+             VALUES ($1, $2, 1, $3::jsonb)
+             RETURNING updated_at::text AS updated_at",
         )
         .bind(&session.id)
         .bind(i64::from(SESSION_SCHEMA_VERSION))
@@ -224,8 +321,8 @@ impl SqliteRepository {
             let row = sqlx::query(
                 "INSERT INTO characters
                  (id, campaign_session_id, schema_version, revision, payload_json)
-                 VALUES (?, ?, ?, 1, ?)
-                 RETURNING updated_at",
+                 VALUES ($1, $2, $3, 1, $4::jsonb)
+                 RETURNING updated_at::text AS updated_at",
             )
             .bind(character_id)
             .bind(&session.id)
@@ -261,8 +358,9 @@ impl SqliteRepository {
         let stored = load_document(
             &self.pool,
             DocumentTable::CampaignSession,
-            "SELECT id, schema_version, revision, payload_json, created_at, updated_at
-             FROM campaign_sessions WHERE id = ?",
+            "SELECT id, schema_version, revision, payload_json::text AS payload_json,
+                    created_at::text AS created_at, updated_at::text AS updated_at
+             FROM campaign_sessions WHERE id = $1",
             id,
         )
         .await?;
@@ -276,8 +374,9 @@ impl SqliteRepository {
         let stored = load_document(
             &self.pool,
             DocumentTable::Character,
-            "SELECT id, schema_version, revision, payload_json, created_at, updated_at
-             FROM characters WHERE id = ?",
+            "SELECT id, schema_version, revision, payload_json::text AS payload_json,
+                    created_at::text AS created_at, updated_at::text AS updated_at
+             FROM characters WHERE id = $1",
             id,
         )
         .await?;
@@ -293,9 +392,10 @@ impl SqliteRepository {
         let row = sqlx::query(
             "SELECT campaign_session_id, idempotency_key, command_kind,
                     request_fingerprint, expected_revision, result_revision,
-                    audit_id, response_json, created_at
+                    audit_id, response_json,
+                    created_at::text AS created_at
              FROM command_receipts
-             WHERE campaign_session_id = ? AND idempotency_key = ?",
+             WHERE campaign_session_id = $1 AND idempotency_key = $2",
         )
         .bind(campaign_session_id)
         .bind(idempotency_key)
@@ -323,12 +423,16 @@ impl SqliteRepository {
             session,
             expected_revision,
             event,
-            character_updates,
-            None,
+            CommitUpdates {
+                characters: character_updates,
+                hero: None,
+            },
+            CommitMetadata::default(),
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_session_event_with_receipt(
         &self,
         audit_id: &str,
@@ -344,8 +448,70 @@ impl SqliteRepository {
             session,
             expected_revision,
             event,
-            character_updates,
-            Some(receipt),
+            CommitUpdates {
+                characters: character_updates,
+                hero: None,
+            },
+            CommitMetadata {
+                receipt: Some(receipt),
+                correlation_id: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_session_event_with_receipt_and_correlation(
+        &self,
+        session: &SessionDto,
+        expected_revision: u64,
+        event: &SessionEventDto,
+        character_updates: &[CharacterUpdate<'_>],
+        receipt: &NewCommandReceipt,
+        correlation_id: &str,
+    ) -> Result<SessionEventCommitOutcome, RepositoryError> {
+        let audit_id = receipt.audit_id.as_str();
+        validate_command_receipt_for_commit(receipt, audit_id, session, expected_revision, event)?;
+        self.commit_session_event_internal(
+            audit_id,
+            session,
+            expected_revision,
+            event,
+            CommitUpdates {
+                characters: character_updates,
+                hero: None,
+            },
+            CommitMetadata {
+                receipt: Some(receipt),
+                correlation_id: Some(correlation_id),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_encounter_event_with_receipt_and_correlation(
+        &self,
+        session: &SessionDto,
+        expected_revision: u64,
+        event: &SessionEventDto,
+        hero_update: Option<EncounterHeroUpdate<'_>>,
+        receipt: &NewCommandReceipt,
+        correlation_id: &str,
+    ) -> Result<SessionEventCommitOutcome, RepositoryError> {
+        let audit_id = receipt.audit_id.as_str();
+        validate_command_receipt_for_commit(receipt, audit_id, session, expected_revision, event)?;
+        self.commit_session_event_internal(
+            audit_id,
+            session,
+            expected_revision,
+            event,
+            CommitUpdates {
+                characters: &[],
+                hero: hero_update,
+            },
+            CommitMetadata {
+                receipt: Some(receipt),
+                correlation_id: Some(correlation_id),
+            },
         )
         .await
     }
@@ -356,9 +522,17 @@ impl SqliteRepository {
         session: &SessionDto,
         expected_revision: u64,
         event: &SessionEventDto,
-        character_updates: &[CharacterUpdate<'_>],
-        receipt: Option<&NewCommandReceipt>,
+        updates: CommitUpdates<'_>,
+        metadata: CommitMetadata<'_>,
     ) -> Result<SessionEventCommitOutcome, RepositoryError> {
+        let CommitUpdates {
+            characters: character_updates,
+            hero: hero_update,
+        } = updates;
+        let CommitMetadata {
+            receipt,
+            correlation_id,
+        } = metadata;
         validate_session(session)?;
         validate_session_event(event)?;
         if !is_valid_opaque_id(audit_id) {
@@ -366,6 +540,13 @@ impl SqliteRepository {
                 entity: "session event",
                 id: format!("{}:{}", event.session_id, event.sequence),
                 reason: "audit id must be a valid opaque identifier",
+            });
+        }
+        if correlation_id.is_some_and(|value| !is_valid_opaque_id(value)) {
+            return Err(RepositoryError::InvalidDomainState {
+                entity: "session event",
+                id: audit_id.to_owned(),
+                reason: "correlation id must be a valid opaque identifier",
             });
         }
         if session.id != event.session_id || session.last_event_sequence != event.sequence {
@@ -396,8 +577,9 @@ impl SqliteRepository {
 
         let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
         let current_row = sqlx::query(
-            "SELECT schema_version, revision, payload_json
-             FROM campaign_sessions WHERE id = ?",
+            "SELECT schema_version, revision, payload_json::text AS payload_json
+             FROM campaign_sessions WHERE id = $1
+             FOR UPDATE",
         )
         .bind(&session.id)
         .fetch_optional(&mut *transaction)
@@ -514,8 +696,10 @@ impl SqliteRepository {
         for update in character_updates {
             let character_id = update.character.id();
             let row = sqlx::query(
-                "SELECT campaign_session_id, schema_version, revision, payload_json
-                 FROM characters WHERE id = ?",
+                "SELECT campaign_session_id, schema_version, revision,
+                        payload_json::text AS payload_json
+                 FROM characters WHERE id = $1
+                 FOR UPDATE",
             )
             .bind(character_id)
             .fetch_optional(&mut *transaction)
@@ -615,10 +799,10 @@ impl SqliteRepository {
             let character_payload = serialize("character", update.character)?;
             let updated_character_row = sqlx::query(
                 "UPDATE characters
-                 SET schema_version = ?, revision = ?, payload_json = ?,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ? AND campaign_session_id = ? AND revision = ?
-                 RETURNING updated_at",
+                 SET schema_version = $1, revision = $2, payload_json = $3::jsonb,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $4 AND campaign_session_id = $5 AND revision = $6
+                 RETURNING updated_at::text AS updated_at",
             )
             .bind(i64::from(CHARACTER_SCHEMA_VERSION))
             .bind(to_i64(next_character_revision, "revision")?)
@@ -646,12 +830,21 @@ impl SqliteRepository {
             });
         }
 
+        let committed_hero = if let Some(update) = hero_update {
+            Some(
+                hero::commit_encounter_hero_update(&mut transaction, &session.id, event, update)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         let updated_row = sqlx::query(
             "UPDATE campaign_sessions
-             SET schema_version = ?, revision = ?, payload_json = ?,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ? AND revision = ?
-             RETURNING updated_at",
+             SET schema_version = $1, revision = $2, payload_json = $3::jsonb,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4 AND revision = $5
+             RETURNING updated_at::text AS updated_at",
         )
         .bind(i64::from(SESSION_SCHEMA_VERSION))
         .bind(to_i64(next_revision, "revision")?)
@@ -673,13 +866,15 @@ impl SqliteRepository {
 
         sqlx::query(
             "INSERT INTO turn_audits
-             (id, campaign_session_id, turn_number, actor_id, schema_version, payload_json)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (id, campaign_session_id, turn_number, actor_id, correlation_id, schema_version,
+              payload_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
         )
         .bind(audit_id)
         .bind(&event.session_id)
         .bind(to_i64(event.sequence, "event sequence")?)
         .bind(actor_id)
+        .bind(correlation_id)
         .bind(i64::from(SESSION_SCHEMA_VERSION))
         .bind(event_payload)
         .execute(&mut *transaction)
@@ -700,6 +895,7 @@ impl SqliteRepository {
                 updated_at,
             },
             characters: committed_characters,
+            hero_character: committed_hero,
         })
     }
 
@@ -711,10 +907,10 @@ impl SqliteRepository {
         T: DeserializeOwned,
     {
         let rows = sqlx::query(
-            "SELECT id, campaign_session_id, turn_number, actor_id, schema_version,
-                    payload_json, created_at
+            "SELECT id, campaign_session_id, turn_number, actor_id, correlation_id, schema_version,
+                    payload_json::text AS payload_json, created_at::text AS created_at
              FROM turn_audits
-             WHERE campaign_session_id = ?
+             WHERE campaign_session_id = $1
              ORDER BY turn_number",
         )
         .bind(campaign_session_id)
@@ -746,6 +942,9 @@ impl SqliteRepository {
                         "turn_number",
                     )?,
                     actor_id: row.try_get("actor_id").map_err(RepositoryError::Database)?,
+                    correlation_id: row
+                        .try_get("correlation_id")
+                        .map_err(RepositoryError::Database)?,
                     schema_version: from_i64_u32(
                         row.try_get("schema_version")
                             .map_err(RepositoryError::Database)?,
@@ -797,7 +996,7 @@ impl SqliteRepository {
             "INSERT INTO generated_assets
              (id, campaign_session_id, turn_id, asset_kind, provider, model, location,
               prompt_fingerprint, metadata_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)",
         )
         .bind(&asset.id)
         .bind(&asset.campaign_session_id)
@@ -820,9 +1019,10 @@ impl SqliteRepository {
     ) -> Result<Vec<GeneratedAssetAudit>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT id, campaign_session_id, turn_id, asset_kind, provider, model, location,
-                    prompt_fingerprint, metadata_json, created_at
+                    prompt_fingerprint, metadata_json::text AS metadata_json,
+                    created_at::text AS created_at
              FROM generated_assets
-             WHERE campaign_session_id = ?
+             WHERE campaign_session_id = $1
              ORDER BY created_at, id",
         )
         .bind(campaign_session_id)
@@ -889,7 +1089,7 @@ impl SqliteRepository {
 }
 
 async fn insert_command_receipt(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut Transaction<'_, Postgres>,
     receipt: &NewCommandReceipt,
 ) -> Result<(), RepositoryError> {
     let receipt_id = command_receipt_id(&receipt.campaign_session_id, &receipt.idempotency_key);
@@ -897,7 +1097,7 @@ async fn insert_command_receipt(
         "INSERT INTO command_receipts
          (campaign_session_id, idempotency_key, command_kind, request_fingerprint,
           expected_revision, result_revision, audit_id, response_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(&receipt.campaign_session_id)
     .bind(&receipt.idempotency_key)
@@ -913,9 +1113,7 @@ async fn insert_command_receipt(
     Ok(())
 }
 
-fn stored_command_receipt_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> Result<StoredCommandReceipt, RepositoryError> {
+fn stored_command_receipt_from_row(row: PgRow) -> Result<StoredCommandReceipt, RepositoryError> {
     let campaign_session_id: String = row
         .try_get("campaign_session_id")
         .map_err(RepositoryError::Database)?;
@@ -1098,7 +1296,7 @@ impl DocumentTable {
 }
 
 async fn load_document<T>(
-    pool: &SqlitePool,
+    pool: &PgPool,
     table: DocumentTable,
     query: &'static str,
     id: &str,
@@ -1307,6 +1505,10 @@ fn event_references_unknown_character(session: &SessionDto, event: &SessionEvent
     match &event.payload {
         SessionEventPayload::PlayerIntent { character_id, .. }
         | SessionEventPayload::AbilityCheckResolved { character_id, .. }
+        | SessionEventPayload::ExplorationSocialResolved {
+            command: manchester_dnd_core::AttemptSocialInteractionCommand { character_id, .. },
+            ..
+        }
         | SessionEventPayload::ExperienceAwarded { character_id, .. } => !known(character_id),
         _ => false,
     }
@@ -1480,10 +1682,8 @@ mod tests {
         .expect("valid character")
     }
 
-    async fn repository() -> SqliteRepository {
-        SqliteRepository::connect("sqlite::memory:")
-            .await
-            .expect("in-memory repository should initialize")
+    fn repository(pool: PgPool) -> PostgresRepository {
+        PostgresRepository::from_pool(pool)
     }
 
     fn command_receipt(
@@ -1503,9 +1703,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn creates_loads_and_rejects_duplicate_sessions() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn creates_loads_and_rejects_duplicate_sessions(pool: PgPool) {
+        let repository = repository(pool);
         let initial = session();
         let party = [character()];
 
@@ -1531,9 +1731,9 @@ mod tests {
         assert_eq!(loaded.revision, 1);
     }
 
-    #[tokio::test]
-    async fn campaign_creation_rolls_back_if_any_character_conflicts() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn campaign_creation_rolls_back_if_any_character_conflicts(pool: PgPool) {
+        let repository = repository(pool);
         repository
             .create_campaign(&session(), &[character()])
             .await
@@ -1565,9 +1765,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn new_campaign_must_start_active() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn new_campaign_must_start_active(pool: PgPool) {
+        let repository = repository(pool);
         let mut completed = session();
         completed.status = SessionStatus::Completed;
 
@@ -1584,9 +1784,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn event_timestamps_cannot_move_backwards() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn event_timestamps_cannot_move_backwards(pool: PgPool) {
+        let repository = repository(pool);
         let initial = session();
         repository
             .create_campaign(&initial, &[character()])
@@ -1617,9 +1817,71 @@ mod tests {
         assert_eq!(stored.revision, 1);
     }
 
-    #[tokio::test]
-    async fn command_receipt_round_trips_with_its_event() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn concurrent_writers_commit_one_revision_and_report_the_current_loser(pool: PgPool) {
+        let repository = repository(pool);
+        let initial = session();
+        repository
+            .create_campaign(&initial, &[character()])
+            .await
+            .expect("campaign should save");
+        let event = SessionEventDto {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: initial.id.clone(),
+            sequence: 1,
+            occurred_at_unix_ms: 5,
+            actor: EventActor::System,
+            payload: SessionEventPayload::SessionStarted,
+        };
+        let mut submitted = initial;
+        submitted.last_event_sequence = 1;
+        submitted.updated_at_unix_ms = 5;
+
+        let first_repository = repository.clone();
+        let second_repository = repository.clone();
+        let first_session = submitted.clone();
+        let first_event = event.clone();
+        let (first, second) = tokio::join!(
+            first_repository.commit_session_event(
+                "turn-concurrent-a",
+                &first_session,
+                1,
+                &first_event,
+                &[],
+            ),
+            second_repository
+                .commit_session_event("turn-concurrent-b", &submitted, 1, &event, &[],),
+        );
+
+        let results = [first, second];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(RepositoryError::RevisionConflict {
+                expected: 1,
+                actual: 2,
+                ..
+            })
+        )));
+        let stored = repository
+            .load_campaign_session("session-1")
+            .await
+            .expect("session should load")
+            .expect("session should exist");
+        assert_eq!(stored.revision, 2);
+        assert_eq!(
+            repository
+                .list_session_events("session-1")
+                .await
+                .expect("events should load")
+                .len(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn command_receipt_round_trips_with_its_event(pool: PgPool) {
+        let repository = repository(pool);
         let initial = session();
         repository
             .create_campaign(&initial, &[character()])
@@ -1660,9 +1922,9 @@ mod tests {
         assert!(!stored.created_at.is_empty());
     }
 
-    #[tokio::test]
-    async fn duplicate_command_key_rolls_back_the_new_event() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn duplicate_command_key_rolls_back_the_new_event(pool: PgPool) {
+        let repository = repository(pool);
         let initial = session();
         repository
             .create_campaign(&initial, &[character()])
@@ -1747,21 +2009,18 @@ mod tests {
         assert_eq!(original_receipt.result_revision, 2);
     }
 
-    #[tokio::test]
-    async fn receipt_insert_failure_rolls_back_the_event_transaction() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn receipt_insert_failure_rolls_back_the_event_transaction(pool: PgPool) {
+        let repository = repository(pool);
         let initial = session();
         repository
             .create_campaign(&initial, &[character()])
             .await
             .expect("campaign should save");
         sqlx::query(
-            "CREATE TRIGGER reject_test_receipt
-             BEFORE INSERT ON command_receipts
-             WHEN NEW.idempotency_key = 'force-rollback'
-             BEGIN
-                 SELECT RAISE(ABORT, 'forced receipt failure');
-             END",
+            "ALTER TABLE command_receipts
+             ADD CONSTRAINT reject_test_receipt
+             CHECK (idempotency_key <> 'force-rollback')",
         )
         .execute(&repository.pool)
         .await
@@ -1814,9 +2073,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn persists_character_turn_and_generated_asset_audits() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn persists_character_turn_and_generated_asset_audits(pool: PgPool) {
+        let repository = repository(pool);
         let initial = session();
         let mut advanced_character = character();
         repository
@@ -1908,9 +2167,9 @@ mod tests {
         assert_eq!(loaded_character.revision, 2);
     }
 
-    #[tokio::test]
-    async fn mismatched_xp_commit_leaves_every_document_unchanged() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn mismatched_xp_commit_leaves_every_document_unchanged(pool: PgPool) {
+        let repository = repository(pool);
         let initial_session = session();
         let initial_character = character();
         repository
@@ -1978,9 +2237,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn generated_asset_cannot_reference_another_campaigns_turn() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn generated_asset_cannot_reference_another_campaigns_turn(pool: PgPool) {
+        let repository = repository(pool);
         let first = session();
         repository
             .create_campaign(&first, &[character()])
@@ -2028,9 +2287,9 @@ mod tests {
         assert!(matches!(error, RepositoryError::Database(_)));
     }
 
-    #[tokio::test]
-    async fn generated_assets_are_revalidated_when_loaded() {
-        let repository = repository().await;
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn generated_assets_are_revalidated_when_loaded(pool: PgPool) {
+        let repository = repository(pool);
         repository
             .create_campaign(&session(), &[character()])
             .await

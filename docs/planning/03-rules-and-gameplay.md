@@ -8,7 +8,14 @@ SRD 5.2.1 represents revised rules and terminology published later. It is not an
 
 ## Target authority split
 
-The current foundation implements ability modifiers, validated d20 checks/attacks, action-resource accounting, XP thresholds, numeric level derivation, and an atomic audited XP update. Slice 1A additionally exposes one persisted authored check: `inspect-viaduct-runes` is Wisdom, proficient, DC 13, with normal roll mode and no situational modifier. Saving throws, damage, conditions, initiative, playable combat, equipment, spells, HP mutation, and level-feature choices in the matrix below remain planned engine work; the AI and UI must not simulate them as if they were implemented.
+The current end-to-end surface implements the persisted `inspect-viaduct-runes`
+check, the deterministic fixed Q04 encounter, authoritative created-hero encounter
+stats, and the bounded level 1→2 hero workflow. A pure `rules_matrix` module also
+implements and tests the broader level 1–2 mechanics listed below. Those broader
+spell, class-resource, rest, condition, inventory, cover, and exploration/social
+resolvers remain `implemented_not_exposed`: the application, persistence, AI, and UI
+must not present them as playable until their capability is moved into a new pack and
+the complete path has acceptance evidence.
 
 | Deterministic Rust engine | AI GM |
 | --- | --- |
@@ -32,26 +39,41 @@ resolve(state, validated_command, rng_cursor, ruleset_version)
 
 No wall clock, database, network, model, OS randomness, or UI state is read inside resolution. Commands are intent (`Attack`, `AttemptCheck`, `Move`, `EndTurn`, `TakeRest`, `ChooseLevelFeature`); resolution facts include outcomes such as `AttackResolved`, `DamageApplied`, and `TurnEnded`. MVP writes the resulting authoritative state to revisioned documents and the facts to a turn audit. A later complete event stream may derive state from ordered facts only after equivalence tests prove coverage.
 
-The implemented concrete command is `AttemptExplorationCheckCommand`. Its strict shared schema contains only schema version, campaign/character/action IDs, expected revision, and idempotency key; unknown fields and attempts to submit mechanics are rejected. `GameApplicationService`, outside the pure rules crate, chooses the authored `AbilityCheck`, supplies dice and time, assigns `EventActor::System`, and persists the validated result as `AbilityCheckResolved`. Browser reload reconstructs the latest check from that audit and never rolls again.
+The authored exploration check uses `AttemptExplorationCheckCommand`; its strict
+shared schema contains only schema version, campaign/character/action IDs, expected
+revision, and idempotency key. The fixed encounter similarly accepts typed
+`CommitEncounterCommand` intent without client-authored mechanics. In both paths,
+`GameApplicationService` supplies trusted rules, dice, and time and atomically stores
+the outcome/audit. Browser reload reconstructs committed state and never rerolls it.
 
 Each explanation item identifies a rule key, inputs, modifiers, and result without reproducing long rules prose. This powers a player-facing “why?” panel and conformance tests.
 
 ## Dice and auditability
 
 - Parse a bounded grammar such as `NdS`, optional keep/drop, and signed constants only when a supported mechanic requires it. Reject zero/oversized counts, sides, arithmetic overflow, and unbounded expressions.
-- The target server initializes a campaign/encounter RNG from an operating-system CSPRNG. Resolution will use a pinned deterministic PRNG algorithm; algorithm ID, seed material or verifiable seed reference, and cursor remain pending persistence work.
+- The server derives a protected campaign/encounter stream and uses the pinned
+  `chacha20-v1` algorithm. Audits retain an opaque seed reference and cursor span;
+  raw seed material remains server-only.
 - A `RollRecord` contains roll ID, expression, individual dice, kept dice, modifier components, total, roll purpose, actor/target IDs, advantage state, ruleset version, and RNG cursor range.
 - Clients submit “roll this check,” never dice values. Animation visualizes the committed record.
 - Advantage and disadvantage follow the profile's cancellation/stacking behavior. Attack-roll natural 20/natural 1 handling is distinct from generic ability checks; do not generalize critical rules to all d20 tests.
 - Displaying or rechecking a historic turn consumes no new randomness. A correction writes a new state revision/audit; it never edits a historic roll.
 
-Slice 1A currently records the selected d20, roll mode, ability/proficiency/situational modifiers, DC, total, and success in `AbilityCheckResolved`. It does not yet implement the general dice-expression grammar, pinned PRNG/cursor record, initiative, attack/damage sequence, or HP transitions described by the target above.
+The authored check and fixed encounter now retain canonical roll records, including
+purpose, dice, modifiers, comparison, outcome, algorithm ID, opaque seed reference,
+and cursor span where applicable. The pure rules-matrix resolvers still need an
+application/persistence bridge before their additional rolls or resource mutations
+can be described as durable gameplay.
 
 A future competitive multiplayer mode can add seed commitment/reveal. It is not an MVP security claim.
 
 ## MVP coverage matrix
 
-This matrix is the MVP target. A row counts as delivered only when it is implemented, tested, and surfaced in the UI; “Later” is not delegated to the AI. At present, only the Slice 1A ability-check path is playable end to end—initiative, combat, damage, and HP mutation are still pending.
+This matrix is the MVP target. A row counts as delivered only when it is implemented,
+tested, and surfaced in the UI; “Later” is not delegated to the AI. The fixed Q04
+encounter and hero creation/advancement paths cover their advertised subset. Pure
+rules-matrix coverage is implementation evidence only until each broader row has an
+application, persistence, and UI path.
 
 | Area | MVP | Later expansion |
 | --- | --- | --- |
@@ -69,7 +91,10 @@ This matrix is the MVP target. A row counts as delivered only when it is impleme
 | Creatures | Authored, licensed stat blocks for a small encounter set with deterministic actions | Encounter balancing, broad bestiary, procedural tactics |
 | Advancement | One complete level 1→2 path for every MVP-supported character option; atomic validation of choices and derived stats | Levels 1–20, multiclassing, feats if licensed/supported |
 
-Before implementation, convert this matrix into a traceability table of mechanic ID → source location → implementation → tests. An encounter or character option cannot ship if it references an unimplemented mechanic.
+The machine-readable table and fail-closed gate are described in
+[mechanic traceability evidence](../evidence/mechanic-traceability-gate.md). An
+encounter or character option cannot ship if it references an unimplemented or
+untraced mechanic.
 
 ## Turn lifecycle
 

@@ -1,0 +1,54 @@
+{
+  "schema": "typed-gm-evaluation-fixtures/v1",
+  "fixture_set_id": "typed-gm-private-mvp-v1",
+  "cases": [
+    {
+      "case_id": "accepted-factual-narration",
+      "behavior": "accepted",
+      "expected_source": "provider",
+      "expected_failure": null
+    },
+    {
+      "case_id": "malformed-json",
+      "behavior": "malformed",
+      "expected_source": "authored_fallback",
+      "expected_failure": "malformed"
+    },
+    {
+      "case_id": "disabled-provider",
+      "behavior": "disabled",
+      "expected_source": "authored_fallback",
+      "expected_failure": "unavailable"
+    },
+    {
+      "case_id": "deadline-timeout",
+      "behavior": "timeout",
+      "expected_source": "authored_fallback",
+      "expected_failure": "timeout"
+    },
+    {
+      "case_id": "hostile-prompt-exfiltration",
+      "behavior": "hostile",
+      "expected_source": "authored_fallback",
+      "expected_failure": "unsafe"
+    },
+    {
+      "case_id": "contradictory-mechanical-fact",
+      "behavior": "contradiction",
+      "expected_source": "authored_fallback",
+      "expected_failure": "contradiction"
+    },
+    {
+      "case_id": "provider-rate-limit",
+      "behavior": "rate_limit",
+      "expected_source": "authored_fallback",
+      "expected_failure": "rate_limit"
+    },
+    {
+      "case_id": "provider-unavailable",
+      "behavior": "unavailable",
+      "expected_source": "authored_fallback",
+      "expected_failure": "unavailable"
+    }
+  ]
+}

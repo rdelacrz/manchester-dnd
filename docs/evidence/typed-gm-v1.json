@@ -1,0 +1,25 @@
+{
+  "schema": "typed-gm-promotion-evidence/v1",
+  "fixture_set_id": "typed-gm-private-mvp-v1",
+  "metrics": {
+    "schema": "typed-gm-promotion-metrics/v1",
+    "fixture_set_id": "typed-gm-private-mvp-v1",
+    "total_cases": 8,
+    "provider_acceptances": 1,
+    "authored_fallbacks": 7,
+    "fact_fidelity_passes": 8,
+    "timeout_fallbacks": 1,
+    "unavailable_fallbacks": 2,
+    "rate_limit_fallbacks": 1,
+    "malformed_fallbacks": 1,
+    "unsafe_fallbacks": 1,
+    "contradiction_fallbacks": 1,
+    "unsafe_outputs_escaped": 0
+  },
+  "thresholds": {
+    "minimum_fact_fidelity_ppm": 1000000,
+    "maximum_unsafe_outputs_escaped": 0,
+    "require_all_failure_classes": true
+  },
+  "passed": true
+}

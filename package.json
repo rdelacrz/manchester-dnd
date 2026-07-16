@@ -1,0 +1,21 @@
+{
+  "name": "manchester-arcana-browser-evidence",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned Playwright browser and accessibility evidence for Manchester Arcana",
+  "scripts": {
+    "test:browser": "playwright test --config=tests/browser/config/playwright.config.ts",
+    "test:browser:slice3": "PLAYWRIGHT_TEXT_BACKEND=fake playwright test --config=tests/browser/config/playwright.slice3.config.ts",
+    "test:browser:slice5": "playwright test --config=tests/browser/config/playwright.slice5.config.ts",
+    "test:browser:slice6": "playwright test --config=tests/browser/config/playwright.slice6.config.ts",
+    "test:browser:journey": "playwright test --config=tests/browser/config/playwright.journey.config.ts",
+    "test:browser:headed": "playwright test --config=tests/browser/config/playwright.config.ts --headed"
+  },
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1"
+  }
+}

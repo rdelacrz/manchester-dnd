@@ -162,8 +162,8 @@ cargo test --locked -p manchester-dnd-server \
   -- --exact --nocapture
 1 passed; 0 failed
 
-cargo test --locked -p manchester-dnd-web
-5 passed; 0 failed
+cargo test --locked -p manchester-dnd-app --features ssr --bin manchester-dnd-web
+6 passed; 0 failed
 
 cargo clippy --locked --workspace --all-targets -- -D warnings
 passed

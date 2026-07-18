@@ -4,8 +4,6 @@ members = [
     "app",
     "crates/game-core",
     "crates/game-server",
-    "frontend",
-    "server",
 ]
 
 [workspace.package]
@@ -60,8 +58,10 @@ panic = "abort"
 [[workspace.metadata.leptos]]
 name = "manchester-arcana"
 output-name = "manchester-arcana"
-bin-package = "manchester-dnd-web"
-lib-package = "manchester-dnd-frontend"
+bin-package = "manchester-dnd-app"
+bin-target = "manchester-dnd-web"
+bin-exe-name = "manchester-dnd-web"
+lib-package = "manchester-dnd-app"
 site-root = "target/site"
 site-pkg-dir = "pkg"
 style-file = "style/main.css"
@@ -69,8 +69,8 @@ assets-dir = "public"
 site-addr = "127.0.0.1:6789"
 reload-port = 7000
 browserquery = "defaults"
-bin-features = []
+bin-features = ["ssr"]
 bin-default-features = false
-lib-features = []
+lib-features = ["hydrate"]
 lib-default-features = false
 lib-profile-release = "wasm-release"

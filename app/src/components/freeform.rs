@@ -882,7 +882,7 @@ pub async fn submit_typed_player_intent(
                                 },
                                 format!(
                                     "Cast Light on {}",
-                                    super::authored_object_label(object_id)
+                                    crate::authored_object_label(object_id)
                                 ),
                             ),
                         );
@@ -896,7 +896,7 @@ pub async fn submit_typed_player_intent(
                                 },
                                 format!(
                                     "Cast Mage Hand by {}",
-                                    super::authored_object_label(anchor_object_id)
+                                    crate::authored_object_label(anchor_object_id)
                                 ),
                             ),
                         );
@@ -910,7 +910,7 @@ pub async fn submit_typed_player_intent(
                                 },
                                 format!(
                                     "Use Mage Hand on {}",
-                                    super::authored_object_label(object_id)
+                                    crate::authored_object_label(object_id)
                                 ),
                             ),
                         );

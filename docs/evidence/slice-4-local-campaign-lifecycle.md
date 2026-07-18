@@ -28,7 +28,7 @@ Run:
 
 ```sh
 cargo test -p manchester-dnd-server repository::lifecycle::tests -- --nocapture
-cargo test -p manchester-dnd-web
+cargo test -p manchester-dnd-app --features ssr --bin manchester-dnd-web
 cargo check -p manchester-dnd-app --features ssr
 cargo check -p manchester-dnd-app --features hydrate --target wasm32-unknown-unknown
 scripts/check-postgres-role-policy.sh

@@ -27,7 +27,6 @@ Prerequisites are the repository's pinned Rust toolchain, the `wasm32-unknown-un
 rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
 cargo install --locked --version 0.3.7 cargo-leptos
 docker compose up -d --wait postgres
-cp .env.example .env
 cargo leptos watch
 ```
 
@@ -52,9 +51,9 @@ Existing embedded-database files are not imported automatically. Preserve a back
 ## Workspace
 
 ```text
-app/                  Leptos UI and typed server-function boundary
-frontend/             Browser hydration entry point
-server/               Axum/Leptos server entry point
+app/                  Leptos UI, hydration, and Axum/Leptos server entry points
+app/src/components/   Reusable UI components and server-function boundary
+app/src/views/        Route-level views
 crates/game-core/     Deterministic, framework-independent game rules
 crates/game-server/   Application commands, configuration, AI, events, persistence
 migrations/           PostgreSQL schema

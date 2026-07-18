@@ -5,9 +5,9 @@
 Manchester Arcana starts as a Rust modular monolith using Leptos 0.8, Axum, SQLx, and PostgreSQL. The implemented workspace is the architectural baseline:
 
 ```text
-app/                 shared Leptos components, routes, and server functions
-frontend/            browser/WASM hydration entry point
-server/              Axum SSR binary and static-file integration
+app/                 Leptos components, routes, hydration, and the Axum SSR binary
+app/src/components/  reusable UI components and server functions
+app/src/views/       route-level views
 crates/game-core/    framework-independent rules, characters, dice, progression,
                      session DTOs, and declarative AI-GM proposals
 crates/game-server/  server-only application orchestration, configuration,

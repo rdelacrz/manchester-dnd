@@ -39,8 +39,6 @@ declare -A rust_boms=(
   ["app/${prefix}.json"]="rust-app.cdx.json"
   ["crates/game-core/${prefix}.json"]="rust-game-core.cdx.json"
   ["crates/game-server/${prefix}.json"]="rust-game-server.cdx.json"
-  ["frontend/${prefix}.json"]="rust-frontend.cdx.json"
-  ["server/${prefix}.json"]="rust-web.cdx.json"
 )
 
 for source in "${!rust_boms[@]}"; do
@@ -94,6 +92,6 @@ python3 scripts/validate_release_provenance.py >/dev/null
 )
 
 echo "release SBOM generated: $OUTPUT_DIR"
-echo "  Rust workspace and fuzz-harness components: 6 CycloneDX documents"
+echo "  Rust workspace and fuzz-harness components: 4 CycloneDX documents"
 echo "  JavaScript build/test components: $(jq '.components | length' "$OUTPUT_DIR/javascript-build.cdx.json")"
 echo "  Release assets: $(jq '.assets | length' "$OUTPUT_DIR/release-assets.provenance.json")"

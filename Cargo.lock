@@ -1636,6 +1636,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 name = "manchester-dnd-app"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "console_error_panic_hook",
+ "futures-util",
  "http",
  "leptos",
  "leptos_axum",
@@ -1645,7 +1648,10 @@ dependencies = [
  "manchester-dnd-server",
  "serde",
  "serde_json",
+ "tokio",
+ "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1660,16 +1666,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "manchester-dnd-frontend"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "leptos",
- "manchester-dnd-app",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1694,24 +1690,6 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
-]
-
-[[package]]
-name = "manchester-dnd-web"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures-util",
- "leptos",
- "leptos_axum",
- "manchester-dnd-app",
- "manchester-dnd-core",
- "manchester-dnd-server",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

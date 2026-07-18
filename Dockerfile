@@ -12,8 +12,6 @@ RUN rustup target add --toolchain 1.90.0 wasm32-unknown-unknown \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY app ./app
 COPY crates ./crates
-COPY frontend ./frontend
-COPY server ./server
 COPY migrations ./migrations
 COPY public ./public
 COPY style ./style

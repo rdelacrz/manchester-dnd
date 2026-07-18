@@ -25,7 +25,7 @@ run_case() {
 # Browser trust, CSRF-like drive-by mutation, framing, content type, request
 # size, restore confirmation, and independent rate-window boundaries.
 run_case http-boundaries \
-    cargo test --locked -p manchester-dnd-web
+    cargo test --locked -p manchester-dnd-app --features ssr --bin manchester-dnd-web
 run_case server-function-origin \
     cargo test --locked -p manchester-dnd-app \
     campaign::tests::mutation_origin_must_match_the_request_host

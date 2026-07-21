@@ -137,3 +137,30 @@ container digests, database recovery manifests, and the explicit go/no-go record
 Any critical unresolved data-loss, authority, consent, privacy, security, provenance,
 or accessibility issue is a no-go. External branding/provider/manual-device holds
 must be listed as blockers rather than converted into unsupported claims.
+
+## Rewrite Part 1: Authenticated multi-user mode (2026-07-21)
+
+### Migration scope
+Migrations 0001-0031 must be applied in order. Key new migrations:
+- 0027: Player character audit retention (FK ON DELETE SET NULL).
+- 0028: Campaign memberships, invitations, character instances.
+- 0029: Campaign membership theme_id.
+- 0030: Campaign lobbies and turns (extends play_sessions, adds participants/turn-state/audit tables).
+- 0031: Custom-action point ledger.
+
+### Backfill behavior
+- Existing `campaign_play_sessions.state = 'open'` rows are backfilled to `'waiting'`.
+- `gm_account_id` is backfilled from `campaign_sessions.owner_account_id`.
+- Legacy local-owner rows use `'account:local'` as a placeholder.
+- Existing local campaign/hero/export fixtures remain loadable after all migrations.
+
+### Hosted-mode gate
+Hosted mode (`APP_ACCESS_MODE=hosted`) remains fail-closed in `validate_access_mode()`
+until the evidence checklist in `docs/evidence/rewrite-part-1-auth-and-isolation.md` is
+fully verified. Do not remove the gate without completing the two-account isolation matrix.
+
+### Recovery
+- Backup and restore accounts, sessions, memberships, character library, campaigns,
+  lobby, turn state, audits, and point ledger.
+- Verify canonical state hashes match before and after restore.
+- Sessions may be excluded/revoked after disaster recovery; document expected re-login behavior.

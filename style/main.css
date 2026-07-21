@@ -1902,6 +1902,10 @@ footer a {
 }
 
 @media (max-width: 768px) {
+  .side-navigation {
+    z-index: 11;
+  }
+
   .side-navigation-toggle {
     display: block;
     background: var(--panel-strong);

@@ -17,4 +17,10 @@ pub(crate) use views::home::load_campaign_into;
 pub fn hydrate() {
     console_error_panic_hook::set_once();
     leptos::mount::hydrate_body(app::App);
+    if let Some(body) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.body())
+    {
+        let _ = body.set_attribute("data-hydrated", "true");
+    }
 }

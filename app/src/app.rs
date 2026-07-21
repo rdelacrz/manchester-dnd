@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
+use leptos_meta::{MetaTags, Title, provide_meta_context};
 use leptos_router::{
     StaticSegment,
     components::{Route, Router, Routes},
@@ -31,6 +31,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                     name="description"
                     content="A collaborative, AI-guided fantasy role-playing game inspired by Manchester."
                 />
+                <link id="leptos" rel="stylesheet" href="/pkg/manchester-arcana.css"/>
                 <AutoReload options=options.clone()/>
                 <HydrationScripts options/>
                 <MetaTags/>
@@ -47,7 +48,6 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
-        <Stylesheet id="leptos" href="/pkg/manchester-arcana.css"/>
         <Title text="Manchester Arcana"/>
         <a class="skip-link" href="#main-content">"Skip to main content"</a>
         <ErrorBoundary fallback=|_errors| view! { <AppError/> }>

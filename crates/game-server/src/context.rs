@@ -5,7 +5,7 @@ use crate::{
     campaign_pins::CampaignPinRuntime,
     config::{AppConfig, ContentPackConfig},
     content::{ActiveContentCatalog, load_bundled_content_catalog},
-    error::{ApplicationError, BootstrapError},
+    error::{ApplicationError, BootstrapError, ConfigError},
     generation::{GenerationProviders, ImageGenerator, TextGenerator},
     generation_ledger::InlineGenerationLedger,
     gm::GameMasterService,
@@ -22,6 +22,7 @@ pub struct ServerContext {
     pub config: Arc<AppConfig>,
     pub active_content: Arc<ActiveContentCatalog>,
     pub application: GameApplicationService,
+    pub authentication: crate::auth::AuthService,
     pub text_generator: Arc<dyn TextGenerator>,
     pub image_generator: Arc<dyn ImageGenerator>,
     pub game_master: GameMasterService,
@@ -45,6 +46,14 @@ impl ServerContext {
         let repository =
             PostgresRepository::connect(config.database_url.expose_secret(), config.database)
                 .await?;
+        let authentication =
+            crate::auth::AuthService::new(repository.clone(), config.authentication.clone())
+                .map_err(|_| {
+                    BootstrapError::Config(ConfigError::InvalidValue {
+                        name: "AUTH_ARGON2_*",
+                        reason: "Argon2id parameter construction failed".to_owned(),
+                    })
+                })?;
         let generation_ledger = InlineGenerationLedger::new(
             repository.clone(),
             &config.text_llm,
@@ -82,6 +91,7 @@ impl ServerContext {
             config: Arc::new(config),
             active_content,
             application,
+            authentication,
             text_generator: providers.text,
             image_generator: providers.image,
             game_master,

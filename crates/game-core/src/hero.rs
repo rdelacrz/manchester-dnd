@@ -3100,7 +3100,7 @@ where
     }
 }
 
-fn require_schema(actual: u16, expected: u16) -> HeroResult<()> {
+pub(crate) fn require_schema(actual: u16, expected: u16) -> HeroResult<()> {
     if actual == expected {
         Ok(())
     } else {
@@ -3108,7 +3108,7 @@ fn require_schema(actual: u16, expected: u16) -> HeroResult<()> {
     }
 }
 
-fn validate_id(field: &'static str, value: &str) -> HeroResult<()> {
+pub(crate) fn validate_id(field: &'static str, value: &str) -> HeroResult<()> {
     if is_valid_opaque_id(value) {
         Ok(())
     } else {

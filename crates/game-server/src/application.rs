@@ -52,10 +52,14 @@ use crate::{
 
 mod hero;
 mod lifecycle;
+mod player_characters;
 pub use hero::{
     ClaimEncounterRewardCommand, EncounterRewardClaimOutcomeDto, HERO_APPLICATION_SCHEMA_VERSION,
     HERO_DRAFT_RETENTION_SECONDS, HERO_DRAFT_TTL_SECONDS, HeroLevelUpChoicesDto,
     HeroLevelUpOutcomeDto, HeroRewardOutcomeDto, LOCAL_HERO_OWNER_KEY, LocalHeroWorkspaceDto,
+};
+pub use player_characters::{
+    PLAYER_CHARACTER_DRAFT_RETENTION_SECONDS, PLAYER_CHARACTER_DRAFT_TTL_SECONDS,
 };
 
 pub const LOCAL_CAMPAIGN_SESSION_ID: &str = "local-campaign";
@@ -205,6 +209,14 @@ impl GameApplicationService {
             SystemDice,
             SystemClock,
         )
+    }
+
+    /// Read-only access to the underlying repository for scoped queries that
+    /// do not belong to the game application service (e.g. player character
+    /// library operations).
+    #[must_use]
+    pub fn repository(&self) -> &PostgresRepository {
+        &self.repository
     }
 
     #[cfg(test)]

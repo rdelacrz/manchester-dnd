@@ -111,6 +111,29 @@ pub enum RepositoryError {
     },
 }
 
+/// Errors returned by `AuthService` and the HTTP authentication boundary.
+///
+/// Variants are deliberately coarse to prevent account enumeration: unknown
+/// account, disabled account, and wrong password all map to
+/// `InvalidCredentials`.
+#[derive(Debug, Error)]
+pub enum AuthenticationError {
+    #[error("invalid credentials")]
+    InvalidCredentials,
+    #[error("account is unavailable")]
+    AccountUnavailable,
+    #[error("session is invalid or expired")]
+    InvalidSession,
+    #[error("password hash operation failed")]
+    PasswordHash,
+    #[error("cryptographic randomness source failed")]
+    Randomness,
+    #[error("authentication input failed validation")]
+    InvalidInput(#[from] crate::auth::AuthenticationInputError),
+    #[error("repository error during authentication")]
+    Repository(#[from] RepositoryError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransientPostgresFailure {
     SerializationFailure,

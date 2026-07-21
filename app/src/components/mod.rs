@@ -1,7 +1,14 @@
+pub(crate) mod auth;
 pub(crate) mod campaign;
+pub(crate) mod character_campaigns;
+pub(crate) mod character_library;
 pub(crate) mod freeform;
 pub(crate) mod hero;
 pub(crate) mod images;
 pub(crate) mod info;
+pub(crate) mod layout;
 pub(crate) mod lifecycle;
 pub(crate) mod privacy;
+pub(crate) mod protected_layout;
+pub(crate) mod public_header;
+pub(crate) mod side_navigation;

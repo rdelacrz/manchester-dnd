@@ -6,6 +6,7 @@
 //! apply them through the authoritative core domain.
 
 pub mod application;
+pub mod auth;
 pub mod campaign_pins;
 pub mod config;
 pub mod content;
@@ -30,17 +31,22 @@ pub use application::{
     LOCAL_CHARACTER_ID, LOCAL_EXPLORATION_ACTION_ID, LOCAL_HERO_OWNER_KEY, LOCAL_SOCIAL_ACTION_ID,
     LocalHeroWorkspaceDto, UnixTimeSource,
 };
+pub use auth::{
+    AccountPrincipal, AccountSummary, AuthService, AuthenticatedSession, AuthenticationActionKind,
+    AuthenticationAudit, AuthenticationInputError, AuthenticationSecret,
+    AuthenticationThrottleBucket, IssuedSession, LOCAL_ACCOUNT_ID, PasswordPhc,
+};
 pub use campaign_pins::{CampaignPinRuntime, CampaignPinValidationError};
 pub use config::{
-    AccessMode, AppConfig, ContentPackConfig, DatabaseRuntimeConfig, GenerationConfigFingerprints,
-    LlmBackend, LlmProfile, SecretString,
+    AccessMode, AppConfig, AuthenticationConfig, ContentPackConfig, DatabaseRuntimeConfig,
+    GenerationConfigFingerprints, LlmBackend, LlmProfile, SecretString,
 };
 pub use content::{ActiveContentCatalog, ActiveContentPack, ContentCatalogError};
 pub use context::ServerContext;
 pub use error::{
-    ApplicationError, BootstrapError, ConfigError, EventPromptError, GameMasterError,
-    GenerationError, PrivateInspirationError, RepositoryError, TransientPostgresFailure,
-    classify_postgres_sqlstate,
+    ApplicationError, AuthenticationError, BootstrapError, ConfigError, EventPromptError,
+    GameMasterError, GenerationError, PrivateInspirationError, RepositoryError,
+    TransientPostgresFailure, classify_postgres_sqlstate,
 };
 pub use generation_ledger::{
     GenerationLedgerError, InlineGenerationAttempt, InlineGenerationLedger, InlineGenerationRequest,

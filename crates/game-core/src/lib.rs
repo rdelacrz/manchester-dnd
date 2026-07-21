@@ -18,6 +18,7 @@ mod error;
 mod exploration;
 pub mod hero;
 mod identifier;
+pub mod player_character;
 mod proficiency;
 mod progression;
 mod roll;
@@ -49,6 +50,10 @@ pub use exploration::{
     SOCIAL_INTERACTION_SCHEMA_VERSION, SocialInteractionOutcomeDto, SocialSceneViewDto,
 };
 pub use identifier::{MAX_OPAQUE_ID_LEN, is_valid_opaque_id};
+pub use player_character::{
+    MAX_DISPLAY_NAME_LEN as MAX_PLAYER_CHARACTER_DISPLAY_NAME_LEN, PLAYER_CHARACTER_SCHEMA_VERSION,
+    PlayerCharacter,
+};
 pub use proficiency::Proficiency;
 pub use progression::{Level, XP_THRESHOLDS};
 pub use roll::{

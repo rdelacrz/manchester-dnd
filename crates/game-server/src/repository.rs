@@ -13,6 +13,7 @@ use sqlx::{
 
 use crate::{config::DatabaseRuntimeConfig, error::RepositoryError};
 
+mod auth;
 mod governance;
 mod hero;
 mod images;
@@ -23,6 +24,7 @@ mod legacy;
 mod lifecycle;
 mod operations;
 mod pins;
+mod player_characters;
 mod presentations;
 mod recaps;
 pub use governance::{
@@ -61,6 +63,10 @@ pub use operations::{
     RecoveryManifestError, RecoveryMigrationManifestEntry, VerifiedRecoveryFile,
 };
 pub use pins::StoredCampaignPins;
+pub use player_characters::{
+    NewPlayerCharacterReceipt, PlayerCharacterDraftSummary, PlayerCharacterSummary,
+    StoredPlayerCharacterReceipt,
+};
 pub use presentations::{
     GeneratedTextPresentation, GeneratedTextPresentationReceipt, GeneratedTextPresentationReplay,
     GeneratedTextPresentationSnapshot, GeneratedTextPresentationSource,

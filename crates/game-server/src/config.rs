@@ -191,6 +191,47 @@ impl Default for DatabaseRuntimeConfig {
     }
 }
 
+/// Authentication, session, and throttling configuration.
+///
+/// In hosted mode, `cookie_secure` must be `true` and `canonical_origin` must
+/// be set. Local mode permits `cookie_secure = false` for loopback development.
+#[derive(Debug, Clone)]
+pub struct AuthenticationConfig {
+    pub session_idle_lifetime: Duration,
+    pub session_absolute_lifetime: Duration,
+    pub max_active_sessions: u32,
+    pub max_hash_concurrency: usize,
+    pub throttle_window_seconds: u64,
+    pub throttle_block_after_attempts: u32,
+    pub throttle_block_seconds: u64,
+    pub throttle_hmac_key: SecretString,
+    pub cookie_secure: bool,
+    pub canonical_origin: Option<String>,
+    pub argon2_memory_kib: u32,
+    pub argon2_iterations: u32,
+    pub argon2_parallelism: u32,
+}
+
+impl Default for AuthenticationConfig {
+    fn default() -> Self {
+        Self {
+            session_idle_lifetime: Duration::from_secs(60 * 60 * 24 * 7),
+            session_absolute_lifetime: Duration::from_secs(60 * 60 * 24 * 30),
+            max_active_sessions: 5,
+            max_hash_concurrency: 2,
+            throttle_window_seconds: 300,
+            throttle_block_after_attempts: 5,
+            throttle_block_seconds: 60,
+            throttle_hmac_key: SecretString::new("change-me-throttle-hmac-key"),
+            cookie_secure: false,
+            canonical_origin: None,
+            argon2_memory_kib: 19_456,
+            argon2_iterations: 2,
+            argon2_parallelism: 1,
+        }
+    }
+}
+
 /// Trusted deployment selection for the fixed private-MVP content allowlist.
 /// The root may move between source checkouts and runtime images, but startup
 /// only inspects the three compiled pack directories beneath it.
@@ -430,6 +471,7 @@ pub struct AppConfig {
     pub text_llm: LlmProfile,
     pub image_llm: LlmProfile,
     pub generation_governance: GenerationGovernanceConfig,
+    pub authentication: AuthenticationConfig,
 }
 
 impl AppConfig {
@@ -735,6 +777,7 @@ impl AppConfig {
             text_llm,
             image_llm,
             generation_governance,
+            authentication: AuthenticationConfig::default(),
         })
     }
 

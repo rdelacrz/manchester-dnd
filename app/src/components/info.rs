@@ -1,45 +1,14 @@
 use leptos::prelude::*;
 use leptos_meta::Title;
 
-fn info_header() -> impl IntoView {
-    view! {
-        <header class="topbar info-topbar">
-            <a class="brand" href="/" aria-label="Manchester Arcana home">
-                <span class="brand-mark">"M"</span>
-                <span>
-                    <strong>"Manchester Arcana"</strong>
-                    <small>"Private evaluation build"</small>
-                </span>
-            </a>
-            <nav aria-label="Information navigation">
-                <a href="/guide">"Guide"</a>
-                <a href="/privacy-and-safety">"Privacy"</a>
-                <a href="/legal">"Legal"</a>
-                <a href="/">"Return to game"</a>
-            </nav>
-        </header>
-    }
-}
-
-fn info_footer() -> impl IntoView {
-    view! {
-        <footer>
-            <p>"Private evaluation only · Manchester Arcana is a working title."</p>
-            <div class="footer-links">
-                <a href="/guide">"Supported features"</a>
-                <a href="/privacy-and-safety">"Privacy and reporting"</a>
-                <a href="/legal">"Legal and attribution"</a>
-            </div>
-        </footer>
-    }
-}
+use crate::components::layout::PublicLayout;
 
 #[component]
 pub(crate) fn GuidePage() -> impl IntoView {
     view! {
         <Title text="Guide and supported features · Manchester Arcana"/>
-        <main id="main-content" class="game-shell info-shell" tabindex="-1">
-            {info_header()}
+        <PublicLayout>
+            <div class="info-shell">
             <section class="info-hero" aria-labelledby="guide-heading">
                 <p class="eyebrow">"START HERE"</p>
                 <h1 id="guide-heading">"Set up safely, then follow the saved story"</h1>
@@ -62,10 +31,10 @@ pub(crate) fn GuidePage() -> impl IntoView {
                 <article class="panel info-card">
                     <h2>"Your first run"</h2>
                     <ol class="first-run-list">
-                        <li><a href="/#campaigns">"Create or resume the local campaign"</a>" and confirm its saved revision."</li>
-                        <li><a href="/#themes">"Build a rules-valid hero"</a>"; every step is saved and can survive a refresh."</li>
-                        <li><a href="/#play">"Inspect the viaduct runes"</a>" to commit the authored exploration consequence."</li>
-                        <li><a href="/#encounter">"Choose only rendered legal actions"</a>" until victory or the non-terminal story-recovery defeat."</li>
+                        <li><a href="/play#campaigns">"Create or resume the local campaign"</a>" and confirm its saved revision."</li>
+                        <li><a href="/play#themes">"Build a rules-valid hero"</a>"; every step is saved and can survive a refresh."</li>
+                        <li><a href="/play#play">"Inspect the viaduct runes"</a>" to commit the authored exploration consequence."</li>
+                        <li><a href="/play#encounter">"Choose only rendered legal actions"</a>" until victory or the non-terminal story-recovery defeat."</li>
                         <li>"Claim trusted encounter XP, advance to level 2, inspect stored history, and make a private export from the campaign library."</li>
                     </ol>
                 </article>
@@ -93,8 +62,8 @@ pub(crate) fn GuidePage() -> impl IntoView {
                 <p>"Pause play, disable providers or private inspiration when relevant, preserve only the safe correlation code and time, and use the private-test reporting route. Never paste campaign prose, source material, credentials, or exported saves into a report."</p>
                 <a class="primary-button" href="/privacy-and-safety">"Privacy controls and reporting"</a>
             </section>
-            {info_footer()}
-        </main>
+            </div>
+        </PublicLayout>
     }
 }
 
@@ -102,8 +71,8 @@ pub(crate) fn GuidePage() -> impl IntoView {
 pub(crate) fn PrivacyAndSafetyPage() -> impl IntoView {
     view! {
         <Title text="Privacy, safety, and reporting · Manchester Arcana"/>
-        <main id="main-content" class="game-shell info-shell" tabindex="-1">
-            {info_header()}
+        <PublicLayout>
+            <div class="info-shell">
             <section class="info-hero" aria-labelledby="privacy-heading">
                 <p class="eyebrow">"PRIVATE BY DEFAULT"</p>
                 <h1 id="privacy-heading">"Your campaign and real-life inspiration stay under your control"</h1>
@@ -136,11 +105,11 @@ pub(crate) fn PrivacyAndSafetyPage() -> impl IntoView {
                 </article>
             </section>
             <div class="info-actions">
-                <a class="primary-button" href="/#privacy">"Open in-game privacy controls"</a>
+                <a class="primary-button" href="/play#privacy">"Open in-game privacy controls"</a>
                 <a class="text-link" href="/legal">"Read legal and attribution information →"</a>
             </div>
-            {info_footer()}
-        </main>
+            </div>
+        </PublicLayout>
     }
 }
 
@@ -148,8 +117,8 @@ pub(crate) fn PrivacyAndSafetyPage() -> impl IntoView {
 pub(crate) fn LegalPage() -> impl IntoView {
     view! {
         <Title text="Legal and attribution · Manchester Arcana"/>
-        <main id="main-content" class="game-shell info-shell" tabindex="-1">
-            {info_header()}
+        <PublicLayout>
+            <div class="info-shell">
             <section class="info-hero" aria-labelledby="legal-heading">
                 <p class="eyebrow">"ATTRIBUTION AND DISTRIBUTION"</p>
                 <h1 id="legal-heading">"Private evaluation notices"</h1>
@@ -181,7 +150,7 @@ pub(crate) fn LegalPage() -> impl IntoView {
                     <p>"“Manchester Arcana” is a private working title and does not claim endorsement by Wizards of the Coast, the city of Manchester, any business, or any real person. Public name, domain, and trademark clearance remains an explicit release blocker."</p>
                 </article>
             </section>
-            {info_footer()}
-        </main>
+            </div>
+        </PublicLayout>
     }
 }

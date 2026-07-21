@@ -18,7 +18,7 @@ use axum::{
 };
 use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list};
-use manchester_dnd_app::{App, shell};
+use manchester_dnd_app::{App, auth_boundary, shell};
 use manchester_dnd_core::is_valid_opaque_id;
 use manchester_dnd_server::{
     AppConfig, ApplicationError, LOCAL_CAMPAIGN_SESSION_ID, RestoreCampaignExportCommand,
@@ -84,6 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let restore_context = server_context.clone();
     let image_delivery_context = server_context.clone();
     let request_rate_limiter = RequestRateLimiter::new();
+    let auth_boundary_state = auth_boundary::AuthenticationBoundaryState {
+        context: server_context.clone(),
+    };
     spawn_scene_image_worker(server_context.clone());
     let router = Router::new()
         .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
@@ -149,6 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(
             request_rate_limiter,
             enforce_rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            auth_boundary_state,
+            auth_boundary::resolve_request_principal,
         ))
         .layer(middleware::from_fn(enforce_public_boundary))
         .with_state(leptos_options);

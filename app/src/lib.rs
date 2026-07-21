@@ -2,7 +2,7 @@
 
 pub mod app;
 #[cfg(feature = "ssr")]
-pub(crate) mod auth_boundary;
+pub mod auth_boundary;
 pub(crate) mod components;
 pub(crate) mod views;
 

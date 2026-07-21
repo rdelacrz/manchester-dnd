@@ -622,7 +622,7 @@ impl PostgresRepository {
         }
         let result = sqlx::query(
             "UPDATE campaign_memberships
-             SET state = 'removed', left_at = CURRENT_TIMESTAMP
+             SET state = 'removed', left_at = CURRENT_TIMESTAMP, accepted_at = NULL
              WHERE campaign_session_id = $1 AND account_id = $2
                AND state = 'active'",
         )
@@ -1089,4 +1089,626 @@ fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T,
         id: id.to_owned(),
         reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manchester_dnd_core::{
+        PLAYER_CHARACTER_SCHEMA_VERSION, PlayerCharacter,
+        hero::{
+            AncestryId, BackgroundId, BackgroundSelection, ClassSelection, EquipmentId,
+            EquipmentSelection, FightingStyleId, HeroChoices, HeroConceptId, HeroPins,
+            HeroPresentation, SkillId, StandardArrayAssignment, ThemeId,
+        },
+    };
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    const THEME_ID: &str = "dev.manchester-arcana.rainbound-borough";
+
+    fn test_choices(theme: ThemeId) -> HeroChoices {
+        HeroChoices {
+            pins: HeroPins::mvp(theme),
+            concept: HeroConceptId::CanalGuardian,
+            ancestry: AncestryId::Human,
+            class: ClassSelection::Fighter {
+                fighting_style: FightingStyleId::Defense,
+            },
+            ability_assignment: StandardArrayAssignment {
+                strength: 15,
+                dexterity: 14,
+                constitution: 13,
+                intelligence: 12,
+                wisdom: 10,
+                charisma: 8,
+            },
+            background: BackgroundSelection {
+                background: BackgroundId::Soldier,
+                class_skills: vec![SkillId::Perception, SkillId::Survival],
+            },
+            equipment: EquipmentSelection {
+                carried: vec![
+                    EquipmentId::Longsword,
+                    EquipmentId::LightCrossbow,
+                    EquipmentId::ChainMail,
+                    EquipmentId::ExplorersPack,
+                ],
+                simple_weapon: None,
+                equipped_armor: Some(EquipmentId::ChainMail),
+                shield_equipped: false,
+            },
+            wizard_spells: None,
+            presentation: HeroPresentation {
+                name: "Test Hero".to_owned(),
+                pronouns: "they/them".to_owned(),
+                appearance: "A weathered adventurer".to_owned(),
+                ideal: "Justice for all".to_owned(),
+                bond: "Owes a life debt".to_owned(),
+                flaw: "Too trusting".to_owned(),
+                tone_limits: Vec::new(),
+            },
+        }
+    }
+
+    fn new_character(account_id: &str, name: &str) -> PlayerCharacter {
+        PlayerCharacter::new(
+            format!("character:{}", Uuid::new_v4()),
+            account_id.to_owned(),
+            name.to_owned(),
+            test_choices(ThemeId::RainboundBorough),
+        )
+        .expect("test character should be valid")
+    }
+
+    async fn insert_test_account(pool: &PgPool, account_id: &str) {
+        sqlx::query(
+            "INSERT INTO accounts (id, display_name, login_enabled) VALUES ($1, $2, FALSE)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind("Test Account")
+        .execute(pool)
+        .await
+        .expect("test account should insert");
+    }
+
+    /// Inserts a minimal `player_characters` row directly. The `choices_json`
+    /// is a valid MVP `HeroChoices` payload so the FK row is consistent, but
+    /// callers that need the in-memory `PlayerCharacter` object (e.g. for
+    /// `assign_character_to_campaign`) should build one via `new_character`
+    /// using the same id and choices.
+    async fn insert_test_player_character(pool: &PgPool, account_id: &str, character_id: &str) {
+        let choices = test_choices(ThemeId::RainboundBorough);
+        let choices_json = serde_json::to_value(&choices).expect("test choices should serialize");
+        // Derive a unique display name from the character id to satisfy the
+        // unique (owner_account_id, lower(display_name)) constraint when a
+        // single test inserts multiple characters for the same account.
+        let display_name = format!("Hero {}", &character_id[..character_id.len().min(20)]);
+        sqlx::query(
+            "INSERT INTO player_characters
+             (id, owner_account_id, revision, display_name, choices_json, schema_version)
+             VALUES ($1, $2, 0, $3, $4, $5)",
+        )
+        .bind(character_id)
+        .bind(account_id)
+        .bind(&display_name)
+        .bind(&choices_json)
+        .bind(PLAYER_CHARACTER_SCHEMA_VERSION as i32)
+        .execute(pool)
+        .await
+        .expect("test player character should insert");
+    }
+
+    // ── 1. create_campaign_with_owner ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn create_campaign_with_owner_creates_campaign_and_gm_membership(pool: PgPool) {
+        let account = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        insert_test_account(&pool, account).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(account, "Test Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+        assert_eq!(outcome.title, "Test Campaign");
+        assert_eq!(outcome.theme_id, THEME_ID);
+        assert!(outcome.campaign_id.starts_with("campaign:"));
+
+        // The campaign_sessions row exists with the owner backfilled.
+        let owner: String =
+            sqlx::query_scalar("SELECT owner_account_id FROM campaign_sessions WHERE id = $1")
+                .bind(&outcome.campaign_id)
+                .fetch_one(&repo.pool)
+                .await
+                .expect("session row should exist");
+        assert_eq!(owner, account);
+
+        // The GM membership is active.
+        let membership = repo
+            .load_membership(&outcome.campaign_id, account)
+            .await
+            .expect("load should succeed")
+            .expect("membership should exist");
+        assert_eq!(membership.role, MembershipRole::GameMaster);
+        assert_eq!(membership.state, MembershipState::Active);
+    }
+
+    // ── 2. list_account_campaigns ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn list_account_campaigns_returns_owned_and_member_campaigns(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Shared Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        // GM creates an invitation and the player accepts it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
+            .await
+            .expect("invitation should be created");
+        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await
+            .expect("accept should succeed");
+
+        // GM sees the campaign.
+        let gm_campaigns = repo
+            .list_account_campaigns(gm)
+            .await
+            .expect("list should succeed");
+        assert_eq!(gm_campaigns.len(), 1);
+        assert_eq!(gm_campaigns[0].campaign_id, outcome.campaign_id);
+        assert_eq!(gm_campaigns[0].role, MembershipRole::GameMaster);
+
+        // Player also sees the campaign.
+        let player_campaigns = repo
+            .list_account_campaigns(player)
+            .await
+            .expect("list should succeed");
+        assert_eq!(player_campaigns.len(), 1);
+        assert_eq!(player_campaigns[0].campaign_id, outcome.campaign_id);
+        assert_eq!(player_campaigns[0].role, MembershipRole::Player);
+    }
+
+    // ── 3. cross-account access ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn cross_account_campaign_access_returns_not_found(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let outsider = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, outsider).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Private Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        // The outsider is not a member — listing members returns NotFound.
+        let result = repo
+            .list_campaign_members(outsider, &outcome.campaign_id)
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound { .. })),
+            "non-member should get NotFound, got {result:?}"
+        );
+
+        // The outsider's own campaign list does not include this campaign.
+        let outsider_campaigns = repo
+            .list_account_campaigns(outsider)
+            .await
+            .expect("list should succeed");
+        assert!(
+            outsider_campaigns.is_empty(),
+            "non-member should not see the campaign"
+        );
+    }
+
+    // ── 4. invitation accept ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn invitation_accept_creates_active_membership(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Invite Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
+            .await
+            .expect("invitation should be created");
+
+        let membership = repo
+            .accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await
+            .expect("accept should succeed");
+        assert_eq!(membership.account_id, player);
+        assert_eq!(membership.role, MembershipRole::Player);
+        assert_eq!(membership.state, MembershipState::Active);
+        assert_eq!(membership.campaign_id, outcome.campaign_id);
+    }
+
+    // ── 5. invitation revocation ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn invitation_revocation_prevents_acceptance(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Revoke Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
+            .await
+            .expect("invitation should be created");
+
+        repo.revoke_campaign_invitation(gm, &invitation.id)
+            .await
+            .expect("revoke should succeed");
+
+        let result = repo
+            .accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound { .. })),
+            "revoked invitation should not be acceptable, got {result:?}"
+        );
+
+        // The player is not a member.
+        let membership = repo
+            .load_membership(&outcome.campaign_id, player)
+            .await
+            .expect("load should succeed");
+        assert!(membership.is_none(), "player should not be a member");
+    }
+
+    // ── 6. invitation expiry ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn invitation_expiry_prevents_acceptance(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Expiry Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        // Create an invitation that is already expired (expiry in the past).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now - 1)
+            .await
+            .expect("invitation should be created");
+
+        let result = repo
+            .accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound { .. })),
+            "expired invitation should not be acceptable, got {result:?}"
+        );
+
+        let membership = repo
+            .load_membership(&outcome.campaign_id, player)
+            .await
+            .expect("load should succeed");
+        assert!(membership.is_none(), "player should not be a member");
+    }
+
+    // ── 7. non-GM cannot invite ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn non_gm_cannot_invite(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "GM Only", THEME_ID)
+            .await
+            .expect("create should succeed");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
+            .await
+            .expect("invitation should be created");
+        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await
+            .expect("accept should succeed");
+
+        // The player (now an active member, but not the GM) cannot invite.
+        let result = repo
+            .create_campaign_invitation(
+                player,
+                &outcome.campaign_id,
+                "other@example.com",
+                now + 3600,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound { .. })),
+            "non-GM should not be able to invite, got {result:?}"
+        );
+    }
+
+    // ── 8. remove member ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn remove_campaign_member_sets_state_removed(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Removal Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
+            .await
+            .expect("invitation should be created");
+        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await
+            .expect("accept should succeed");
+
+        repo.remove_campaign_member(gm, &outcome.campaign_id, player)
+            .await
+            .expect("remove should succeed");
+
+        let membership = repo
+            .load_membership(&outcome.campaign_id, player)
+            .await
+            .expect("load should succeed")
+            .expect("membership row should still exist");
+        assert_eq!(membership.state, MembershipState::Removed);
+        assert_eq!(membership.role, MembershipRole::Player);
+    }
+
+    // ── 9. GM cannot remove self ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn gm_cannot_remove_self(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        insert_test_account(&pool, gm).await;
+        let repo = PostgresRepository::from_pool(pool);
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "No Self Removal", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        let result = repo
+            .remove_campaign_member(gm, &outcome.campaign_id, gm)
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::InvalidDomainState { .. })),
+            "GM should not be able to remove self, got {result:?}"
+        );
+
+        // GM membership is still active.
+        let membership = repo
+            .load_membership(&outcome.campaign_id, gm)
+            .await
+            .expect("load should succeed")
+            .expect("membership should exist");
+        assert_eq!(membership.state, MembershipState::Active);
+    }
+
+    // ── 10. assign character creates runtime hero ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn assign_character_creates_runtime_hero_instance(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        insert_test_account(&pool, gm).await;
+        let repo = PostgresRepository::from_pool(pool.clone());
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Hero Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        let character = new_character(gm, "Library Hero");
+        insert_test_player_character(&pool, gm, &character.character_id).await;
+
+        let assigned = repo
+            .assign_character_to_campaign(
+                gm,
+                &outcome.campaign_id,
+                &character.character_id,
+                &character,
+            )
+            .await
+            .expect("assign should succeed");
+        assert!(!assigned.instance_id.is_empty());
+        assert!(
+            assigned
+                .runtime_hero_character_id
+                .starts_with("character:runtime-")
+        );
+
+        // The campaign_character_instances row exists and is active.
+        let instance = repo
+            .load_active_character_instance(gm, &outcome.campaign_id)
+            .await
+            .expect("load should succeed")
+            .expect("instance should exist");
+        assert_eq!(instance.account_id, gm);
+        assert_eq!(instance.source_player_character_id, character.character_id);
+        assert_eq!(
+            instance.runtime_hero_character_id,
+            assigned.runtime_hero_character_id
+        );
+        assert_eq!(instance.state, CharacterInstanceState::Active);
+        assert_eq!(instance.source_display_name, "Library Hero");
+
+        // The runtime hero_characters row exists and deserializes.
+        let hero = repo
+            .load_runtime_hero_character(&assigned.runtime_hero_character_id)
+            .await
+            .expect("load should succeed")
+            .expect("hero should exist");
+        assert_eq!(hero.campaign_id, outcome.campaign_id);
+        assert_eq!(hero.owner_id, gm);
+    }
+
+    // ── 11. duplicate active character slot ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn duplicate_active_character_slot_rejected(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        insert_test_account(&pool, gm).await;
+        let repo = PostgresRepository::from_pool(pool.clone());
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Duplicate Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        let first = new_character(gm, "First Hero");
+        insert_test_player_character(&pool, gm, &first.character_id).await;
+        repo.assign_character_to_campaign(gm, &outcome.campaign_id, &first.character_id, &first)
+            .await
+            .expect("first assign should succeed");
+
+        // A second character from the same account cannot be assigned — the
+        // active slot is already taken.
+        let second = new_character(gm, "Second Hero");
+        insert_test_player_character(&pool, gm, &second.character_id).await;
+        let result = repo
+            .assign_character_to_campaign(gm, &outcome.campaign_id, &second.character_id, &second)
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::AlreadyExists { .. })),
+            "duplicate active slot should be rejected, got {result:?}"
+        );
+    }
+
+    // ── 12. cross-account character assignment ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn cross_account_character_assignment_rejected(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, player).await;
+        let repo = PostgresRepository::from_pool(pool.clone());
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Cross Account Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        // GM owns the character; the player tries to assign it.
+        let character = new_character(gm, "GM Hero");
+        insert_test_player_character(&pool, gm, &character.character_id).await;
+
+        // Make the player a member first so the membership check passes and we
+        // reach the ownership check.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invitation = repo
+            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
+            .await
+            .expect("invitation should be created");
+        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
+            .await
+            .expect("accept should succeed");
+
+        let result = repo
+            .assign_character_to_campaign(
+                player,
+                &outcome.campaign_id,
+                &character.character_id,
+                &character,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound { .. })),
+            "cross-account character assignment should be rejected, got {result:?}"
+        );
+    }
+
+    // ── 13. foreign campaign character assignment ──
+
+    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
+    async fn foreign_campaign_character_assignment_rejected(pool: PgPool) {
+        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let outsider = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        insert_test_account(&pool, gm).await;
+        insert_test_account(&pool, outsider).await;
+        let repo = PostgresRepository::from_pool(pool.clone());
+
+        let outcome = repo
+            .create_campaign_with_owner(gm, "Foreign Campaign", THEME_ID)
+            .await
+            .expect("create should succeed");
+
+        let character = new_character(outsider, "Outsider Hero");
+        insert_test_player_character(&pool, outsider, &character.character_id).await;
+
+        // The outsider is not a member of the campaign.
+        let result = repo
+            .assign_character_to_campaign(
+                outsider,
+                &outcome.campaign_id,
+                &character.character_id,
+                &character,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound { .. })),
+            "non-member character assignment should be rejected, got {result:?}"
+        );
+    }
 }

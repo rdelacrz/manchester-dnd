@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub(crate) mod campaign;
+pub(crate) mod campaign_library;
 pub(crate) mod character_campaigns;
 pub(crate) mod character_library;
 pub(crate) mod freeform;

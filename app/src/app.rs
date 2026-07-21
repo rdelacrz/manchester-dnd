@@ -7,7 +7,8 @@ use leptos_router::{
 
 use crate::components::info::{GuidePage, LegalPage, PrivacyAndSafetyPage};
 use crate::components::layout::PublicLayout;
-use crate::components::protected_layout::ProtectedLayout;
+use crate::views::campaign_new::CampaignNewPage;
+use crate::views::campaigns::CampaignsPage;
 use crate::views::character_campaign_stats::CharacterCampaignStatsPage;
 use crate::views::character_detail::CharacterDetailPage;
 use crate::views::character_new::CharacterNewPage;
@@ -59,6 +60,7 @@ pub fn App() -> impl IntoView {
                     <Route path=(StaticSegment("characters"), ParamSegment("character_id")) view=CharacterDetailPage/>
                     <Route path=(StaticSegment("characters"), ParamSegment("character_id"), StaticSegment("campaigns"), ParamSegment("campaign_id"), StaticSegment("stats")) view=CharacterCampaignStatsPage/>
                     <Route path=StaticSegment("campaigns") view=CampaignsPage/>
+                    <Route path=StaticSegment("campaigns/new") view=CampaignNewPage/>
                     <Route path=StaticSegment("guide") view=GuidePage/>
                     <Route path=StaticSegment("privacy-and-safety") view=PrivacyAndSafetyPage/>
                     <Route path=StaticSegment("legal") view=LegalPage/>
@@ -127,28 +129,6 @@ fn HomePage() -> impl IntoView {
                 </div>
             </section>
         </PublicLayout>
-    }
-}
-
-/// Protected campaigns page. Wrapped in `ProtectedLayout` which enforces
-/// authentication on the client side.
-#[component]
-fn CampaignsPage() -> impl IntoView {
-    view! {
-        <Title text="Campaigns · Manchester Arcana"/>
-        <ProtectedLayout>
-            <section class="protected-page" aria-labelledby="campaigns-heading">
-                <p class="eyebrow">"YOUR ADVENTURES"</p>
-                <h1 id="campaigns-heading">"Campaigns"</h1>
-                <p class="protected-page-notice">
-                    "Your campaigns and invitations will appear here once campaign memberships are implemented."
-                </p>
-                <div class="protected-placeholder" data-testid="campaigns-placeholder">
-                    <p>"No campaigns yet. Campaign creation is coming soon."</p>
-                    <a class="primary-button" href="/play">"Open the local game"</a>
-                </div>
-            </section>
-        </ProtectedLayout>
     }
 }
 

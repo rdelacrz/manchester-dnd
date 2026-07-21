@@ -1,3 +1,5 @@
+pub(crate) mod campaign_new;
+pub(crate) mod campaigns;
 pub(crate) mod character_campaign_stats;
 pub(crate) mod character_detail;
 pub(crate) mod character_new;

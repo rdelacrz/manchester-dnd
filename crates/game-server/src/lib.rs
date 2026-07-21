@@ -68,6 +68,10 @@ pub use repository::{
     RecoveryManifestError, RecoveryMigrationManifestEntry, RestoreCampaignExportCommand,
     StartPlaySessionCommand, VerifiedRecoveryFile,
 };
+pub use repository::{
+    CampaignMembershipRow, CreateCampaignWithOwnerOutcome, MembershipCampaignSummary,
+    MembershipRole, MembershipState,
+};
 #[cfg(feature = "legacy-import")]
 pub use repository::{
     LEGACY_IMPORT_SCHEMA_VERSION, LegacyImportCounts, LegacyImportError, LegacyImportReport,

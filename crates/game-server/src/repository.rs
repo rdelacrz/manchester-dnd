@@ -56,6 +56,11 @@ pub use lifecycle::{
     CampaignTurnHistoryItem, CampaignTurnHistoryPage, DeleteCampaignCommand, EndPlaySessionCommand,
     PreparedCampaignDeletion, RestoreCampaignExportCommand, StartPlaySessionCommand,
 };
+pub use memberships::{
+    AssignCharacterOutcome, CampaignCharacterInstanceRow, CampaignInvitationRow,
+    CampaignMembershipRow, CharacterInstanceState, CreateCampaignWithOwnerOutcome,
+    MembershipCampaignSummary, MembershipRole, MembershipState,
+};
 pub use operations::{
     CompleteRecoveryManifest, DATABASE_OPERATIONS_SNAPSHOT_SCHEMA_VERSION,
     DATABASE_RECOVERY_MANIFEST_SCHEMA_VERSION, DatabaseOperationsSnapshot,

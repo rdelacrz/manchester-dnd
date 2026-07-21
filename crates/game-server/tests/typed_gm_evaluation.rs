@@ -351,6 +351,8 @@ fn turn(service: &TypedGmService, purpose: TypedGmPurpose) -> TypedGmTurnInput {
         player_intent: (purpose == TypedGmPurpose::InterpretPlayerIntent)
             .then(|| "Advance carefully, or ask what I mean if that is ambiguous.".to_owned()),
         private_inspiration: None,
+        absent_character_summary: None,
+        safe_fallback_action_ids: Vec::new(),
         policy,
     }
 }

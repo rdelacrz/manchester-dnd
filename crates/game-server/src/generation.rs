@@ -563,6 +563,33 @@ fn fake_typed_gm_response(envelope: &Value) -> String {
         })
         .to_string();
     }
+    if task == "choose_absent_player_action" {
+        let legal_ids = envelope
+            .pointer("/legal_ids/action_ids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let safe_fallback = envelope
+            .pointer("/required_output/safe_fallback_action_ids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // Prefer the first safe fallback action if available, then any legal action.
+        let action_id = safe_fallback
+            .iter()
+            .chain(legal_ids.iter())
+            .filter_map(Value::as_str)
+            .next()
+            .unwrap_or("action:move");
+        return json!({
+            "type": "action",
+            "base": base,
+            "action_id": action_id,
+            "target_id": null,
+            "rationale": "The deterministic fake chose a conservative legal action for the absent player.",
+        })
+        .to_string();
+    }
 
     let legal_ids = envelope
         .pointer("/legal_ids/action_ids")

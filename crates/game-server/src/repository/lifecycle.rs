@@ -497,7 +497,7 @@ impl PostgresRepository {
                     p.id AS open_play_session_id
              FROM campaign_sessions c
              LEFT JOIN campaign_play_sessions p
-               ON p.campaign_session_id = c.id AND p.state = 'open'
+               ON p.campaign_session_id = c.id AND p.state IN ('waiting', 'active')
              WHERE c.owner_key = $1
              ORDER BY c.updated_at DESC, c.id",
         )
@@ -524,7 +524,7 @@ impl PostgresRepository {
                     p.id AS open_play_session_id
              FROM campaign_sessions c
              LEFT JOIN campaign_play_sessions p
-               ON p.campaign_session_id = c.id AND p.state = 'open'
+               ON p.campaign_session_id = c.id AND p.state IN ('waiting', 'active')
              WHERE c.owner_key = $1 AND c.id = $2",
         )
         .bind(owner_key)
@@ -1879,7 +1879,7 @@ async fn insert_restored_lifecycle_rows(
 ) -> Result<(), RepositoryError> {
     let campaign_session_id = &exported.campaign.document.id;
     for play in &exported.play_sessions {
-        let restored_open = play.state == "open";
+        let restored_open = play.state == "waiting" || play.state == "active";
         let state = if restored_open {
             "closed"
         } else {
@@ -2240,11 +2240,12 @@ fn play_session_from_row(row: PgRow) -> Result<CampaignPlaySession, RepositoryEr
 
 fn validate_play_session(play: &CampaignPlaySession) -> Result<(), RepositoryError> {
     let shape_valid = match play.state.as_str() {
-        "open" => {
+        "open" | "waiting" => {
             play.ended_campaign_revision.is_none()
                 && play.closed_at.is_none()
                 && play.close_reason.is_none()
         }
+        "active" => play.ended_campaign_revision.is_none() && play.closed_at.is_none(),
         "closed" => {
             play.ended_campaign_revision
                 .is_some_and(|end| end >= play.started_campaign_revision)
@@ -3286,7 +3287,7 @@ fn validate_export(exported: &CampaignPrivateExportV1) -> Result<(), RepositoryE
                 "play session owner or campaign is inconsistent",
             );
         }
-        open_count += usize::from(play.state == "open");
+        open_count += usize::from(play.state == "waiting");
     }
     if open_count > 1 {
         return invalid(
@@ -3723,7 +3724,7 @@ impl PostgresRepository {
         locked.require_state(CampaignLifecycleState::Active)?;
         let existing_open: Option<String> = sqlx::query_scalar(
             "SELECT id FROM campaign_play_sessions
-             WHERE campaign_session_id = $1 AND state = 'open' FOR UPDATE",
+             WHERE campaign_session_id = $1 AND state IN ('waiting', 'active') FOR UPDATE",
         )
         .bind(&command.lifecycle.campaign_session_id)
         .fetch_optional(&mut *transaction)
@@ -3740,7 +3741,7 @@ impl PostgresRepository {
             "INSERT INTO campaign_play_sessions
              (id, campaign_session_id, owner_key, schema_version, state,
               started_campaign_revision)
-             VALUES ($1, $2, $3, $4, 'open', $5)",
+             VALUES ($1, $2, $3, $4, 'waiting', $5)",
         )
         .bind(&command.play_session_id)
         .bind(&command.lifecycle.campaign_session_id)
@@ -3823,7 +3824,7 @@ impl PostgresRepository {
              SET state = 'closed', ended_campaign_revision = $4,
                  closed_at = CURRENT_TIMESTAMP, close_reason = 'owner_ended'
              WHERE id = $1 AND campaign_session_id = $2 AND owner_key = $3
-               AND state = 'open'",
+               AND state IN ('waiting', 'active')",
         )
         .bind(&command.play_session_id)
         .bind(&command.lifecycle.campaign_session_id)
@@ -4254,7 +4255,7 @@ async fn require_no_open_play_session(
 ) -> Result<(), RepositoryError> {
     let open: Option<String> = sqlx::query_scalar(
         "SELECT id FROM campaign_play_sessions
-         WHERE campaign_session_id = $1 AND state = 'open' FOR UPDATE",
+         WHERE campaign_session_id = $1 AND state IN ('waiting', 'active') FOR UPDATE",
     )
     .bind(campaign_session_id)
     .fetch_optional(&mut **transaction)

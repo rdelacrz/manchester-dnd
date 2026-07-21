@@ -439,6 +439,8 @@ pub async fn submit_typed_player_intent(
             public_facts,
             player_intent: Some(command.player_intent.trim().to_owned()),
             private_inspiration: None,
+            absent_character_summary: None,
+            safe_fallback_action_ids: Vec::new(),
             policy: policy.clone(),
         };
         let prepared = match context.typed_game_master.prepare_request(&input) {
@@ -679,6 +681,8 @@ pub async fn submit_typed_player_intent(
                     public_facts: narration_public_facts,
                     player_intent: None,
                     private_inspiration,
+                    absent_character_summary: None,
+                    safe_fallback_action_ids: Vec::new(),
                     policy,
                 };
                 let engine_narration = committed.resolution.narration.authored_text.clone();
@@ -1741,6 +1745,8 @@ mod narration_server {
             }],
             player_intent: None,
             private_inspiration: None,
+            absent_character_summary: None,
+            safe_fallback_action_ids: Vec::new(),
             policy,
         })
     }

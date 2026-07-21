@@ -7,7 +7,9 @@ use leptos_router::{
 
 use crate::components::info::{GuidePage, LegalPage, PrivacyAndSafetyPage};
 use crate::components::layout::PublicLayout;
+use crate::views::campaign_lobby::CampaignLobbyPage;
 use crate::views::campaign_new::CampaignNewPage;
+use crate::views::campaign_play::CampaignPlayPage;
 use crate::views::campaigns::CampaignsPage;
 use crate::views::character_campaign_stats::CharacterCampaignStatsPage;
 use crate::views::character_detail::CharacterDetailPage;
@@ -61,6 +63,8 @@ pub fn App() -> impl IntoView {
                     <Route path=(StaticSegment("characters"), ParamSegment("character_id"), StaticSegment("campaigns"), ParamSegment("campaign_id"), StaticSegment("stats")) view=CharacterCampaignStatsPage/>
                     <Route path=StaticSegment("campaigns") view=CampaignsPage/>
                     <Route path=StaticSegment("campaigns/new") view=CampaignNewPage/>
+                    <Route path=(StaticSegment("campaigns"), ParamSegment("id"), StaticSegment("lobby")) view=CampaignLobbyPage/>
+                    <Route path=(StaticSegment("campaigns"), ParamSegment("id"), StaticSegment("play")) view=CampaignPlayPage/>
                     <Route path=StaticSegment("guide") view=GuidePage/>
                     <Route path=StaticSegment("privacy-and-safety") view=PrivacyAndSafetyPage/>
                     <Route path=StaticSegment("legal") view=LegalPage/>

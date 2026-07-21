@@ -1,6 +1,7 @@
 pub(crate) mod auth;
 pub(crate) mod campaign;
 pub(crate) mod campaign_library;
+pub(crate) mod campaign_lobby;
 pub(crate) mod character_campaigns;
 pub(crate) mod character_library;
 pub(crate) mod freeform;
@@ -13,3 +14,4 @@ pub(crate) mod privacy;
 pub(crate) mod protected_layout;
 pub(crate) mod public_header;
 pub(crate) mod side_navigation;
+pub(crate) mod turn_history;

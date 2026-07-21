@@ -12,6 +12,7 @@
 /generated/
 **/__pycache__/
 /.runtime-private/
+/.hermes-orchestration/recovery/*.dump
 /graphify-out/
 /prompts/events/private/*
 !/prompts/events/private/.gitkeep

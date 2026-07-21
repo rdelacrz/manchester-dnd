@@ -2048,7 +2048,7 @@ async fn insert_restored_presentations_and_assets(
     Ok(())
 }
 
-fn summary_from_row(row: PgRow) -> Result<CampaignSummary, RepositoryError> {
+pub(crate) fn summary_from_row(row: PgRow) -> Result<CampaignSummary, RepositoryError> {
     let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
     let state: String = row
         .try_get("lifecycle_state")

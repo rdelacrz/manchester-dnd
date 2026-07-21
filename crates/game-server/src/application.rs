@@ -53,11 +53,13 @@ use crate::{
 mod hero;
 mod lifecycle;
 mod player_characters;
+
 pub use hero::{
     ClaimEncounterRewardCommand, EncounterRewardClaimOutcomeDto, HERO_APPLICATION_SCHEMA_VERSION,
     HERO_DRAFT_RETENTION_SECONDS, HERO_DRAFT_TTL_SECONDS, HeroLevelUpChoicesDto,
     HeroLevelUpOutcomeDto, HeroRewardOutcomeDto, LOCAL_HERO_OWNER_KEY, LocalHeroWorkspaceDto,
 };
+pub(crate) use lifecycle::map_lifecycle_repository_error;
 pub use player_characters::{
     PLAYER_CHARACTER_DRAFT_RETENTION_SECONDS, PLAYER_CHARACTER_DRAFT_TTL_SECONDS,
 };
@@ -217,6 +219,39 @@ impl GameApplicationService {
     #[must_use]
     pub fn repository(&self) -> &PostgresRepository {
         &self.repository
+    }
+
+    /// Verifies that `account_id` is an active member of `campaign_id`.
+    /// Returns `NotFound` for non-members and non-existent campaigns alike
+    /// (anti-enumeration). This is the guard every hosted-mode server function
+    /// must call before returning campaign data.
+    pub async fn assert_member_access(
+        &self,
+        account_id: &str,
+        campaign_id: &str,
+    ) -> Result<(), ApplicationError> {
+        let is_member = self
+            .repository
+            .is_active_member(account_id, campaign_id)
+            .await
+            .map_err(map_lifecycle_repository_error)?;
+        if !is_member {
+            return Err(ApplicationError::WrongCampaign);
+        }
+        Ok(())
+    }
+
+    /// Loads a campaign summary after verifying the caller is an active member.
+    /// Returns `None` for non-members and non-existent campaigns (anti-enumeration).
+    pub async fn load_member_campaign(
+        &self,
+        account_id: &str,
+        campaign_id: &str,
+    ) -> Result<Option<crate::repository::lifecycle::CampaignSummary>, ApplicationError> {
+        self.repository
+            .load_member_campaign_summary(account_id, campaign_id)
+            .await
+            .map_err(map_lifecycle_repository_error)
     }
 
     #[cfg(test)]

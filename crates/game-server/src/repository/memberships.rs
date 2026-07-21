@@ -492,6 +492,64 @@ impl PostgresRepository {
         row.map(membership_from_row).transpose()
     }
 
+    /// Returns `true` if `account_id` is an active member of `campaign_id`.
+    /// This is the membership guard used by all member-scoped loaders.
+    pub async fn is_active_member(
+        &self,
+        account_id: &str,
+        campaign_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        validate_account_id(account_id)?;
+        validate_campaign_id(campaign_id)?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT account_id FROM campaign_memberships
+             WHERE campaign_session_id = $1 AND account_id = $2 AND state = 'active'",
+        )
+        .bind(campaign_id)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::Database)?;
+        Ok(row.is_some())
+    }
+
+    /// Loads a campaign summary after verifying the caller is an active member.
+    /// Returns `None` if the campaign does not exist or the caller is not a member.
+    /// Non-members and non-existent campaigns are indistinguishable (anti-enumeration).
+    pub async fn load_member_campaign_summary(
+        &self,
+        account_id: &str,
+        campaign_id: &str,
+    ) -> Result<Option<crate::repository::lifecycle::CampaignSummary>, RepositoryError> {
+        validate_account_id(account_id)?;
+        validate_campaign_id(campaign_id)?;
+        let is_member = self.is_active_member(account_id, campaign_id).await?;
+        if !is_member {
+            return Ok(None);
+        }
+        // Delegate to the lifecycle repository's existing summary loader,
+        // bypassing the owner_key check since membership is already verified.
+        let row = sqlx::query(
+            "SELECT c.id, c.owner_key, c.revision, c.lifecycle_revision, c.lifecycle_state,
+                    c.archived_at::text AS archived_at, c.safety_policy_id,
+                    c.progression_policy_id, c.retention_class,
+                    c.retention_delete_after::text AS retention_delete_after,
+                    c.payload_json->>'title' AS title,
+                    c.created_at::text AS created_at, c.updated_at::text AS updated_at,
+                    p.id AS open_play_session_id
+             FROM campaign_sessions c
+             LEFT JOIN campaign_play_sessions p
+               ON p.campaign_session_id = c.id AND p.state IN ('waiting', 'active')
+             WHERE c.id = $1",
+        )
+        .bind(campaign_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::Database)?;
+        row.map(crate::repository::lifecycle::summary_from_row)
+            .transpose()
+    }
+
     /// Lists all members of a campaign. The caller must be an active member;
     /// otherwise returns `NotFound`.
     pub async fn list_campaign_members(

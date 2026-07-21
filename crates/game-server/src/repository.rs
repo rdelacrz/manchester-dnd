@@ -21,7 +21,7 @@ mod inspiration;
 pub mod jobs;
 #[cfg(feature = "legacy-import")]
 mod legacy;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod memberships;
 mod operations;
 mod pins;

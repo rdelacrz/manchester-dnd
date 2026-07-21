@@ -298,7 +298,7 @@ fn require_fixed_campaign(campaign_session_id: &str) -> Result<(), ApplicationEr
     Ok(())
 }
 
-fn map_lifecycle_repository_error(error: RepositoryError) -> ApplicationError {
+pub(crate) fn map_lifecycle_repository_error(error: RepositoryError) -> ApplicationError {
     match error {
         RepositoryError::RevisionConflict {
             expected, actual, ..

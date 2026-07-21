@@ -22,6 +22,7 @@ pub mod jobs;
 #[cfg(feature = "legacy-import")]
 mod legacy;
 mod lifecycle;
+mod memberships;
 mod operations;
 mod pins;
 mod player_characters;

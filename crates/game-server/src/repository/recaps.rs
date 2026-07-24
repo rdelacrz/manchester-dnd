@@ -1,18 +1,26 @@
-//! Durable owner-private recaps derived only from committed turn audits.
+//! MongoDB owner-private recaps derived only from committed turn events.
 
-use manchester_dnd_core::{
-    SESSION_SCHEMA_VERSION, SessionEventDto, SessionEventPayload, Sha256Digest, is_valid_opaque_id,
+#![allow(dead_code)]
+
+use manchester_dnd_core::{SessionEventDto, SessionEventPayload, Sha256Digest, is_valid_opaque_id};
+use mongodb::{
+    ClientSession, Collection,
+    bson::{DateTime, Document, doc},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+use uuid::Uuid;
 
-use super::{PostgresRepository, from_i64, to_i64};
-use crate::error::RepositoryError;
+use super::{CampaignDocument, MongoRepository, lifecycle::TurnEventDocument};
+use crate::{
+    error::{MongoFailureKind, PersistenceError, RepositoryError},
+    persistence::CollectionName,
+};
 
 pub const PRIVATE_RECAP_SCHEMA_VERSION: u16 = 1;
 const PRIVATE_RECAP_TEMPLATE_ID: &str = "private-recap-v1";
 const MAX_PRIVATE_RECAP_BYTES: usize = 128 * 1024;
+const MAX_RECAP_SOURCE_EVENTS: usize = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +108,53 @@ impl CampaignPrivateRecap {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecapPresentationDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    campaign_id: String,
+    owner_account_id: String,
+    origin_event_id: String,
+    version: i64,
+    selected: bool,
+    presentation_type: String,
+    campaign_revision: i64,
+    idempotency_key: String,
+    request_fingerprint: Sha256Digest,
+    first_turn_number: Option<i64>,
+    last_turn_number: Option<i64>,
+    source_audit_count: i64,
+    source_audit_digest: Sha256Digest,
+    template_id: String,
+    body: String,
+    body_digest: Sha256Digest,
+    created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecapReceiptDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    scope_kind: String,
+    scope_id: String,
+    campaign_id: String,
+    actor_account_id: String,
+    command_kind: String,
+    idempotency_key: String,
+    request_fingerprint: Sha256Digest,
+    expected_revision: i64,
+    result_revision: i64,
+    response: Document,
+    state: String,
+    retain_after_delete: bool,
+    created_at: DateTime,
+    purge_at: Option<DateTime>,
+}
+
 #[derive(Serialize)]
 struct RecapAuditDigestInput<'a> {
     id: &'a str,
@@ -113,7 +168,7 @@ struct RecapSourceTurn {
     event: SessionEventDto,
 }
 
-impl PostgresRepository {
+impl MongoRepository {
     pub async fn generate_private_recap(
         &self,
         owner_key: &str,
@@ -122,151 +177,143 @@ impl PostgresRepository {
         validate_owner(owner_key)?;
         command.validate()?;
         let request_fingerprint = command_fingerprint(command)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-
-        if let Some(existing) = recap_by_idempotency_key(
-            &mut transaction,
-            owner_key,
-            &command.campaign_session_id,
-            &command.idempotency_key,
-        )
-        .await?
-        {
-            if existing.request_fingerprint != request_fingerprint {
-                return invalid(
-                    "private recap command",
-                    &command.idempotency_key,
-                    "idempotency key was reused with different input",
-                );
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(existing);
-        }
-
-        let campaign = sqlx::query(
-            "SELECT revision, payload_json->>'title' AS title
-             FROM campaign_sessions
-             WHERE owner_key = $1 AND id = $2
-             FOR UPDATE",
-        )
-        .bind(owner_key)
-        .bind(&command.campaign_session_id)
-        .fetch_optional(&mut *transaction)
+        let campaigns = self.campaigns();
+        let presentations = self
+            .store()
+            .collection::<RecapPresentationDocument>(CollectionName::GeneratedPresentations);
+        let turns = self
+            .store()
+            .collection::<TurnEventDocument>(CollectionName::TurnEvents);
+        let receipts = self
+            .store()
+            .collection::<RecapReceiptDocument>(CollectionName::CommandReceipts);
+        let owner = owner_key.to_owned();
+        let command_owned = command.clone();
+        let campaign_id = command.campaign_session_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let presentations = presentations.clone();
+            let turns = turns.clone();
+            let receipts = receipts.clone();
+            let owner = owner.clone();
+            let command = command_owned.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                if let Some(replay) =
+                    load_recap_replay(&receipts, session, &owner, &command, &request_fingerprint)
+                        .await?
+                {
+                    return Ok(replay);
+                }
+                let campaign =
+                    load_owned_campaign(&campaigns, session, &owner, &command.campaign_session_id)
+                        .await?;
+                let current_revision = nonnegative_u64(campaign.revision);
+                if current_revision != command.expected_campaign_revision {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_session",
+                        id: campaign.id,
+                        expected: command.expected_campaign_revision,
+                        actual: current_revision,
+                    });
+                }
+                let origin_event_id =
+                    format!("campaign-revision:{}", command.expected_campaign_revision);
+                if let Some(existing) = presentations
+                    .find_one(doc! {
+                        "campaign_id": &command.campaign_session_id,
+                        "owner_account_id": &owner,
+                        "origin_event_id": &origin_event_id,
+                        "presentation_type": "private_recap",
+                        "selected": true,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load recap for campaign revision", error)
+                    })?
+                {
+                    let recap = recap_from_document(existing).map_err(repository_to_persistence)?;
+                    insert_recap_receipt(
+                        &receipts,
+                        session,
+                        &owner,
+                        &command,
+                        request_fingerprint,
+                        &recap,
+                    )
+                    .await?;
+                    return Ok(recap);
+                }
+                let source_turns =
+                    load_source_turns(&turns, session, &command.campaign_session_id).await?;
+                let source_audit_digest =
+                    audit_digest(&source_turns).map_err(repository_to_persistence)?;
+                let body = render_recap(
+                    &campaign.title,
+                    current_revision,
+                    &source_audit_digest,
+                    &source_turns,
+                )
+                .map_err(repository_to_persistence)?;
+                let body_digest = digest(body.as_bytes());
+                let id = format!("private-recap:{}", Uuid::new_v4());
+                let source_count = i64::try_from(source_turns.len()).map_err(|_| {
+                    PersistenceError::SchemaDrift {
+                        collection: "turn_events".to_owned(),
+                        detail: "recap source event count is outside the supported range"
+                            .to_owned(),
+                    }
+                })?;
+                let document = RecapPresentationDocument {
+                    id,
+                    schema_version: i64::from(PRIVATE_RECAP_SCHEMA_VERSION),
+                    campaign_id: command.campaign_session_id.clone(),
+                    owner_account_id: owner.clone(),
+                    origin_event_id,
+                    version: 1,
+                    selected: true,
+                    presentation_type: "private_recap".to_owned(),
+                    campaign_revision: to_i64_persistence(current_revision)?,
+                    idempotency_key: command.idempotency_key.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    first_turn_number: source_turns
+                        .first()
+                        .map(|turn| to_i64_persistence(turn.turn_number))
+                        .transpose()?,
+                    last_turn_number: source_turns
+                        .last()
+                        .map(|turn| to_i64_persistence(turn.turn_number))
+                        .transpose()?,
+                    source_audit_count: source_count,
+                    source_audit_digest,
+                    template_id: PRIVATE_RECAP_TEMPLATE_ID.to_owned(),
+                    body,
+                    body_digest,
+                    created_at: DateTime::now(),
+                };
+                presentations
+                    .insert_one(document.clone())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("store private recap presentation", error)
+                    })?;
+                let recap = recap_from_document(document).map_err(repository_to_persistence)?;
+                insert_recap_receipt(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command,
+                    request_fingerprint,
+                    &recap,
+                )
+                .await?;
+                Ok(recap)
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?
-        .ok_or_else(|| RepositoryError::NotFound {
-            entity: "campaign session",
-            id: command.campaign_session_id.clone(),
-        })?;
-        let current_revision = from_i64(
-            campaign
-                .try_get("revision")
-                .map_err(RepositoryError::Database)?,
-            "campaign revision",
-        )?;
-        if current_revision != command.expected_campaign_revision {
-            return Err(RepositoryError::RevisionConflict {
-                entity: "campaign session",
-                id: command.campaign_session_id.clone(),
-                expected: command.expected_campaign_revision,
-                actual: current_revision,
-            });
-        }
-
-        if let Some(existing) = recap_by_campaign_revision(
-            &mut transaction,
-            owner_key,
-            &command.campaign_session_id,
-            current_revision,
-        )
-        .await?
-        {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(existing);
-        }
-
-        let title: String = campaign
-            .try_get("title")
-            .map_err(RepositoryError::Database)?;
-        let rows = sqlx::query(
-            "SELECT id, turn_number, payload_json::text AS payload_json
-             FROM turn_audits
-             WHERE campaign_session_id = $1
-             ORDER BY turn_number, id",
-        )
-        .bind(&command.campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let turns = rows
-            .into_iter()
-            .map(source_turn_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        let source_audit_digest = audit_digest(&turns)?;
-        let body = render_recap(&title, current_revision, &source_audit_digest, &turns)?;
-        let body_digest = digest(body.as_bytes());
-        let id = format!(
-            "private-recap:{}",
-            &request_fingerprint.as_str()["sha256:".len().."sha256:".len() + 32]
-        );
-        let first_turn_number = turns.first().map(|turn| turn.turn_number);
-        let last_turn_number = turns.last().map(|turn| turn.turn_number);
-
-        let row = sqlx::query(
-            "INSERT INTO campaign_private_recaps
-             (id, campaign_session_id, owner_key, schema_version,
-              campaign_revision, idempotency_key, request_fingerprint,
-              first_turn_number, last_turn_number, source_audit_count,
-              source_audit_digest, template_id, body, body_digest)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-             RETURNING id, campaign_session_id, schema_version, campaign_revision,
-                       idempotency_key, request_fingerprint, first_turn_number,
-                       last_turn_number, source_audit_count, source_audit_digest,
-                       template_id, body, body_digest, created_at::text AS created_at",
-        )
-        .bind(&id)
-        .bind(&command.campaign_session_id)
-        .bind(owner_key)
-        .bind(i64::from(PRIVATE_RECAP_SCHEMA_VERSION))
-        .bind(to_i64(current_revision, "private recap campaign revision")?)
-        .bind(&command.idempotency_key)
-        .bind(request_fingerprint.as_str())
-        .bind(
-            first_turn_number
-                .map(|value| to_i64(value, "private recap first turn"))
-                .transpose()?,
-        )
-        .bind(
-            last_turn_number
-                .map(|value| to_i64(value, "private recap last turn"))
-                .transpose()?,
-        )
-        .bind(to_i64(
-            u64::try_from(turns.len()).map_err(|_| RepositoryError::NumericRange {
-                field: "private recap source audit count",
-            })?,
-            "private recap source audit count",
-        )?)
-        .bind(source_audit_digest.as_str())
-        .bind(PRIVATE_RECAP_TEMPLATE_ID)
-        .bind(&body)
-        .bind(body_digest.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let recap = private_recap_from_row(row)?;
-        recap.validate_for_campaign(&command.campaign_session_id, current_revision)?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(recap)
+        .map_err(|error| map_transaction_error(error, "private campaign recap", &campaign_id))
     }
 
     pub async fn load_latest_private_recap(
@@ -282,171 +329,241 @@ impl PostgresRepository {
                 "campaign identity is invalid",
             );
         }
-        let revision: Option<i64> = sqlx::query_scalar(
-            "SELECT revision FROM campaign_sessions WHERE owner_key = $1 AND id = $2",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let revision = revision.ok_or_else(|| RepositoryError::NotFound {
-            entity: "campaign session",
-            id: campaign_session_id.to_owned(),
-        })?;
-        let maximum_revision = from_i64(revision, "campaign revision")?;
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, schema_version, campaign_revision,
-                    idempotency_key, request_fingerprint, first_turn_number,
-                    last_turn_number, source_audit_count, source_audit_digest,
-                    template_id, body, body_digest, created_at::text AS created_at
-             FROM campaign_private_recaps
-             WHERE owner_key = $1 AND campaign_session_id = $2
-             ORDER BY campaign_revision DESC, created_at DESC, id DESC
-             LIMIT 1",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(private_recap_from_row)
+        let campaign = self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_session_id,
+                "owner_account_id": owner_key,
+                "members": {
+                    "$elemMatch": {
+                        "account_id": owner_key,
+                        "role": "game_master",
+                        "state": "active",
+                    }
+                },
+            })
+            .await
+            .map_err(|error| mongo_error("authorize private recap read", error))?
+            .ok_or_else(|| RepositoryError::NotFound {
+                entity: "campaign_session",
+                id: campaign_session_id.to_owned(),
+            })?;
+        self.store()
+            .collection::<RecapPresentationDocument>(CollectionName::GeneratedPresentations)
+            .find_one(doc! {
+                "campaign_id": campaign_session_id,
+                "owner_account_id": owner_key,
+                "presentation_type": "private_recap",
+                "selected": true,
+            })
+            .sort(doc! { "campaign_revision": -1, "created_at": -1, "_id": -1 })
+            .await
+            .map_err(|error| mongo_error("load latest private recap", error))?
+            .map(recap_from_document)
             .transpose()?
             .map(|recap| {
-                recap.validate_for_campaign(campaign_session_id, maximum_revision)?;
+                recap.validate_for_campaign(
+                    campaign_session_id,
+                    nonnegative_u64(campaign.revision),
+                )?;
                 Ok(recap)
             })
             .transpose()
     }
 }
 
-async fn recap_by_idempotency_key(
-    transaction: &mut Transaction<'_, Postgres>,
+async fn load_owned_campaign(
+    campaigns: &Collection<CampaignDocument>,
+    session: &mut ClientSession,
     owner_key: &str,
-    campaign_session_id: &str,
-    idempotency_key: &str,
-) -> Result<Option<CampaignPrivateRecap>, RepositoryError> {
-    let row = sqlx::query(
-        "SELECT id, campaign_session_id, schema_version, campaign_revision,
-                idempotency_key, request_fingerprint, first_turn_number,
-                last_turn_number, source_audit_count, source_audit_digest,
-                template_id, body, body_digest, created_at::text AS created_at
-         FROM campaign_private_recaps
-         WHERE owner_key = $1 AND campaign_session_id = $2 AND idempotency_key = $3",
-    )
-    .bind(owner_key)
-    .bind(campaign_session_id)
-    .bind(idempotency_key)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?;
-    row.map(private_recap_from_row).transpose()
+    campaign_id: &str,
+) -> Result<CampaignDocument, PersistenceError> {
+    campaigns
+        .find_one(doc! {
+            "_id": campaign_id,
+            "owner_account_id": owner_key,
+            "members": {
+                "$elemMatch": {
+                    "account_id": owner_key,
+                    "role": "game_master",
+                    "state": "active",
+                }
+            },
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("authorize private recap", error))?
+        .ok_or_else(|| PersistenceError::NotFound {
+            entity: "campaign_session",
+            id: campaign_id.to_owned(),
+        })
 }
 
-async fn recap_by_campaign_revision(
-    transaction: &mut Transaction<'_, Postgres>,
-    owner_key: &str,
-    campaign_session_id: &str,
-    campaign_revision: u64,
-) -> Result<Option<CampaignPrivateRecap>, RepositoryError> {
-    let row = sqlx::query(
-        "SELECT id, campaign_session_id, schema_version, campaign_revision,
-                idempotency_key, request_fingerprint, first_turn_number,
-                last_turn_number, source_audit_count, source_audit_digest,
-                template_id, body, body_digest, created_at::text AS created_at
-         FROM campaign_private_recaps
-         WHERE owner_key = $1 AND campaign_session_id = $2 AND campaign_revision = $3",
-    )
-    .bind(owner_key)
-    .bind(campaign_session_id)
-    .bind(to_i64(
-        campaign_revision,
-        "private recap campaign revision",
-    )?)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?;
-    row.map(private_recap_from_row).transpose()
-}
-
-pub(crate) fn private_recap_from_row(row: PgRow) -> Result<CampaignPrivateRecap, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    Ok(CampaignPrivateRecap {
-        schema_version: u16::try_from(from_i64(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "private recap schema version",
-        )?)
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "private recap schema version",
-        })?,
-        id: id.clone(),
-        campaign_session_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        campaign_revision: from_i64(
-            row.try_get("campaign_revision")
-                .map_err(RepositoryError::Database)?,
-            "private recap campaign revision",
-        )?,
-        idempotency_key: row
-            .try_get("idempotency_key")
-            .map_err(RepositoryError::Database)?,
-        request_fingerprint: digest_from_row(&row, "request_fingerprint", &id)?,
-        first_turn_number: row
-            .try_get::<Option<i64>, _>("first_turn_number")
-            .map_err(RepositoryError::Database)?
-            .map(|value| from_i64(value, "private recap first turn"))
-            .transpose()?,
-        last_turn_number: row
-            .try_get::<Option<i64>, _>("last_turn_number")
-            .map_err(RepositoryError::Database)?
-            .map(|value| from_i64(value, "private recap last turn"))
-            .transpose()?,
-        source_audit_count: from_i64(
-            row.try_get("source_audit_count")
-                .map_err(RepositoryError::Database)?,
-            "private recap source audit count",
-        )?,
-        source_audit_digest: digest_from_row(&row, "source_audit_digest", &id)?,
-        template_id: row
-            .try_get("template_id")
-            .map_err(RepositoryError::Database)?,
-        body: row.try_get("body").map_err(RepositoryError::Database)?,
-        body_digest: digest_from_row(&row, "body_digest", &id)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn source_turn_from_row(row: PgRow) -> Result<RecapSourceTurn, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let event: SessionEventDto =
-        serde_json::from_str(&payload).map_err(|source| RepositoryError::InvalidStoredData {
-            entity: "turn audit",
-            id: id.clone(),
-            source,
-        })?;
-    if event.schema_version != SESSION_SCHEMA_VERSION {
-        return Err(RepositoryError::UnsupportedSchemaVersion {
-            entity: "turn audit",
-            found: u32::from(event.schema_version),
-            supported: u32::from(SESSION_SCHEMA_VERSION),
+async fn load_source_turns(
+    turns: &Collection<TurnEventDocument>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<Vec<RecapSourceTurn>, PersistenceError> {
+    let mut cursor = turns
+        .find(doc! { "campaign_id": campaign_id })
+        .sort(doc! { "sequence": 1, "_id": 1 })
+        .limit(
+            i64::try_from(MAX_RECAP_SOURCE_EVENTS.saturating_add(1)).map_err(|_| {
+                PersistenceError::SchemaDrift {
+                    collection: "turn_events".to_owned(),
+                    detail: "recap source limit is outside the supported range".to_owned(),
+                }
+            })?,
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load private recap source events", error))?;
+    let mut documents = Vec::new();
+    while let Some(document) = cursor
+        .next(&mut *session)
+        .await
+        .transpose()
+        .map_err(|error| PersistenceError::mongo("read private recap source events", error))?
+    {
+        documents.push(document);
+    }
+    if documents.len() > MAX_RECAP_SOURCE_EVENTS {
+        return Err(PersistenceError::SchemaDrift {
+            collection: "turn_events".to_owned(),
+            detail: "recap source event count exceeds the supported bound".to_owned(),
         });
     }
-    Ok(RecapSourceTurn {
-        id,
-        turn_number: from_i64(
-            row.try_get("turn_number")
-                .map_err(RepositoryError::Database)?,
-            "turn number",
-        )?,
-        event,
-    })
+    documents
+        .into_iter()
+        .map(|document| {
+            if document.sequence <= 0
+                || document.event.session_id != campaign_id
+                || document.event.sequence != nonnegative_u64(document.sequence)
+            {
+                return Err(PersistenceError::SchemaDrift {
+                    collection: "turn_events".to_owned(),
+                    detail: "recap source event envelope is inconsistent".to_owned(),
+                });
+            }
+            document
+                .event
+                .validate()
+                .map_err(|_| PersistenceError::SchemaDrift {
+                    collection: "turn_events".to_owned(),
+                    detail: "recap source event failed domain validation".to_owned(),
+                })?;
+            Ok(RecapSourceTurn {
+                id: document.id,
+                turn_number: nonnegative_u64(document.sequence),
+                event: document.event,
+            })
+        })
+        .collect()
+}
+
+async fn load_recap_replay(
+    receipts: &Collection<RecapReceiptDocument>,
+    session: &mut ClientSession,
+    owner_key: &str,
+    command: &GeneratePrivateRecapCommand,
+    fingerprint: &Sha256Digest,
+) -> Result<Option<CampaignPrivateRecap>, PersistenceError> {
+    let receipt = receipts
+        .find_one(doc! {
+            "scope_kind": "campaign",
+            "scope_id": &command.campaign_session_id,
+            "actor_account_id": owner_key,
+            "idempotency_key": &command.idempotency_key,
+            "state": "committed",
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load private recap receipt", error))?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if receipt.command_kind != "private_recap_generate"
+        || receipt.request_fingerprint != *fingerprint
+    {
+        return Err(PersistenceError::AlreadyExists {
+            entity: "private recap idempotency key",
+            id: command.idempotency_key.clone(),
+        });
+    }
+    mongodb::bson::from_document(receipt.response)
+        .map(Some)
+        .map_err(|_| PersistenceError::SchemaDrift {
+            collection: "command_receipts".to_owned(),
+            detail: "private recap receipt response is invalid".to_owned(),
+        })
+}
+
+async fn insert_recap_receipt(
+    receipts: &Collection<RecapReceiptDocument>,
+    session: &mut ClientSession,
+    owner_key: &str,
+    command: &GeneratePrivateRecapCommand,
+    fingerprint: Sha256Digest,
+    recap: &CampaignPrivateRecap,
+) -> Result<(), PersistenceError> {
+    receipts
+        .insert_one(RecapReceiptDocument {
+            id: format!("command-receipt:{}", Uuid::new_v4()),
+            schema_version: 1,
+            scope_kind: "campaign".to_owned(),
+            scope_id: command.campaign_session_id.clone(),
+            campaign_id: command.campaign_session_id.clone(),
+            actor_account_id: owner_key.to_owned(),
+            command_kind: "private_recap_generate".to_owned(),
+            idempotency_key: command.idempotency_key.clone(),
+            request_fingerprint: fingerprint,
+            expected_revision: to_i64_persistence(command.expected_campaign_revision)?,
+            result_revision: to_i64_persistence(recap.campaign_revision)?,
+            response: mongodb::bson::to_document(recap).map_err(PersistenceError::BsonEncoding)?,
+            state: "committed".to_owned(),
+            retain_after_delete: false,
+            created_at: DateTime::now(),
+            purge_at: None,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("store private recap receipt", error))?;
+    Ok(())
+}
+
+fn recap_from_document(
+    document: RecapPresentationDocument,
+) -> Result<CampaignPrivateRecap, RepositoryError> {
+    if document.presentation_type != "private_recap" || !document.selected || document.version != 1
+    {
+        return invalid(
+            "private campaign recap",
+            &document.id,
+            "presentation type, selection, or version is invalid",
+        );
+    }
+    let recap = CampaignPrivateRecap {
+        schema_version: u16::try_from(document.schema_version).map_err(|_| {
+            RepositoryError::NumericRange {
+                field: "private recap schema version",
+            }
+        })?,
+        id: document.id,
+        campaign_session_id: document.campaign_id,
+        campaign_revision: nonnegative_u64(document.campaign_revision),
+        idempotency_key: document.idempotency_key,
+        request_fingerprint: document.request_fingerprint,
+        first_turn_number: document.first_turn_number.map(nonnegative_u64),
+        last_turn_number: document.last_turn_number.map(nonnegative_u64),
+        source_audit_count: nonnegative_u64(document.source_audit_count),
+        source_audit_digest: document.source_audit_digest,
+        template_id: document.template_id,
+        body: document.body,
+        body_digest: document.body_digest,
+        created_at: date_string(document.created_at)?,
+    };
+    recap.validate_for_campaign(&recap.campaign_session_id, recap.campaign_revision)?;
+    Ok(recap)
 }
 
 fn audit_digest(turns: &[RecapSourceTurn]) -> Result<Sha256Digest, RepositoryError> {
@@ -472,7 +589,7 @@ fn render_recap(
     turns: &[RecapSourceTurn],
 ) -> Result<String, RepositoryError> {
     let mut body = format!(
-        "# Private campaign recap\n\nCampaign: {}\n\nCampaign revision: {campaign_revision}\n\nProvenance: {PRIVATE_RECAP_TEMPLATE_ID}; {} committed audit{}; source {}.\n\n",
+        "# Private campaign recap\n\nCampaign: {}\n\nCampaign revision: {campaign_revision}\n\nProvenance: {PRIVATE_RECAP_TEMPLATE_ID}; {} committed event{}; source {}.\n\n",
         escape_markdown_line(title),
         turns.len(),
         if turns.len() == 1 { "" } else { "s" },
@@ -593,20 +710,97 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::from_bytes(Sha256::digest(bytes).into())
 }
 
-fn digest_from_row(row: &PgRow, column: &str, id: &str) -> Result<Sha256Digest, RepositoryError> {
-    let value: String = row.try_get(column).map_err(RepositoryError::Database)?;
-    Sha256Digest::new(value).map_err(|_| RepositoryError::InvalidDomainState {
-        entity: "private campaign recap",
-        id: id.to_owned(),
-        reason: "stored digest is not canonical",
-    })
-}
-
 fn validate_owner(owner_key: &str) -> Result<(), RepositoryError> {
     if is_valid_opaque_id(owner_key) {
         Ok(())
     } else {
         invalid("campaign owner", owner_key, "owner key is invalid")
+    }
+}
+
+fn date_string(value: DateTime) -> Result<String, RepositoryError> {
+    value.try_to_rfc3339_string().map_err(|_| {
+        RepositoryError::Persistence(PersistenceError::SchemaDrift {
+            collection: "generated_presentations".to_owned(),
+            detail: "stored BSON date is outside RFC 3339 range".to_owned(),
+        })
+    })
+}
+
+fn nonnegative_u64(value: i64) -> u64 {
+    if value < 0 { 0 } else { value as u64 }
+}
+
+fn to_i64_persistence(value: u64) -> Result<i64, PersistenceError> {
+    i64::try_from(value).map_err(|_| PersistenceError::SchemaDrift {
+        collection: "generated_presentations".to_owned(),
+        detail: "recap revision is outside the supported range".to_owned(),
+    })
+}
+
+fn repository_to_persistence(error: RepositoryError) -> PersistenceError {
+    match error {
+        RepositoryError::NotFound { entity, id } => PersistenceError::NotFound { entity, id },
+        RepositoryError::AlreadyExists { entity, id } => {
+            PersistenceError::AlreadyExists { entity, id }
+        }
+        RepositoryError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        } => PersistenceError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        },
+        _ => PersistenceError::SchemaDrift {
+            collection: "generated_presentations".to_owned(),
+            detail: "private recap failed validation".to_owned(),
+        },
+    }
+}
+
+fn mongo_error(operation: &'static str, error: mongodb::error::Error) -> RepositoryError {
+    RepositoryError::Persistence(PersistenceError::mongo(operation, error))
+}
+
+fn map_transaction_error(
+    error: PersistenceError,
+    entity: &'static str,
+    id: &str,
+) -> RepositoryError {
+    match error {
+        PersistenceError::NotFound { entity, id } => RepositoryError::NotFound { entity, id },
+        PersistenceError::AlreadyExists { entity, id } => {
+            RepositoryError::AlreadyExists { entity, id }
+        }
+        PersistenceError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        } => RepositoryError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        },
+        other if other.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey) => {
+            RepositoryError::AlreadyExists {
+                entity,
+                id: id.to_owned(),
+            }
+        }
+        other if other.mongo_failure_kind() == Some(MongoFailureKind::DocumentValidation) => {
+            RepositoryError::InvalidDomainState {
+                entity,
+                id: id.to_owned(),
+                reason: "document failed MongoDB schema validation",
+            }
+        }
+        other => RepositoryError::Persistence(other),
     }
 }
 
@@ -620,126 +814,185 @@ fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T,
 
 #[cfg(test)]
 mod tests {
-    use manchester_dnd_core::{
-        EventActor, RULESET, SessionDto, SessionEventDto, SessionEventPayload, SessionStatus,
-    };
-    use sqlx::PgPool;
+    use std::time::Duration;
 
     use super::*;
-    use crate::repository::MIGRATOR;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{MongoStore, SchemaReconciler},
+        repository::{
+            CAMPAIGN_LIFECYCLE_SCHEMA_VERSION, CampaignLifecycleCommand, DeleteCampaignCommand,
+        },
+    };
+    use manchester_dnd_core::{
+        EventActor, SESSION_SCHEMA_VERSION, SessionEventDto, SessionEventPayload,
+    };
 
-    const OWNER: &str = "recap-owner";
-    const CAMPAIGN: &str = "recap-campaign";
-
-    async fn seed_campaign(pool: &PgPool) -> PostgresRepository {
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let mut session = SessionDto {
-            schema_version: SESSION_SCHEMA_VERSION,
-            id: CAMPAIGN.to_owned(),
-            ruleset: RULESET,
-            title: "Rain *and* brass".to_owned(),
-            status: SessionStatus::Active,
-            character_ids: Vec::new(),
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-            last_event_sequence: 0,
+    async fn test_repository() -> Option<(MongoRepository, String)> {
+        let uri = std::env::var("MONGODB_TEST_URI").ok()?;
+        if uri.trim().is_empty() {
+            return None;
+        }
+        let database = format!("mdnd_test_recaps_{}", Uuid::new_v4().simple());
+        let config = MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 5,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(5),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 3,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
         };
-        repository.create_campaign(&session, &[]).await.unwrap();
-        sqlx::query("UPDATE campaign_sessions SET owner_key = $2 WHERE id = $1")
-            .bind(CAMPAIGN)
-            .bind(OWNER)
-            .execute(pool)
+        let store = MongoStore::connect(&config)
             .await
-            .unwrap();
-        session.updated_at_unix_ms = 2;
-        session.last_event_sequence = 1;
+            .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("schema must apply");
+        Some((MongoRepository::new(store), database))
+    }
+
+    async fn insert_account(repository: &MongoRepository, account_id: &str) {
+        repository
+            .store()
+            .document_collection(CollectionName::Accounts)
+            .insert_one(doc! {
+                "_id": account_id,
+                "schema_version": 1_i64,
+                "revision": 1_i64,
+                "role": "user",
+                "username_normalized": format!("user-{}", Uuid::new_v4()),
+                "email_lookup_hmac": format!("hmac-sha256:{}", Uuid::new_v4().simple()),
+                "password_phc": "$argon2id$test",
+                "login_enabled": false,
+                "created_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            })
+            .await
+            .expect("account fixture must insert");
+    }
+
+    #[tokio::test]
+    async fn mongo_recap_is_turn_derived_owner_scoped_replayed_and_cascaded() {
+        let Some((repository, database)) = test_repository().await else {
+            return;
+        };
+        let owner = format!("account:{}", Uuid::new_v4());
+        let outsider = format!("account:{}", Uuid::new_v4());
+        insert_account(&repository, &owner).await;
+        insert_account(&repository, &outsider).await;
+        let campaign = repository
+            .create_campaign_with_owner(
+                &owner,
+                "Rain *and* Brass",
+                "dev.manchester-arcana.rainbound-borough",
+            )
+            .await
+            .expect("campaign must create");
         let event = SessionEventDto {
             schema_version: SESSION_SCHEMA_VERSION,
-            session_id: CAMPAIGN.to_owned(),
+            session_id: campaign.campaign_id.clone(),
             sequence: 1,
-            occurred_at_unix_ms: 2,
+            occurred_at_unix_ms: 1,
             actor: EventActor::System,
             payload: SessionEventPayload::SessionStarted,
         };
-        sqlx::query(
-            "UPDATE campaign_sessions
-             SET revision = 2, payload_json = $2::jsonb, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1",
-        )
-        .bind(CAMPAIGN)
-        .bind(serde_json::to_string(&session).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO turn_audits
-             (id, campaign_session_id, turn_number, schema_version, payload_json)
-             VALUES ('recap-turn-1', $1, 1, 1, $2::jsonb)",
-        )
-        .bind(CAMPAIGN)
-        .bind(serde_json::to_string(&event).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
         repository
-    }
-
-    fn command(key: &str) -> GeneratePrivateRecapCommand {
-        GeneratePrivateRecapCommand {
-            schema_version: PRIVATE_RECAP_SCHEMA_VERSION,
-            campaign_session_id: CAMPAIGN.to_owned(),
-            expected_campaign_revision: 2,
-            idempotency_key: key.to_owned(),
-        }
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn recap_is_owner_scoped_audit_derived_idempotent_and_cascaded(pool: PgPool) {
-        let repository = seed_campaign(&pool).await;
-        let first = repository
-            .generate_private_recap(OWNER, &command("recap-command-one"))
+            .store()
+            .document_collection(CollectionName::TurnEvents)
+            .insert_one(doc! {
+                "_id": format!("turn-event:{}", Uuid::new_v4()),
+                "schema_version": 1_i64,
+                "campaign_id": &campaign.campaign_id,
+                "play_session_id": format!("play-session:{}", Uuid::new_v4()),
+                "sequence": 1_i64,
+                "correlation_id": format!("correlation:{}", Uuid::new_v4()),
+                "actor_account_id": mongodb::bson::Bson::Null,
+                "event": mongodb::bson::to_bson(&event)
+                    .expect("event fixture must encode"),
+                "created_at": DateTime::now(),
+            })
             .await
-            .unwrap();
-        assert!(first.body.contains("Turn 1 — The campaign began."));
-        assert!(first.body.contains("Rain \\*and\\* brass"));
-        assert_eq!(first.source_audit_count, 1);
+            .expect("turn fixture must insert");
+        let command = GeneratePrivateRecapCommand {
+            schema_version: PRIVATE_RECAP_SCHEMA_VERSION,
+            campaign_session_id: campaign.campaign_id.clone(),
+            expected_campaign_revision: 1,
+            idempotency_key: "command:recap-once".to_owned(),
+        };
+        let recap = repository
+            .generate_private_recap(&owner, &command)
+            .await
+            .expect("recap must generate");
+        assert!(recap.body.contains("The campaign began."));
         assert_eq!(
             repository
-                .generate_private_recap(OWNER, &command("recap-command-one"))
+                .generate_private_recap(&owner, &command)
                 .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(
-            repository
-                .generate_private_recap(OWNER, &command("another-command-same-revision"))
-                .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(
-            repository
-                .load_latest_private_recap(OWNER, CAMPAIGN)
-                .await
-                .unwrap(),
-            Some(first)
+                .expect("recap replay must work"),
+            recap
         );
         assert!(matches!(
             repository
-                .load_latest_private_recap("another-owner", CAMPAIGN)
+                .load_latest_private_recap(&outsider, &campaign.campaign_id)
                 .await,
             Err(RepositoryError::NotFound { .. })
         ));
+        repository
+            .archive_campaign(
+                &owner,
+                &CampaignLifecycleCommand {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: campaign.campaign_id.clone(),
+                    expected_lifecycle_revision: 1,
+                    idempotency_key: "command:archive-recap".to_owned(),
+                },
+            )
+            .await
+            .expect("archive must work");
+        let prepared = repository
+            .prepare_campaign_deletion(&owner, &campaign.campaign_id, 2, "deletion:recap-cascade")
+            .await
+            .expect("delete preparation must work");
+        repository
+            .delete_archived_campaign(
+                &owner,
+                &DeleteCampaignCommand {
+                    lifecycle: CampaignLifecycleCommand {
+                        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                        campaign_session_id: campaign.campaign_id.clone(),
+                        expected_lifecycle_revision: 2,
+                        idempotency_key: "command:delete-recap".to_owned(),
+                    },
+                    deletion_id: prepared.deletion_id,
+                    confirm_permanent_delete: true,
+                },
+            )
+            .await
+            .expect("campaign delete must work");
+        assert!(
+            repository
+                .store()
+                .document_collection(CollectionName::GeneratedPresentations)
+                .find_one(doc! { "campaign_id": &campaign.campaign_id })
+                .await
+                .expect("presentation cascade read must work")
+                .is_none()
+        );
 
-        sqlx::query("DELETE FROM campaign_sessions WHERE id = $1")
-            .bind(CAMPAIGN)
-            .execute(&pool)
+        assert!(
+            database.starts_with("mdnd_test_recaps_"),
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
             .await
-            .unwrap();
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM campaign_private_recaps")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(remaining, 0);
+            .expect("test database must drop");
     }
 }

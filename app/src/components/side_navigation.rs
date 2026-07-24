@@ -93,7 +93,7 @@ fn LogoutButton() -> impl IntoView {
             #[cfg(target_arch = "wasm32")]
             {
                 if let Some(win) = web_sys::window() {
-                    if let Ok(Some(storage)) = win.local_storage() {
+                    if let Ok(Some(storage)) = win.session_storage() {
                         let _ = storage.remove_item("csrf");
                     }
                 }

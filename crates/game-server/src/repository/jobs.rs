@@ -1,34 +1,45 @@
-//! Durable, metadata-only generation queue storage.
+//! Durable, metadata-only MongoDB generation queue.
 //!
-//! The queue never accepts or persists prompt bodies, minimized input bodies,
-//! provider response bodies, or credentials. Callers supply canonical digests
-//! plus bounded operational metadata. The private-MVP defaults are deliberately
-//! conservative: at most five attempts, leases between one second and five
-//! minutes, failed metadata retained seven days, and unselected successful
-//! presentation artifacts retained thirty days.
+//! Prompt bodies, provider bodies, credentials, and raw lease tokens have no
+//! storage fields. MongoDB is authoritative; optional queue wakeups happen in
+//! the application only after these methods return a committed result.
 
-use std::{str::FromStr, time::Duration};
+use std::{future::IntoFuture, str::FromStr, time::Duration};
 
 use manchester_dnd_core::{Sha256Digest, is_valid_opaque_id};
-use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+use mongodb::{
+    ClientSession, Collection,
+    bson::{DateTime, doc},
+    options::ReturnDocument,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::{
+    error::{MongoFailureKind, PersistenceError},
+    persistence::{CollectionName, MongoStore},
+};
+
 use super::{
-    PostgresRepository,
+    MongoRepository,
     governance::{
         GenerationBudgetDimension, GenerationBudgetScope, NewGenerationGovernanceReceipt,
         ensure_matching_governance_receipt, insert_generation_governance_receipt,
         load_governance_receipt_by_key, preflight_generation_governance,
         record_generation_attempt_usage, release_generation_budget,
-        settle_unknown_generation_usage,
+        settle_unknown_generation_usage, validate_new_governance,
     },
 };
 
+const SCHEMA_VERSION: u32 = 1;
 const MAX_ATTEMPTS: u8 = 5;
 const MIN_LEASE: Duration = Duration::from_secs(1);
 const MAX_LEASE: Duration = Duration::from_secs(5 * 60);
-const FAILED_RETENTION_SQL: &str = "INTERVAL '7 days'";
+const FAILED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const UNSELECTED_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CLAIM_SCAN_LIMIT: i64 = 64;
 pub const IMAGE_REQUESTS_PER_ROLLING_DAY: u64 = 3;
 pub const IMAGE_REQUESTS_PER_CAMPAIGN_LIFETIME: u64 = 10;
 pub const IMAGE_REQUESTS_PER_TURN: u64 = 2;
@@ -59,33 +70,35 @@ pub enum GenerationJobStoreError {
     LostLease,
     #[error("stored generation metadata is invalid: {0}")]
     InvalidStoredData(&'static str),
-    #[error("generation numeric value is outside PostgreSQL BIGINT's supported range")]
+    #[error("generation numeric value is outside MongoDB's signed integer range")]
     NumericRange,
-    #[error("generation database operation failed")]
-    Database(#[source] sqlx::Error),
+    #[error("generation MongoDB operation failed")]
+    Database(#[source] PersistenceError),
 }
 
 impl GenerationJobStoreError {
-    /// Classification only: any retry must preserve the original job metadata
-    /// and idempotency key. Connection failures and unknown SQLSTATEs fail
-    /// closed; PostgreSQL documents `40001` and `40P01` as transaction-level
-    /// serialization/deadlock failures that may be retried as a whole.
+    /// Informational classification. Transaction callbacks are already retried
+    /// only for driver-labelled transient/unknown-commit failures.
     pub fn retryable_database_transaction(&self) -> bool {
         let Self::Database(error) = self else {
             return false;
         };
-        error
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .is_some_and(|code| transient_postgres_sqlstate(code.as_ref()))
+        persistence_retryable(error)
     }
 }
 
-fn transient_postgres_sqlstate(code: &str) -> bool {
-    matches!(code, "40001" | "40P01")
+fn persistence_retryable(error: &PersistenceError) -> bool {
+    match error {
+        PersistenceError::Mongo { kind, .. } => matches!(
+            kind,
+            MongoFailureKind::TransientTransaction | MongoFailureKind::UnknownCommitResult
+        ),
+        PersistenceError::TransactionRetriesExhausted { last, .. } => persistence_retryable(last),
+        _ => false,
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GenerationPurpose {
     IntentParsing,
     GmPlanning,
@@ -105,6 +118,15 @@ impl GenerationPurpose {
 
     const fn requires_origin_turn(self) -> bool {
         matches!(self, Self::Narration | Self::Illustration)
+    }
+
+    const fn priority(self) -> i32 {
+        match self {
+            Self::IntentParsing => 400,
+            Self::GmPlanning => 300,
+            Self::Narration => 200,
+            Self::Illustration => 100,
+        }
     }
 
     pub const fn default_max_attempts(self) -> u8 {
@@ -164,7 +186,7 @@ pub enum GenerationJobState {
 }
 
 impl GenerationJobState {
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -210,6 +232,17 @@ pub enum GenerationAttemptState {
     Cancelled,
 }
 
+impl GenerationAttemptState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 impl FromStr for GenerationAttemptState {
     type Err = GenerationJobStoreError;
 
@@ -228,9 +261,7 @@ impl FromStr for GenerationAttemptState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuccessRetention {
-    /// An owner-selected artifact follows the campaign lifetime.
     CampaignLifetime,
-    /// Q13's default for an unselected presentation version.
     UnselectedPresentation30Days,
 }
 
@@ -263,6 +294,17 @@ pub enum GenerationRetentionClass {
     FailedMetadata7Days,
     UnselectedPresentation30Days,
     CampaignLifetime,
+}
+
+impl GenerationRetentionClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::FailedMetadata7Days => "failed_metadata_7d",
+            Self::UnselectedPresentation30Days => "unselected_presentation_30d",
+            Self::CampaignLifetime => "campaign_lifetime",
+        }
+    }
 }
 
 impl FromStr for GenerationRetentionClass {
@@ -310,9 +352,6 @@ impl FromStr for GenerationFailureClass {
     }
 }
 
-/// Stable, body-free failure codes. Only transport availability failures are
-/// automatically retryable; safety, fidelity, budget, and provider rejections
-/// fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationFailureCode {
     Timeout,
@@ -473,9 +512,7 @@ pub struct GenerationUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
-    /// Estimated or provider-reported cost in millionths of one US dollar.
     pub cost_microusd: Option<u64>,
-    /// End-to-end provider-attempt latency. Queue time is excluded.
     pub latency_milliseconds: Option<u64>,
 }
 
@@ -511,9 +548,6 @@ pub struct ClaimedGenerationJob {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationSuccess {
-    /// Illustration jobs require a campaign-owned validated artifact. Textual
-    /// jobs may complete metadata-only after their typed result is committed
-    /// elsewhere; no placeholder asset location is manufactured.
     pub artifact_id: Option<String>,
     pub output_digest: Sha256Digest,
     pub usage: GenerationUsage,
@@ -525,8 +559,6 @@ pub struct GenerationAttemptFailure {
     pub provider_status: Option<u16>,
     pub provider_request_id: Option<String>,
     pub usage: GenerationUsage,
-    /// Present when a validated, safe authored fallback was produced. Transport
-    /// failures that yielded no presentation leave this absent.
     pub output_digest: Option<Sha256Digest>,
 }
 
@@ -543,168 +575,486 @@ pub enum GenerationAttemptFinishOutcome {
     Failed,
 }
 
-impl PostgresRepository {
-    /// Inserts one durable job or returns the original row for a matching
-    /// idempotent replay. A replay is checked before the campaign's current
-    /// revision so a later retry can still recover the original job ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GenerationAttemptDocument {
+    #[serde(rename = "_id")]
+    pub(super) id: String,
+    pub(super) attempt_number: i32,
+    pub(super) state: String,
+    pub(super) lease_owner: String,
+    pub(super) lease_token_digest: String,
+    pub(super) provider: String,
+    pub(super) model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) prompt_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) completion_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) total_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cost_microusd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) latency_milliseconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) provider_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) provider_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) output_digest: Option<String>,
+    pub(super) started_at: DateTime,
+    pub(super) heartbeat_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) finished_at: Option<DateTime>,
+    pub(super) created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GenerationJobDocument {
+    #[serde(rename = "_id")]
+    pub(super) id: String,
+    pub(super) schema_version: u32,
+    pub(super) campaign_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) origin_event_id: Option<String>,
+    pub(super) origin_campaign_revision: i64,
+    pub(super) purpose: String,
+    pub(super) idempotency_key: String,
+    pub(super) request_fingerprint: String,
+    pub(super) state: String,
+    pub(super) priority: i32,
+    pub(super) available_at: DateTime,
+    pub(super) input_digest: String,
+    pub(super) prompt_digest: String,
+    pub(super) policy_digest: String,
+    pub(super) config_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) output_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) correlation_id: Option<String>,
+    pub(super) attempt_count: i32,
+    pub(super) max_attempts: i32,
+    pub(super) campaign_concurrency_limit: i32,
+    pub(super) attempts: Vec<GenerationAttemptDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lease_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lease_token_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lease_expires_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) artifact_id: Option<String>,
+    pub(super) success_retention: String,
+    pub(super) retention_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) purge_at: Option<DateTime>,
+    pub(super) created_at: DateTime,
+    pub(super) updated_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) completed_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pending_artifact_id: Option<String>,
+}
+
+impl GenerationJobDocument {
+    pub(super) fn to_public(&self) -> Result<GenerationJob, GenerationJobStoreError> {
+        let job = GenerationJob {
+            id: self.id.clone(),
+            campaign_session_id: self.campaign_id.clone(),
+            origin_turn_id: self.origin_event_id.clone(),
+            origin_campaign_revision: from_i64(self.origin_campaign_revision)?,
+            purpose: self.purpose.parse()?,
+            idempotency_key: self.idempotency_key.clone(),
+            state: self.state.parse()?,
+            input_digest: stored_digest(&self.input_digest)?,
+            prompt_digest: stored_digest(&self.prompt_digest)?,
+            policy_digest: stored_digest(&self.policy_digest)?,
+            config_digest: stored_digest(&self.config_digest)?,
+            output_digest: self
+                .output_digest
+                .as_deref()
+                .map(stored_digest)
+                .transpose()?,
+            correlation_id: self.correlation_id.clone(),
+            attempt_count: u8::try_from(self.attempt_count)
+                .map_err(|_| GenerationJobStoreError::NumericRange)?,
+            max_attempts: u8::try_from(self.max_attempts)
+                .map_err(|_| GenerationJobStoreError::NumericRange)?,
+            retry_at: (self.state == "queued")
+                .then(|| date_string(self.available_at))
+                .transpose()?,
+            lease_owner: self.lease_owner.clone(),
+            lease_token: self.lease_token_digest.clone(),
+            lease_expires_at: self.lease_expires_at.map(date_string).transpose()?,
+            last_failure_class: self
+                .last_failure_class
+                .as_deref()
+                .map(str::parse)
+                .transpose()?,
+            last_failure_code: self
+                .last_failure_code
+                .as_deref()
+                .map(str::parse)
+                .transpose()?,
+            artifact_id: self.artifact_id.clone(),
+            success_retention: self.success_retention.parse()?,
+            retention_class: self.retention_class.parse()?,
+            retention_delete_after: self.purge_at.map(date_string).transpose()?,
+            created_at: date_string(self.created_at)?,
+            updated_at: date_string(self.updated_at)?,
+            completed_at: self.completed_at.map(date_string).transpose()?,
+        };
+        validate_loaded_job(&job)?;
+        Ok(job)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnqueueReceiptDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: u32,
+    scope_kind: String,
+    scope_id: String,
+    actor_account_id: String,
+    command_kind: String,
+    idempotency_key: String,
+    request_fingerprint: String,
+    state: String,
+    result_job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin_event_id: Option<String>,
+    created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignRevisionReference {
+    #[serde(rename = "_id")]
+    id: String,
+    revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnReference {
+    #[serde(rename = "_id")]
+    id: String,
+    campaign_id: String,
+    sequence: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactReference {
+    #[serde(rename = "_id")]
+    id: String,
+    job_id: String,
+    campaign_id: String,
+    entity_kind: String,
+    state: String,
+}
+
+impl MongoRepository {
     pub async fn enqueue_generation_job(
         &self,
         new_job: &NewGenerationJob,
     ) -> Result<EnqueueGenerationJobOutcome, GenerationJobStoreError> {
         validate_new_job(new_job)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-
-        // The campaign row is the cross-process serialization point for both
-        // exact-key replay and aggregate budget/concurrency reservation.
-        let current_revision: Option<i64> =
-            sqlx::query_scalar("SELECT revision FROM campaign_sessions WHERE id = $1 FOR UPDATE")
-                .bind(&new_job.campaign_session_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?;
-        let Some(current_revision) = current_revision else {
-            return Err(GenerationJobStoreError::NotFound {
-                job_id: new_job.id.clone(),
-            });
-        };
-        let current_revision = from_i64(current_revision)?;
-        if let Some(existing) = exact_enqueue_replay(&mut transaction, new_job).await? {
-            transaction
-                .commit()
-                .await
-                .map_err(GenerationJobStoreError::Database)?;
-            return Ok(EnqueueGenerationJobOutcome::Existing(existing));
+        if let Some(governance) = new_job.governance.as_ref() {
+            validate_new_governance(governance)?;
         }
-        if new_job.purpose == GenerationPurpose::Illustration {
-            preflight_illustration_request_limits(
-                &mut transaction,
-                &new_job.campaign_session_id,
-                new_job.origin_turn_id.as_deref(),
-            )
-            .await?;
-        }
-        if let Some(turn_id) = new_job.origin_turn_id.as_deref() {
-            let origin_turn_number: Option<i64> = sqlx::query_scalar(
-                "SELECT turn_number FROM turn_audits
-                 WHERE id = $1 AND campaign_session_id = $2",
-            )
-            .bind(turn_id)
-            .bind(&new_job.campaign_session_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-            let Some(origin_turn_number) = origin_turn_number else {
-                return Err(GenerationJobStoreError::InvalidInput(
-                    "origin turn does not belong to the campaign",
-                ));
-            };
-            let origin_turn_number = from_i64(origin_turn_number)?;
-            let committed_revision = origin_turn_number
-                .checked_add(1)
-                .ok_or(GenerationJobStoreError::NumericRange)?;
-            if committed_revision != new_job.origin_campaign_revision
-                || current_revision < new_job.origin_campaign_revision
-            {
-                return Err(GenerationJobStoreError::OriginRevisionConflict {
-                    expected: new_job.origin_campaign_revision,
-                    actual: current_revision,
-                });
-            }
-        } else if current_revision != new_job.origin_campaign_revision {
-            return Err(GenerationJobStoreError::OriginRevisionConflict {
-                expected: new_job.origin_campaign_revision,
-                actual: current_revision,
-            });
-        }
+        let requested = new_job.clone();
+        let request_fingerprint = enqueue_fingerprint(&requested);
+        let store = self.store().clone();
+        let transaction_store = store.clone();
+        let jobs = generation_jobs(&store);
+        let receipts = enqueue_receipts(&store);
+        transaction_store
+            .with_transaction(move |session| {
+                let requested = requested.clone();
+                let request_fingerprint = request_fingerprint.clone();
+                let jobs = jobs.clone();
+                let receipts = receipts.clone();
+                let store = store.clone();
+                Box::pin(async move {
+                    if let Some(existing) = jobs
+                        .find_one(doc! {
+                            "campaign_id": &requested.campaign_session_id,
+                            "purpose": requested.purpose.as_str(),
+                            "idempotency_key": &requested.idempotency_key,
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load generation replay", error))?
+                    {
+                        let existing_public = match existing.to_public() {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if let Err(error) = ensure_matching_replay(&existing_public, &requested) {
+                            return Ok(Err(error));
+                        }
+                        let governance = load_governance_receipt_by_key(
+                            &store,
+                            session,
+                            &requested.campaign_session_id,
+                            requested.purpose,
+                            &requested.idempotency_key,
+                        )
+                        .await?;
+                        match (governance, requested.governance.as_ref()) {
+                            (Some(existing), Some(requested_governance))
+                                if existing.job_id == existing_public.id =>
+                            {
+                                if let Err(error) = ensure_matching_governance_receipt(
+                                    &existing,
+                                    requested_governance,
+                                ) {
+                                    return Ok(Err(error));
+                                }
+                            }
+                            (None, None) => {}
+                            _ => return Ok(Err(GenerationJobStoreError::IdempotencyConflict)),
+                        }
+                        return Ok(Ok(EnqueueGenerationJobOutcome::Existing(existing_public)));
+                    }
 
-        if let Some(governance) = new_job.governance.as_ref()
-            && let Err(error) = preflight_generation_governance(
-                &mut transaction,
-                &new_job.campaign_session_id,
-                new_job.purpose,
-                governance,
-            )
-            .await
-        {
-            if matches!(error, GenerationJobStoreError::BudgetExceeded { .. }) {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(GenerationJobStoreError::Database)?;
-            }
-            return Err(error);
-        }
+                    let scope_kind = enqueue_scope_kind(requested.purpose);
+                    if let Some(receipt) = receipts
+                        .find_one(doc! {
+                            "scope_kind": scope_kind,
+                            "scope_id": &requested.campaign_session_id,
+                            "idempotency_key": &requested.idempotency_key,
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load closed generation receipt", error)
+                        })?
+                    {
+                        return Ok(Err(
+                            if receipt.request_fingerprint == request_fingerprint.as_str() {
+                                GenerationJobStoreError::IdempotencyReceiptClosed
+                            } else {
+                                GenerationJobStoreError::IdempotencyConflict
+                            },
+                        ));
+                    }
 
-        let sql = format!(
-            "INSERT INTO generation_jobs
-             (id, campaign_session_id, origin_turn_id, origin_campaign_revision,
-              purpose, idempotency_key, state, input_digest, prompt_digest,
-              policy_digest, config_digest, correlation_id, attempt_count,
-              max_attempts, retry_at, success_retention_class, retention_class)
-             VALUES
-             ($1, $2, $3, $4, $5, $6, 'queued', $7, $8, $9, $10, $11,
-              0, $12, CURRENT_TIMESTAMP, $13, 'pending')
-             ON CONFLICT (campaign_session_id, purpose, idempotency_key) DO NOTHING
-             RETURNING {JOB_COLUMNS}"
-        );
-        let inserted = sqlx::query(&sql)
-            .bind(&new_job.id)
-            .bind(&new_job.campaign_session_id)
-            .bind(new_job.origin_turn_id.as_deref())
-            .bind(to_i64(new_job.origin_campaign_revision)?)
-            .bind(new_job.purpose.as_str())
-            .bind(&new_job.idempotency_key)
-            .bind(new_job.input_digest.as_str())
-            .bind(new_job.prompt_digest.as_str())
-            .bind(new_job.policy_digest.as_str())
-            .bind(new_job.config_digest.as_str())
-            .bind(new_job.correlation_id.as_deref())
-            .bind(i16::from(new_job.max_attempts))
-            .bind(new_job.success_retention.as_str())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(map_enqueue_error)?
-            .map(job_from_row)
-            .transpose()?;
+                    let campaigns =
+                        store.collection::<CampaignRevisionReference>(CollectionName::Campaigns);
+                    let Some(campaign) = campaigns
+                        .find_one(doc! { "_id": &requested.campaign_session_id })
+                        .projection(doc! { "_id": 1, "revision": 1 })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load generation campaign", error)
+                        })?
+                    else {
+                        return Ok(Err(GenerationJobStoreError::NotFound {
+                            job_id: requested.id.clone(),
+                        }));
+                    };
+                    store
+                        .document_collection(CollectionName::Campaigns)
+                        .update_one(
+                            doc! { "_id": &campaign.id },
+                            doc! { "$inc": { "generation_queue_revision": 1_i64 } },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("serialize generation enqueue", error)
+                        })?;
 
-        let outcome = if let Some(inserted) = inserted {
-            if let Some(governance) = new_job.governance.as_ref() {
-                insert_generation_governance_receipt(
-                    &mut transaction,
-                    &inserted.id,
-                    &inserted.campaign_session_id,
-                    inserted.origin_turn_id.as_deref(),
-                    inserted.purpose,
-                    &inserted.idempotency_key,
-                    governance,
-                )
-                .await?;
-            }
-            EnqueueGenerationJobOutcome::Enqueued(inserted)
-        } else {
-            let existing = load_job_by_key(
-                &mut transaction,
-                &new_job.campaign_session_id,
-                new_job.purpose,
-                &new_job.idempotency_key,
-            )
-            .await?
-            .ok_or(GenerationJobStoreError::InvalidStoredData(
-                "idempotency conflict did not resolve to a job",
-            ))?;
-            ensure_matching_replay(&existing, new_job)?;
-            ensure_job_governance_replay(&mut transaction, &existing, new_job).await?;
-            EnqueueGenerationJobOutcome::Existing(existing)
-        };
-        transaction
-            .commit()
+                    if requested.purpose == GenerationPurpose::Illustration {
+                        let limits = preflight_illustration_request_limits(
+                            &store,
+                            session,
+                            &requested.campaign_session_id,
+                            requested.origin_turn_id.as_deref(),
+                        )
+                        .await?;
+                        if let Err(error) = limits {
+                            return Ok(Err(error));
+                        }
+                    }
+
+                    if let Some(turn_id) = requested.origin_turn_id.as_deref() {
+                        let turns = store.collection::<TurnReference>(CollectionName::TurnEvents);
+                        let Some(turn) = turns
+                            .find_one(doc! {
+                                "_id": turn_id,
+                                "campaign_id": &requested.campaign_session_id,
+                            })
+                            .projection(doc! { "_id": 1, "campaign_id": 1, "sequence": 1 })
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("load generation origin turn", error)
+                            })?
+                        else {
+                            return Ok(Err(GenerationJobStoreError::InvalidInput(
+                                "origin turn does not belong to the campaign",
+                            )));
+                        };
+                        if turn.id != turn_id || turn.campaign_id != requested.campaign_session_id {
+                            return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                "origin turn projection is inconsistent",
+                            )));
+                        }
+                        let committed_revision = match u64::try_from(turn.sequence)
+                            .ok()
+                            .and_then(|sequence| sequence.checked_add(1))
+                        {
+                            Some(value) => value,
+                            None => return Ok(Err(GenerationJobStoreError::NumericRange)),
+                        };
+                        let current_revision = match u64::try_from(campaign.revision) {
+                            Ok(value) => value,
+                            Err(_) => return Ok(Err(GenerationJobStoreError::NumericRange)),
+                        };
+                        if committed_revision != requested.origin_campaign_revision
+                            || current_revision < requested.origin_campaign_revision
+                        {
+                            return Ok(Err(GenerationJobStoreError::OriginRevisionConflict {
+                                expected: requested.origin_campaign_revision,
+                                actual: current_revision,
+                            }));
+                        }
+                    } else {
+                        let current_revision = match u64::try_from(campaign.revision) {
+                            Ok(value) => value,
+                            Err(_) => return Ok(Err(GenerationJobStoreError::NumericRange)),
+                        };
+                        if current_revision != requested.origin_campaign_revision {
+                            return Ok(Err(GenerationJobStoreError::OriginRevisionConflict {
+                                expected: requested.origin_campaign_revision,
+                                actual: current_revision,
+                            }));
+                        }
+                    }
+
+                    if let Some(governance) = requested.governance.as_ref() {
+                        match preflight_generation_governance(
+                            &store,
+                            session,
+                            &requested.campaign_session_id,
+                            requested.purpose,
+                            governance,
+                        )
+                        .await?
+                        {
+                            Ok(()) => {}
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+
+                    let now = DateTime::now();
+                    let document = GenerationJobDocument {
+                        id: requested.id.clone(),
+                        schema_version: SCHEMA_VERSION,
+                        campaign_id: requested.campaign_session_id.clone(),
+                        origin_event_id: requested.origin_turn_id.clone(),
+                        origin_campaign_revision: match to_i64(requested.origin_campaign_revision) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                        purpose: requested.purpose.as_str().to_owned(),
+                        idempotency_key: requested.idempotency_key.clone(),
+                        request_fingerprint: request_fingerprint.as_str().to_owned(),
+                        state: GenerationJobState::Queued.as_str().to_owned(),
+                        priority: requested.purpose.priority(),
+                        available_at: now,
+                        input_digest: requested.input_digest.as_str().to_owned(),
+                        prompt_digest: requested.prompt_digest.as_str().to_owned(),
+                        policy_digest: requested.policy_digest.as_str().to_owned(),
+                        config_digest: requested.config_digest.as_str().to_owned(),
+                        output_digest: None,
+                        correlation_id: requested.correlation_id.clone(),
+                        attempt_count: 0,
+                        max_attempts: i32::from(requested.max_attempts),
+                        campaign_concurrency_limit: requested
+                            .governance
+                            .as_ref()
+                            .map_or(i32::MAX, |governance| {
+                                i32::from(governance.limits.max_campaign_concurrency)
+                            }),
+                        attempts: Vec::new(),
+                        lease_owner: None,
+                        lease_token_digest: None,
+                        lease_expires_at: None,
+                        last_failure_class: None,
+                        last_failure_code: None,
+                        artifact_id: None,
+                        success_retention: requested.success_retention.as_str().to_owned(),
+                        retention_class: GenerationRetentionClass::Pending.as_str().to_owned(),
+                        purge_at: None,
+                        created_at: now,
+                        updated_at: now,
+                        completed_at: None,
+                        pending_artifact_id: None,
+                    };
+                    jobs.insert_one(document.clone())
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert generation job", error))?;
+                    if let Some(governance) = requested.governance.as_ref() {
+                        insert_generation_governance_receipt(
+                            &store,
+                            session,
+                            &requested.id,
+                            &requested.campaign_session_id,
+                            requested.origin_turn_id.as_deref(),
+                            requested.purpose,
+                            &requested.idempotency_key,
+                            governance,
+                        )
+                        .await?;
+                    }
+                    receipts
+                        .insert_one(EnqueueReceiptDocument {
+                            id: format!("command-receipt:generation:{}", requested.id),
+                            schema_version: SCHEMA_VERSION,
+                            scope_kind: scope_kind.to_owned(),
+                            scope_id: requested.campaign_session_id.clone(),
+                            actor_account_id: "account:system-generation".to_owned(),
+                            command_kind: "enqueue_generation_job".to_owned(),
+                            idempotency_key: requested.idempotency_key.clone(),
+                            request_fingerprint: request_fingerprint.as_str().to_owned(),
+                            state: "committed".to_owned(),
+                            result_job_id: requested.id.clone(),
+                            origin_event_id: requested.origin_turn_id.clone(),
+                            created_at: now,
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("insert generation enqueue receipt", error)
+                        })?;
+                    let public = match document.to_public() {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    Ok(Ok(EnqueueGenerationJobOutcome::Enqueued(public)))
+                })
+            })
             .await
-            .map_err(GenerationJobStoreError::Database)?;
-        Ok(outcome)
+            .map_err(map_database)?
     }
 
     pub async fn load_generation_job(
@@ -714,18 +1064,17 @@ impl PostgresRepository {
     ) -> Result<Option<GenerationJob>, GenerationJobStoreError> {
         validate_identifier(campaign_session_id, "campaign id is invalid")?;
         validate_identifier(job_id, "job id is invalid")?;
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM generation_jobs
-             WHERE id = $1 AND campaign_session_id = $2"
-        );
-        sqlx::query(&sql)
-            .bind(job_id)
-            .bind(campaign_session_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(GenerationJobStoreError::Database)?
-            .map(job_from_row)
-            .transpose()
+        operation(
+            self.store(),
+            "load generation job",
+            generation_jobs(self.store()).find_one(doc! {
+                "_id": job_id,
+                "campaign_id": campaign_session_id,
+            }),
+        )
+        .await?
+        .map(|document| document.to_public())
+        .transpose()
     }
 
     pub async fn load_generation_job_by_key(
@@ -736,19 +1085,18 @@ impl PostgresRepository {
     ) -> Result<Option<GenerationJob>, GenerationJobStoreError> {
         validate_identifier(campaign_session_id, "campaign id is invalid")?;
         validate_identifier(idempotency_key, "idempotency key is invalid")?;
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM generation_jobs
-             WHERE campaign_session_id = $1 AND purpose = $2 AND idempotency_key = $3"
-        );
-        sqlx::query(&sql)
-            .bind(campaign_session_id)
-            .bind(purpose.as_str())
-            .bind(idempotency_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(GenerationJobStoreError::Database)?
-            .map(job_from_row)
-            .transpose()
+        operation(
+            self.store(),
+            "load generation job by key",
+            generation_jobs(self.store()).find_one(doc! {
+                "campaign_id": campaign_session_id,
+                "purpose": purpose.as_str(),
+                "idempotency_key": idempotency_key,
+            }),
+        )
+        .await?
+        .map(|document| document.to_public())
+        .transpose()
     }
 
     pub async fn list_generation_attempts(
@@ -758,25 +1106,25 @@ impl PostgresRepository {
     ) -> Result<Vec<GenerationAttempt>, GenerationJobStoreError> {
         validate_identifier(campaign_session_id, "campaign id is invalid")?;
         validate_identifier(job_id, "job id is invalid")?;
-        let rows = sqlx::query(&format!(
-            "SELECT {ATTEMPT_COLUMNS}
-             FROM generation_attempts AS generation_attempts
-             JOIN generation_jobs ON generation_jobs.id = generation_attempts.job_id
-             WHERE generation_attempts.job_id = $1
-               AND generation_jobs.campaign_session_id = $2
-             ORDER BY generation_attempts.attempt_number"
-        ))
-        .bind(job_id)
-        .bind(campaign_session_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(GenerationJobStoreError::Database)?;
-        rows.into_iter().map(attempt_from_row).collect()
+        let Some(document) = operation(
+            self.store(),
+            "load generation attempts",
+            generation_jobs(self.store()).find_one(doc! {
+                "_id": job_id,
+                "campaign_id": campaign_session_id,
+            }),
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        document
+            .attempts
+            .iter()
+            .map(|attempt| attempt.to_public(&document.id))
+            .collect()
     }
 
-    /// Claims one ready job. An expired lease is closed as a body-free
-    /// `lease_expired` attempt before a new attempt is created in the same
-    /// transaction. Concurrent workers skip the locked row.
     pub async fn claim_generation_job(
         &self,
         claim: &GenerationClaim,
@@ -784,8 +1132,6 @@ impl PostgresRepository {
         self.claim_generation_job_matching(claim, None, None).await
     }
 
-    /// Claims only one purpose. A dedicated image worker therefore cannot
-    /// consume text work even when both modalities share the durable queue.
     pub async fn claim_generation_job_for_purpose(
         &self,
         purpose: GenerationPurpose,
@@ -795,11 +1141,6 @@ impl PostgresRepository {
             .await
     }
 
-    /// Claims one exact campaign-owned job for an inline bounded worker.
-    ///
-    /// This prevents a request-scoped worker from accidentally leasing an
-    /// unrelated queued job while preserving the same lease/reclaim rules as
-    /// the general background-worker claim path.
     pub async fn claim_generation_job_by_id(
         &self,
         campaign_session_id: &str,
@@ -819,165 +1160,327 @@ impl PostgresRepository {
         purpose_filter: Option<GenerationPurpose>,
     ) -> Result<Option<ClaimedGenerationJob>, GenerationJobStoreError> {
         validate_claim(claim)?;
-        let lease_millis = duration_millis(claim.lease_duration)?;
+        let claim = claim.clone();
+        let exact_job = exact_job.map(|(campaign, job)| (campaign.to_owned(), job.to_owned()));
         let attempt_id = format!("generation-attempt:{}", Uuid::new_v4());
         let lease_token = format!("generation-lease:{}", Uuid::new_v4());
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
+        let lease_digest = opaque_digest("generation-lease-token/v1", &lease_token);
+        let store = self.store().clone();
+        let transaction_store = store.clone();
+        let jobs = generation_jobs(&store);
+        transaction_store
+            .with_transaction(move |session| {
+                let claim = claim.clone();
+                let exact_job = exact_job.clone();
+                let attempt_id = attempt_id.clone();
+                let lease_token = lease_token.clone();
+                let lease_digest = lease_digest.clone();
+                let store = store.clone();
+                let jobs = jobs.clone();
+                Box::pin(async move {
+                    let now = DateTime::now();
+                    let mut filter = doc! {
+                        "$or": [
+                            {
+                                "state": "queued",
+                                "available_at": { "$lte": now },
+                            },
+                            {
+                                "state": "running",
+                                "lease_expires_at": { "$lte": now },
+                            },
+                        ],
+                    };
+                    if let Some((campaign_id, job_id)) = exact_job.as_ref() {
+                        filter.insert("_id", job_id);
+                        filter.insert("campaign_id", campaign_id);
+                    }
+                    if let Some(purpose) = purpose_filter {
+                        filter.insert("purpose", purpose.as_str());
+                    }
+                    let mut cursor = jobs
+                        .find(filter)
+                        .sort(doc! { "priority": -1, "available_at": 1, "_id": 1 })
+                        .limit(CLAIM_SCAN_LIMIT)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("find claimable generation jobs", error)
+                        })?;
+                    let mut candidates = Vec::new();
+                    while cursor.advance(&mut *session).await.map_err(|error| {
+                        PersistenceError::mongo("read claimable generation job", error)
+                    })? {
+                        candidates.push(cursor.deserialize_current().map_err(|error| {
+                            PersistenceError::mongo("decode claimable generation job", error)
+                        })?);
+                    }
+                    drop(cursor);
 
-        let (campaign_filter, job_filter) = exact_job
-            .map(|(campaign_session_id, job_id)| (Some(campaign_session_id), Some(job_id)))
-            .unwrap_or((None, None));
-        let candidate_sql = format!(
-            "SELECT {JOB_COLUMNS} FROM generation_jobs AS candidate
-             WHERE ($1::TEXT IS NULL OR (candidate.campaign_session_id = $1 AND candidate.id = $2))
-               AND ($3::TEXT IS NULL OR candidate.purpose = $3)
-               AND ((state = 'queued' AND retry_at <= CURRENT_TIMESTAMP)
-                 OR (state = 'running' AND lease_expires_at <= CURRENT_TIMESTAMP))
-               AND (
-                    candidate.purpose <> 'illustration'
-                    OR candidate.state = 'running'
-                    OR NOT EXISTS (
-                        SELECT 1 FROM generation_jobs AS active_image
-                        WHERE active_image.campaign_session_id = candidate.campaign_session_id
-                          AND active_image.purpose = 'illustration'
-                          AND active_image.state = 'running'
-                    )
-               )
-             ORDER BY CASE WHEN state = 'queued' THEN 0 ELSE 1 END,
-                      COALESCE(retry_at, lease_expires_at), created_at, id
-             FOR UPDATE SKIP LOCKED
-             LIMIT 1"
-        );
-        let Some(candidate) = sqlx::query(&candidate_sql)
-            .bind(campaign_filter)
-            .bind(job_filter)
-            .bind(purpose_filter.map(GenerationPurpose::as_str))
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?
-            .map(job_from_row)
-            .transpose()?
-        else {
-            transaction
-                .commit()
-                .await
-                .map_err(GenerationJobStoreError::Database)?;
-            return Ok(None);
-        };
+                    for mut candidate in candidates {
+                        let purpose = match candidate.purpose.parse::<GenerationPurpose>() {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let touched = store
+                            .document_collection(CollectionName::Campaigns)
+                            .update_one(
+                                doc! { "_id": &candidate.campaign_id },
+                                doc! { "$inc": { "generation_claim_revision": 1_i64 } },
+                            )
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("serialize generation claim", error)
+                            })?;
+                        if touched.matched_count != 1 {
+                            return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                "generation job references a missing campaign",
+                            )));
+                        }
 
-        if candidate.state == GenerationJobState::Running {
-            let closed = sqlx::query(
-                "UPDATE generation_attempts
-                 SET state = 'failed', failure_class = 'transient',
-                     failure_code = 'lease_expired', heartbeat_at = CURRENT_TIMESTAMP,
-                     finished_at = CURRENT_TIMESTAMP
-                 WHERE job_id = $1 AND lease_token = $2 AND state = 'running'",
-            )
-            .bind(&candidate.id)
-            .bind(candidate.lease_token.as_deref())
-            .execute(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-            if closed.rows_affected() != 1 {
-                return Err(GenerationJobStoreError::InvalidStoredData(
-                    "expired job has no matching running attempt",
-                ));
-            }
-            record_generation_attempt_usage(
-                &mut transaction,
-                &candidate.id,
-                candidate.purpose,
-                &GenerationUsage::default(),
-                candidate.attempt_count >= candidate.max_attempts,
-            )
-            .await?;
-            if candidate.attempt_count >= candidate.max_attempts {
-                sqlx::query(&format!(
-                    "UPDATE generation_jobs
-                     SET state = 'failed', retry_at = NULL, lease_owner = NULL,
-                         lease_token = NULL, lease_expires_at = NULL,
-                         last_failure_class = 'transient',
-                         last_failure_code = 'lease_expired',
-                         retention_class = 'failed_metadata_7d',
-                         retention_delete_after = CURRENT_TIMESTAMP + {FAILED_RETENTION_SQL},
-                         completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                     WHERE id = $1"
-                ))
-                .bind(&candidate.id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(GenerationJobStoreError::Database)?;
-                return Ok(None);
-            }
-        }
+                        let active = jobs
+                            .count_documents(doc! {
+                                "campaign_id": &candidate.campaign_id,
+                                "_id": { "$ne": &candidate.id },
+                                "state": "running",
+                                "lease_expires_at": { "$gt": now },
+                            })
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo(
+                                    "count campaign generation concurrency",
+                                    error,
+                                )
+                            })?;
+                        let illustration_active = if purpose == GenerationPurpose::Illustration {
+                            jobs.count_documents(doc! {
+                                "campaign_id": &candidate.campaign_id,
+                                "_id": { "$ne": &candidate.id },
+                                "purpose": GenerationPurpose::Illustration.as_str(),
+                                "state": "running",
+                                "lease_expires_at": { "$gt": now },
+                            })
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("count active campaign illustration", error)
+                            })?
+                        } else {
+                            0
+                        };
+                        let campaign_concurrency_limit =
+                            match u64::try_from(candidate.campaign_concurrency_limit) {
+                                Ok(0) | Err(_) => {
+                                    return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                        "campaign concurrency limit is invalid",
+                                    )));
+                                }
+                                Ok(value) => value,
+                            };
+                        if active >= campaign_concurrency_limit || illustration_active > 0 {
+                            continue;
+                        }
 
-        let next_attempt = candidate
-            .attempt_count
-            .checked_add(1)
-            .ok_or(GenerationJobStoreError::NumericRange)?;
-        let update_sql = format!(
-            "UPDATE generation_jobs
-             SET state = 'running', attempt_count = $2, retry_at = NULL,
-                 lease_owner = $3, lease_token = $4,
-                 lease_expires_at = CURRENT_TIMESTAMP + ($5 * INTERVAL '1 millisecond'),
-                 last_failure_class = NULL, last_failure_code = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1
-             RETURNING {JOB_COLUMNS}"
-        );
-        let job = job_from_row(
-            sqlx::query(&update_sql)
-                .bind(&candidate.id)
-                .bind(i16::from(next_attempt))
-                .bind(&claim.worker_id)
-                .bind(&lease_token)
-                .bind(lease_millis)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?,
-        )?;
+                        let expired = candidate.state == GenerationJobState::Running.as_str();
+                        if expired {
+                            let previous_digest = {
+                                let Some(previous) = candidate.attempts.last_mut() else {
+                                    return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                        "expired job has no running attempt",
+                                    )));
+                                };
+                                if previous.state != GenerationAttemptState::Running.as_str()
+                                    || candidate.lease_token_digest.as_deref()
+                                        != Some(previous.lease_token_digest.as_str())
+                                {
+                                    return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                        "expired job attempt does not match its lease",
+                                    )));
+                                }
+                                previous.state = GenerationAttemptState::Failed.as_str().to_owned();
+                                previous.failure_class =
+                                    Some(GenerationFailureClass::Transient.as_str().to_owned());
+                                previous.failure_code =
+                                    Some(GenerationFailureCode::LeaseExpired.as_str().to_owned());
+                                previous.heartbeat_at = now;
+                                previous.finished_at = Some(now);
+                                previous.lease_token_digest.clone()
+                            };
+                            if candidate.attempt_count >= candidate.max_attempts {
+                                candidate.state = GenerationJobState::Failed.as_str().to_owned();
+                                candidate.lease_owner = None;
+                                candidate.lease_token_digest = None;
+                                candidate.lease_expires_at = None;
+                                candidate.last_failure_class =
+                                    Some(GenerationFailureClass::Transient.as_str().to_owned());
+                                candidate.last_failure_code =
+                                    Some(GenerationFailureCode::LeaseExpired.as_str().to_owned());
+                                candidate.retention_class =
+                                    GenerationRetentionClass::FailedMetadata7Days
+                                        .as_str()
+                                        .to_owned();
+                                candidate.purge_at = Some(add_duration(now, FAILED_RETENTION));
+                                candidate.completed_at = Some(now);
+                                candidate.updated_at = now;
+                                retire_pending_artifact(
+                                    &store,
+                                    session,
+                                    &candidate,
+                                    add_duration(now, FAILED_RETENTION),
+                                )
+                                .await?;
+                                let replaced = jobs
+                                    .replace_one(
+                                        doc! {
+                                            "_id": &candidate.id,
+                                            "state": "running",
+                                            "lease_token_digest": &previous_digest,
+                                            "lease_expires_at": { "$lte": now },
+                                        },
+                                        candidate.clone(),
+                                    )
+                                    .session(&mut *session)
+                                    .await
+                                    .map_err(|error| {
+                                        PersistenceError::mongo(
+                                            "terminalize expired generation lease",
+                                            error,
+                                        )
+                                    })?;
+                                if replaced.matched_count != 1 {
+                                    continue;
+                                }
+                                match record_generation_attempt_usage(
+                                    &store,
+                                    session,
+                                    &candidate.id,
+                                    purpose,
+                                    &GenerationUsage::default(),
+                                    true,
+                                )
+                                .await?
+                                {
+                                    Ok(()) => {}
+                                    Err(error) => return Ok(Err(error)),
+                                }
+                                insert_job_audit(
+                                    &store,
+                                    session,
+                                    &candidate,
+                                    "lease_expired",
+                                    "failed",
+                                )
+                                .await?;
+                                return Ok(Ok(None));
+                            }
+                        }
 
-        let attempt_sql = format!(
-            "INSERT INTO generation_attempts
-             (id, job_id, attempt_number, state, lease_owner, lease_token, provider, model)
-             VALUES ($1, $2, $3, 'running', $4, $5, $6, $7)
-             RETURNING {ATTEMPT_COLUMNS}"
-        );
-        let attempt = attempt_from_row(
-            sqlx::query(&attempt_sql)
-                .bind(&attempt_id)
-                .bind(&candidate.id)
-                .bind(i16::from(next_attempt))
-                .bind(&claim.worker_id)
-                .bind(&lease_token)
-                .bind(&claim.provider)
-                .bind(&claim.model)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?,
-        )?;
-        transaction
-            .commit()
+                        let next_attempt = match candidate.attempt_count.checked_add(1) {
+                            Some(value) if value <= candidate.max_attempts => value,
+                            _ => return Ok(Err(GenerationJobStoreError::NumericRange)),
+                        };
+                        let expires_at = add_duration(now, claim.lease_duration);
+                        let attempt = GenerationAttemptDocument {
+                            id: attempt_id.clone(),
+                            attempt_number: next_attempt,
+                            state: GenerationAttemptState::Running.as_str().to_owned(),
+                            lease_owner: claim.worker_id.clone(),
+                            lease_token_digest: lease_digest.clone(),
+                            provider: claim.provider.clone(),
+                            model: claim.model.clone(),
+                            prompt_tokens: None,
+                            completion_tokens: None,
+                            total_tokens: None,
+                            cost_microusd: None,
+                            latency_milliseconds: None,
+                            failure_class: None,
+                            failure_code: None,
+                            provider_status: None,
+                            provider_request_id: None,
+                            artifact_id: None,
+                            output_digest: None,
+                            started_at: now,
+                            heartbeat_at: now,
+                            finished_at: None,
+                            created_at: now,
+                        };
+                        candidate.attempts.push(attempt.clone());
+                        candidate.state = GenerationJobState::Running.as_str().to_owned();
+                        candidate.attempt_count = next_attempt;
+                        candidate.available_at = now;
+                        candidate.lease_owner = Some(claim.worker_id.clone());
+                        candidate.lease_token_digest = Some(lease_digest.clone());
+                        candidate.lease_expires_at = Some(expires_at);
+                        candidate.last_failure_class = None;
+                        candidate.last_failure_code = None;
+                        candidate.updated_at = now;
+                        let state_filter = if expired {
+                            doc! {
+                                "state": "running",
+                                "lease_expires_at": { "$lte": now },
+                            }
+                        } else {
+                            doc! {
+                                "state": "queued",
+                                "available_at": { "$lte": now },
+                            }
+                        };
+                        let mut update_filter = doc! { "_id": &candidate.id };
+                        update_filter.extend(state_filter);
+                        let claimed = jobs
+                            .find_one_and_replace(update_filter, candidate.clone())
+                            .return_document(ReturnDocument::After)
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("claim generation job", error)
+                            })?;
+                        let Some(claimed) = claimed else {
+                            continue;
+                        };
+                        if expired {
+                            match record_generation_attempt_usage(
+                                &store,
+                                session,
+                                &candidate.id,
+                                purpose,
+                                &GenerationUsage::default(),
+                                false,
+                            )
+                            .await?
+                            {
+                                Ok(()) => {}
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                        let mut public_job = match claimed.to_public() {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        public_job.lease_token = Some(lease_token.clone());
+                        let mut public_attempt = match attempt.to_public(&candidate.id) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        public_attempt.lease_token = lease_token.clone();
+                        return Ok(Ok(Some(ClaimedGenerationJob {
+                            lease: GenerationLease {
+                                job_id: candidate.id,
+                                attempt_id,
+                                worker_id: claim.worker_id,
+                                lease_token,
+                            },
+                            job: public_job,
+                            attempt: public_attempt,
+                        })));
+                    }
+                    Ok(Ok(None))
+                })
+            })
             .await
-            .map_err(GenerationJobStoreError::Database)?;
-        Ok(Some(ClaimedGenerationJob {
-            lease: GenerationLease {
-                job_id: job.id.clone(),
-                attempt_id: attempt.id.clone(),
-                worker_id: claim.worker_id.clone(),
-                lease_token,
-            },
-            job,
-            attempt,
-        }))
+            .map_err(map_database)?
     }
 
     pub async fn heartbeat_generation_job(
@@ -987,53 +1490,48 @@ impl PostgresRepository {
     ) -> Result<GenerationJob, GenerationJobStoreError> {
         validate_lease(lease)?;
         validate_lease_duration(lease_duration)?;
-        let lease_millis = duration_millis(lease_duration)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-        let update_sql = format!(
-            "UPDATE generation_jobs
-             SET lease_expires_at = CURRENT_TIMESTAMP + ($4 * INTERVAL '1 millisecond'),
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND state = 'running' AND lease_owner = $2
-               AND lease_token = $3 AND lease_expires_at > CURRENT_TIMESTAMP
-             RETURNING {JOB_COLUMNS}"
-        );
-        let Some(row) = sqlx::query(&update_sql)
-            .bind(&lease.job_id)
-            .bind(&lease.worker_id)
-            .bind(&lease.lease_token)
-            .bind(lease_millis)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?
-        else {
-            return Err(GenerationJobStoreError::LostLease);
-        };
-        let touched = sqlx::query(
-            "UPDATE generation_attempts
-             SET heartbeat_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND job_id = $2 AND state = 'running'
-               AND lease_owner = $3 AND lease_token = $4",
+        let now = DateTime::now();
+        let digest = opaque_digest("generation-lease-token/v1", &lease.lease_token);
+        let updated = operation(
+            self.store(),
+            "heartbeat generation lease",
+            generation_jobs(self.store())
+                .find_one_and_update(
+                    doc! {
+                        "_id": &lease.job_id,
+                        "state": "running",
+                        "lease_owner": &lease.worker_id,
+                        "lease_token_digest": &digest,
+                        "lease_expires_at": { "$gt": now },
+                        "attempts": {
+                            "$elemMatch": {
+                                "_id": &lease.attempt_id,
+                                "state": "running",
+                                "lease_owner": &lease.worker_id,
+                                "lease_token_digest": &digest,
+                            }
+                        },
+                    },
+                    doc! {
+                        "$set": {
+                            "lease_expires_at": add_duration(now, lease_duration),
+                            "attempts.$[attempt].heartbeat_at": now,
+                            "updated_at": now,
+                        }
+                    },
+                )
+                .array_filters(vec![doc! {
+                    "attempt._id": &lease.attempt_id,
+                    "attempt.state": "running",
+                    "attempt.lease_token_digest": &digest,
+                }])
+                .return_document(ReturnDocument::After),
         )
-        .bind(&lease.attempt_id)
-        .bind(&lease.job_id)
-        .bind(&lease.worker_id)
-        .bind(&lease.lease_token)
-        .execute(&mut *transaction)
-        .await
-        .map_err(GenerationJobStoreError::Database)?;
-        if touched.rows_affected() != 1 {
-            return Err(GenerationJobStoreError::LostLease);
-        }
-        let job = job_from_row(row)?;
-        transaction
-            .commit()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-        Ok(job)
+        .await?
+        .ok_or(GenerationJobStoreError::LostLease)?;
+        let mut public = updated.to_public()?;
+        public.lease_token = Some(lease.lease_token.clone());
+        Ok(public)
     }
 
     pub async fn finish_generation_attempt(
@@ -1062,111 +1560,33 @@ impl PostgresRepository {
             validate_identifier(artifact_id, "artifact id is invalid")?;
         }
         validate_usage(&success.usage)?;
-        let mut transaction = self
-            .pool
-            .begin()
+        let store = self.store().clone();
+        let transaction_store = store.clone();
+        let lease = lease.clone();
+        let success = success.clone();
+        let result = transaction_store
+            .with_transaction(move |session| {
+                let store = store.clone();
+                let lease = lease.clone();
+                let success = success.clone();
+                Box::pin(async move {
+                    complete_leased_job_in_transaction(
+                        &store,
+                        session,
+                        &lease,
+                        success.artifact_id.as_deref(),
+                        &success.output_digest,
+                        &success.usage,
+                        None,
+                        false,
+                    )
+                    .await
+                    .map(|result| result.map(|(document, _)| document))
+                })
+            })
             .await
-            .map_err(GenerationJobStoreError::Database)?;
-        let job = lock_current_lease(&mut transaction, lease).await?;
-        if job.purpose == GenerationPurpose::Illustration && success.artifact_id.is_none() {
-            return Err(GenerationJobStoreError::InvalidInput(
-                "illustration success requires a validated artifact",
-            ));
-        }
-        if let Some(artifact_id) = success.artifact_id.as_deref() {
-            let artifact_matches: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM generated_assets
-                    WHERE id = $1 AND campaign_session_id = $2
-                 )",
-            )
-            .bind(artifact_id)
-            .bind(&job.campaign_session_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-            if !artifact_matches {
-                return Err(GenerationJobStoreError::InvalidInput(
-                    "artifact does not belong to the generation campaign",
-                ));
-            }
-        }
-
-        let usage = usage_bindings(&success.usage)?;
-        let attempt_updated = sqlx::query(
-            "UPDATE generation_attempts
-             SET state = 'succeeded', prompt_tokens = $5, completion_tokens = $6,
-                 total_tokens = $7, cost_microusd = $8,
-                 latency_milliseconds = $9, artifact_id = $10,
-                 output_digest = $11,
-                 heartbeat_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND job_id = $2 AND state = 'running'
-               AND lease_owner = $3 AND lease_token = $4",
-        )
-        .bind(&lease.attempt_id)
-        .bind(&lease.job_id)
-        .bind(&lease.worker_id)
-        .bind(&lease.lease_token)
-        .bind(usage.prompt_tokens)
-        .bind(usage.completion_tokens)
-        .bind(usage.total_tokens)
-        .bind(usage.cost_microusd)
-        .bind(usage.latency_milliseconds)
-        .bind(success.artifact_id.as_deref())
-        .bind(success.output_digest.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(GenerationJobStoreError::Database)?;
-        if attempt_updated.rows_affected() != 1 {
-            return Err(GenerationJobStoreError::LostLease);
-        }
-        record_generation_attempt_usage(
-            &mut transaction,
-            &lease.job_id,
-            job.purpose,
-            &success.usage,
-            true,
-        )
-        .await?;
-
-        let (retention_class_sql, retention_delete_after_sql) =
-            match (success.artifact_id.is_some(), job.success_retention) {
-                (false, _) => (
-                    "'unselected_presentation_30d'",
-                    "CURRENT_TIMESTAMP + INTERVAL '30 days'",
-                ),
-                (true, SuccessRetention::CampaignLifetime) => ("success_retention_class", "NULL"),
-                (true, SuccessRetention::UnselectedPresentation30Days) => (
-                    "success_retention_class",
-                    "CURRENT_TIMESTAMP + INTERVAL '30 days'",
-                ),
-            };
-        let update_sql = format!(
-            "UPDATE generation_jobs
-             SET state = 'succeeded', retry_at = NULL, lease_owner = NULL,
-                 lease_token = NULL, lease_expires_at = NULL,
-                 last_failure_class = NULL, last_failure_code = NULL,
-                 artifact_id = $2, output_digest = $3,
-                 retention_class = {retention_class_sql},
-                 retention_delete_after = {retention_delete_after_sql},
-                 completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1
-             RETURNING {JOB_COLUMNS}"
-        );
-        let completed = job_from_row(
-            sqlx::query(&update_sql)
-                .bind(&lease.job_id)
-                .bind(success.artifact_id.as_deref())
-                .bind(success.output_digest.as_str())
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-        Ok(completed)
+            .map_err(map_database)??;
+        result.to_public()
     }
 
     pub async fn fail_generation_attempt(
@@ -1176,110 +1596,38 @@ impl PostgresRepository {
     ) -> Result<GenerationAttemptFinishOutcome, GenerationJobStoreError> {
         validate_lease(lease)?;
         validate_failure(failure)?;
-        let mut transaction = self
-            .pool
-            .begin()
+        let store = self.store().clone();
+        let transaction_store = store.clone();
+        let lease = lease.clone();
+        let failure = failure.clone();
+        transaction_store
+            .with_transaction(move |session| {
+                let store = store.clone();
+                let lease = lease.clone();
+                let failure = failure.clone();
+                Box::pin(async move {
+                    let output_digest = failure
+                        .output_digest
+                        .clone()
+                        .unwrap_or_else(|| Sha256Digest::from_bytes([0; 32]));
+                    complete_leased_job_in_transaction(
+                        &store,
+                        session,
+                        &lease,
+                        None,
+                        &output_digest,
+                        &failure.usage,
+                        Some((&failure, failure.output_digest.as_ref())),
+                        true,
+                    )
+                    .await
+                    .map(|result| result.map(|(_, outcome)| outcome))
+                })
+            })
             .await
-            .map_err(GenerationJobStoreError::Database)?;
-        let job = lock_current_lease(&mut transaction, lease).await?;
-        let usage = usage_bindings(&failure.usage)?;
-        let attempt_updated = sqlx::query(
-            "UPDATE generation_attempts
-             SET state = 'failed', prompt_tokens = $5, completion_tokens = $6,
-                 total_tokens = $7, cost_microusd = $8,
-                 latency_milliseconds = $9,
-                 failure_class = $10, failure_code = $11,
-                 provider_status = $12, provider_request_id = $13,
-                 output_digest = $14,
-                 heartbeat_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND job_id = $2 AND state = 'running'
-               AND lease_owner = $3 AND lease_token = $4",
-        )
-        .bind(&lease.attempt_id)
-        .bind(&lease.job_id)
-        .bind(&lease.worker_id)
-        .bind(&lease.lease_token)
-        .bind(usage.prompt_tokens)
-        .bind(usage.completion_tokens)
-        .bind(usage.total_tokens)
-        .bind(usage.cost_microusd)
-        .bind(usage.latency_milliseconds)
-        .bind(failure.code.class().as_str())
-        .bind(failure.code.as_str())
-        .bind(failure.provider_status.map(i32::from))
-        .bind(failure.provider_request_id.as_deref())
-        .bind(failure.output_digest.as_ref().map(Sha256Digest::as_str))
-        .execute(&mut *transaction)
-        .await
-        .map_err(GenerationJobStoreError::Database)?;
-        if attempt_updated.rows_affected() != 1 {
-            return Err(GenerationJobStoreError::LostLease);
-        }
-
-        let retry_delay = job.purpose.retry_delay(failure.code, job.attempt_count);
-        let should_retry = retry_delay.is_some() && job.attempt_count < job.max_attempts;
-        record_generation_attempt_usage(
-            &mut transaction,
-            &lease.job_id,
-            job.purpose,
-            &failure.usage,
-            !should_retry,
-        )
-        .await?;
-        let outcome = if should_retry {
-            let retry_millis = duration_millis(
-                retry_delay.expect("retryable purpose policy supplies a bounded delay"),
-            )?;
-            sqlx::query(
-                "UPDATE generation_jobs
-                 SET state = 'queued', retry_at = CURRENT_TIMESTAMP
-                        + ($2 * INTERVAL '1 millisecond'),
-                     lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                     last_failure_class = $3, last_failure_code = $4,
-                     output_digest = $5,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1",
-            )
-            .bind(&lease.job_id)
-            .bind(retry_millis)
-            .bind(failure.code.class().as_str())
-            .bind(failure.code.as_str())
-            .bind(failure.output_digest.as_ref().map(Sha256Digest::as_str))
-            .execute(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-            GenerationAttemptFinishOutcome::RetryScheduled
-        } else {
-            sqlx::query(&format!(
-                "UPDATE generation_jobs
-                 SET state = 'failed', retry_at = NULL, lease_owner = NULL,
-                     lease_token = NULL, lease_expires_at = NULL,
-                     last_failure_class = $2, last_failure_code = $3,
-                     output_digest = $4,
-                     retention_class = 'failed_metadata_7d',
-                     retention_delete_after = CURRENT_TIMESTAMP + {FAILED_RETENTION_SQL},
-                     completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1"
-            ))
-            .bind(&lease.job_id)
-            .bind(failure.code.class().as_str())
-            .bind(failure.code.as_str())
-            .bind(failure.output_digest.as_ref().map(Sha256Digest::as_str))
-            .execute(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-            GenerationAttemptFinishOutcome::Failed
-        };
-        transaction
-            .commit()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-        Ok(outcome)
+            .map_err(map_database)?
     }
 
-    /// Cancellation is idempotent only after the job is cancelled. A running
-    /// attempt is closed atomically; a stale worker can no longer heartbeat or
-    /// publish an artifact after this commit.
     pub async fn cancel_generation_job(
         &self,
         campaign_session_id: &str,
@@ -1287,215 +1635,560 @@ impl PostgresRepository {
     ) -> Result<GenerationJob, GenerationJobStoreError> {
         validate_identifier(campaign_session_id, "campaign id is invalid")?;
         validate_identifier(job_id, "job id is invalid")?;
-        let mut transaction = self
-            .pool
-            .begin()
+        let store = self.store().clone();
+        let transaction_store = store.clone();
+        let campaign_id = campaign_session_id.to_owned();
+        let job_id = job_id.to_owned();
+        let document = transaction_store
+            .with_transaction(move |session| {
+                let store = store.clone();
+                let campaign_id = campaign_id.clone();
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    let jobs = generation_jobs(&store);
+                    let Some(mut job) = jobs
+                        .find_one(doc! { "_id": &job_id, "campaign_id": &campaign_id })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load generation job for cancellation", error)
+                        })?
+                    else {
+                        return Ok(Err(GenerationJobStoreError::NotFound { job_id }));
+                    };
+                    let state = match job.state.parse::<GenerationJobState>() {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if state == GenerationJobState::Cancelled {
+                        return Ok(Ok(job));
+                    }
+                    if matches!(
+                        state,
+                        GenerationJobState::Succeeded | GenerationJobState::Failed
+                    ) {
+                        return Ok(Err(GenerationJobStoreError::InvalidTransition {
+                            job_id,
+                            state,
+                        }));
+                    }
+                    match state {
+                        GenerationJobState::Queued => {
+                            release_generation_budget(&store, session, &job.id).await?;
+                        }
+                        GenerationJobState::Running => {
+                            let Some(attempt) = job.attempts.last_mut() else {
+                                return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                    "running job has no matching attempt",
+                                )));
+                            };
+                            if attempt.state != "running"
+                                || job.lease_token_digest.as_deref()
+                                    != Some(attempt.lease_token_digest.as_str())
+                            {
+                                return Ok(Err(GenerationJobStoreError::InvalidStoredData(
+                                    "running job has no matching attempt",
+                                )));
+                            }
+                            let now = DateTime::now();
+                            attempt.state = GenerationAttemptState::Cancelled.as_str().to_owned();
+                            attempt.failure_class =
+                                Some(GenerationFailureClass::Permanent.as_str().to_owned());
+                            attempt.failure_code =
+                                Some(GenerationFailureCode::Cancelled.as_str().to_owned());
+                            attempt.heartbeat_at = now;
+                            attempt.finished_at = Some(now);
+                            settle_unknown_generation_usage(&store, session, &job.id).await?;
+                        }
+                        _ => {}
+                    }
+                    let now = DateTime::now();
+                    let original_state = job.state.clone();
+                    let original_digest = job.lease_token_digest.clone();
+                    job.state = GenerationJobState::Cancelled.as_str().to_owned();
+                    job.lease_owner = None;
+                    job.lease_token_digest = None;
+                    job.lease_expires_at = None;
+                    job.last_failure_class =
+                        Some(GenerationFailureClass::Permanent.as_str().to_owned());
+                    job.last_failure_code =
+                        Some(GenerationFailureCode::Cancelled.as_str().to_owned());
+                    job.retention_class = GenerationRetentionClass::FailedMetadata7Days
+                        .as_str()
+                        .to_owned();
+                    job.purge_at = Some(add_duration(now, FAILED_RETENTION));
+                    job.completed_at = Some(now);
+                    job.updated_at = now;
+                    retire_pending_artifact(
+                        &store,
+                        session,
+                        &job,
+                        add_duration(now, FAILED_RETENTION),
+                    )
+                    .await?;
+                    let mut filter = doc! { "_id": &job.id, "state": original_state };
+                    if let Some(digest) = original_digest {
+                        filter.insert("lease_token_digest", digest);
+                    }
+                    let replaced = jobs
+                        .replace_one(filter, job.clone())
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("cancel generation job", error))?;
+                    if replaced.matched_count != 1 {
+                        return Ok(Err(GenerationJobStoreError::LostLease));
+                    }
+                    insert_job_audit(&store, session, &job, "cancel", "cancelled").await?;
+                    Ok(Ok(job))
+                })
+            })
             .await
-            .map_err(GenerationJobStoreError::Database)?;
-        let sql = format!(
-            "SELECT {JOB_COLUMNS} FROM generation_jobs
-             WHERE id = $1 AND campaign_session_id = $2 FOR UPDATE"
-        );
-        let job = sqlx::query(&sql)
-            .bind(job_id)
-            .bind(campaign_session_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(GenerationJobStoreError::Database)?
-            .map(job_from_row)
-            .transpose()?
-            .ok_or_else(|| GenerationJobStoreError::NotFound {
-                job_id: job_id.to_owned(),
-            })?;
-        match job.state {
-            GenerationJobState::Cancelled => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(GenerationJobStoreError::Database)?;
-                return Ok(job);
-            }
-            GenerationJobState::Queued => {
-                release_generation_budget(&mut transaction, job_id).await?;
-            }
-            GenerationJobState::Running => {
-                let closed = sqlx::query(
-                    "UPDATE generation_attempts
-                     SET state = 'cancelled', failure_class = 'permanent',
-                         failure_code = 'cancelled', heartbeat_at = CURRENT_TIMESTAMP,
-                         finished_at = CURRENT_TIMESTAMP
-                     WHERE job_id = $1 AND lease_token = $2 AND state = 'running'",
-                )
-                .bind(job_id)
-                .bind(job.lease_token.as_deref())
-                .execute(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?;
-                if closed.rows_affected() != 1 {
-                    return Err(GenerationJobStoreError::InvalidStoredData(
-                        "running job has no matching attempt",
-                    ));
-                }
-                settle_unknown_generation_usage(&mut transaction, job_id).await?;
-            }
-            GenerationJobState::Succeeded | GenerationJobState::Failed => {
-                return Err(GenerationJobStoreError::InvalidTransition {
-                    job_id: job_id.to_owned(),
-                    state: job.state,
-                });
-            }
-        }
-        let update_sql = format!(
-            "UPDATE generation_jobs
-             SET state = 'cancelled', retry_at = NULL, lease_owner = NULL,
-                 lease_token = NULL, lease_expires_at = NULL,
-                 last_failure_class = 'permanent', last_failure_code = 'cancelled',
-                 retention_class = 'failed_metadata_7d',
-                 retention_delete_after = CURRENT_TIMESTAMP + {FAILED_RETENTION_SQL},
-                 completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1
-             RETURNING {JOB_COLUMNS}"
-        );
-        let cancelled = job_from_row(
-            sqlx::query(&update_sql)
-                .bind(job_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(GenerationJobStoreError::Database)?,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(GenerationJobStoreError::Database)?;
-        Ok(cancelled)
+            .map_err(map_database)??;
+        document.to_public()
     }
 }
 
-const JOB_COLUMNS: &str = "
-    id, campaign_session_id, origin_turn_id, origin_campaign_revision,
-    purpose, idempotency_key, state, input_digest, prompt_digest,
-    policy_digest, config_digest, output_digest, correlation_id, attempt_count, max_attempts,
-    retry_at::text AS retry_at, lease_owner, lease_token,
-    lease_expires_at::text AS lease_expires_at, last_failure_class,
-    last_failure_code, artifact_id, success_retention_class, retention_class,
-    retention_delete_after::text AS retention_delete_after,
-    created_at::text AS created_at, updated_at::text AS updated_at,
-    completed_at::text AS completed_at";
-
-const ATTEMPT_COLUMNS: &str = "
-    generation_attempts.id, generation_attempts.job_id,
-    generation_attempts.attempt_number, generation_attempts.state,
-    generation_attempts.lease_owner, generation_attempts.lease_token,
-    generation_attempts.provider, generation_attempts.model,
-    generation_attempts.prompt_tokens, generation_attempts.completion_tokens,
-    generation_attempts.total_tokens, generation_attempts.cost_microusd,
-    generation_attempts.latency_milliseconds,
-    generation_attempts.failure_class, generation_attempts.failure_code,
-    generation_attempts.provider_status, generation_attempts.provider_request_id,
-    generation_attempts.artifact_id, generation_attempts.output_digest,
-    generation_attempts.started_at::text AS started_at,
-    generation_attempts.heartbeat_at::text AS heartbeat_at,
-    generation_attempts.finished_at::text AS finished_at,
-    generation_attempts.created_at::text AS created_at";
-
-async fn load_job_by_key(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    purpose: GenerationPurpose,
-    idempotency_key: &str,
-) -> Result<Option<GenerationJob>, GenerationJobStoreError> {
-    let sql = format!(
-        "SELECT {JOB_COLUMNS} FROM generation_jobs
-         WHERE campaign_session_id = $1 AND purpose = $2 AND idempotency_key = $3"
-    );
-    sqlx::query(&sql)
-        .bind(campaign_session_id)
-        .bind(purpose.as_str())
-        .bind(idempotency_key)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(GenerationJobStoreError::Database)?
-        .map(job_from_row)
-        .transpose()
-}
-
-async fn exact_enqueue_replay(
-    transaction: &mut Transaction<'_, Postgres>,
-    requested: &NewGenerationJob,
-) -> Result<Option<GenerationJob>, GenerationJobStoreError> {
-    if let Some(existing) = load_job_by_key(
-        transaction,
-        &requested.campaign_session_id,
-        requested.purpose,
-        &requested.idempotency_key,
-    )
-    .await?
-    {
-        ensure_matching_replay(&existing, requested)?;
-        ensure_job_governance_replay(transaction, &existing, requested).await?;
-        return Ok(Some(existing));
-    }
-    if let Some(receipt) = load_governance_receipt_by_key(
-        transaction,
-        &requested.campaign_session_id,
-        requested.purpose,
-        &requested.idempotency_key,
-    )
-    .await?
-    {
-        let governance = requested
-            .governance
-            .as_ref()
-            .ok_or(GenerationJobStoreError::IdempotencyConflict)?;
-        ensure_matching_governance_receipt(&receipt, governance)?;
-        return Err(GenerationJobStoreError::IdempotencyReceiptClosed);
-    }
-    Ok(None)
-}
-
-async fn ensure_job_governance_replay(
-    transaction: &mut Transaction<'_, Postgres>,
-    existing: &GenerationJob,
-    requested: &NewGenerationJob,
-) -> Result<(), GenerationJobStoreError> {
-    match (
-        load_governance_receipt_by_key(
-            transaction,
-            &existing.campaign_session_id,
-            existing.purpose,
-            &existing.idempotency_key,
-        )
-        .await?,
-        requested.governance.as_ref(),
-    ) {
-        (Some(receipt), Some(governance)) if receipt.job_id == existing.id => {
-            ensure_matching_governance_receipt(&receipt, governance)
-        }
-        (None, None) => Ok(()),
-        _ => Err(GenerationJobStoreError::IdempotencyConflict),
-    }
-}
-
-async fn lock_current_lease(
-    transaction: &mut Transaction<'_, Postgres>,
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn complete_leased_job_in_transaction(
+    store: &MongoStore,
+    session: &mut ClientSession,
     lease: &GenerationLease,
-) -> Result<GenerationJob, GenerationJobStoreError> {
-    let sql = format!(
-        "SELECT {JOB_COLUMNS} FROM generation_jobs
-         WHERE id = $1 AND state = 'running' AND lease_owner = $2
-           AND lease_token = $3 AND lease_expires_at > CURRENT_TIMESTAMP
-         FOR UPDATE"
-    );
-    sqlx::query(&sql)
-        .bind(&lease.job_id)
-        .bind(&lease.worker_id)
-        .bind(&lease.lease_token)
-        .fetch_optional(&mut **transaction)
+    artifact_id: Option<&str>,
+    output_digest: &Sha256Digest,
+    usage: &GenerationUsage,
+    failure: Option<(&GenerationAttemptFailure, Option<&Sha256Digest>)>,
+    allow_retry: bool,
+) -> Result<
+    Result<(GenerationJobDocument, GenerationAttemptFinishOutcome), GenerationJobStoreError>,
+    PersistenceError,
+> {
+    let now = DateTime::now();
+    let lease_digest = opaque_digest("generation-lease-token/v1", &lease.lease_token);
+    let jobs = generation_jobs(store);
+    let Some(mut job) = jobs
+        .find_one(doc! {
+            "_id": &lease.job_id,
+            "state": "running",
+            "lease_owner": &lease.worker_id,
+            "lease_token_digest": &lease_digest,
+            "lease_expires_at": { "$gt": now },
+        })
+        .session(&mut *session)
         .await
-        .map_err(GenerationJobStoreError::Database)?
-        .map(job_from_row)
-        .transpose()?
-        .ok_or(GenerationJobStoreError::LostLease)
+        .map_err(|error| PersistenceError::mongo("load current generation lease", error))?
+    else {
+        return Ok(Err(GenerationJobStoreError::LostLease));
+    };
+    let purpose = match job.purpose.parse::<GenerationPurpose>() {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    if purpose == GenerationPurpose::Illustration && failure.is_none() && artifact_id.is_none() {
+        return Ok(Err(GenerationJobStoreError::InvalidInput(
+            "illustration success requires a validated artifact",
+        )));
+    }
+    if purpose == GenerationPurpose::Illustration
+        && artifact_id.is_some()
+        && job.pending_artifact_id.as_deref() != artifact_id
+    {
+        return Ok(Err(GenerationJobStoreError::InvalidInput(
+            "illustration artifact does not own the job publication slot",
+        )));
+    }
+    let mut artifact = None;
+    if let Some(artifact_id) = artifact_id {
+        let assets = store.collection::<ArtifactReference>(CollectionName::GeneratedAssets);
+        artifact = assets
+            .find_one(doc! {
+                "_id": artifact_id,
+                "job_id": &job.id,
+                "campaign_id": &job.campaign_id,
+                "entity_kind": "turn_scene_image",
+                "state": "staged",
+            })
+            .projection(doc! {
+                "_id": 1,
+                "job_id": 1,
+                "campaign_id": 1,
+                "entity_kind": 1,
+                "state": 1,
+            })
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("verify generation artifact ownership", error)
+            })?;
+        if artifact.is_none() {
+            return Ok(Err(GenerationJobStoreError::InvalidInput(
+                "artifact does not belong to the generation campaign",
+            )));
+        }
+    }
+    let Some(attempt) = job
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.id == lease.attempt_id)
+    else {
+        return Ok(Err(GenerationJobStoreError::LostLease));
+    };
+    if attempt.state != GenerationAttemptState::Running.as_str()
+        || attempt.lease_owner != lease.worker_id
+        || attempt.lease_token_digest != lease_digest
+    {
+        return Ok(Err(GenerationJobStoreError::LostLease));
+    }
+    let bindings = match usage_bindings(usage) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    attempt.prompt_tokens = bindings.prompt_tokens;
+    attempt.completion_tokens = bindings.completion_tokens;
+    attempt.total_tokens = bindings.total_tokens;
+    attempt.cost_microusd = bindings.cost_microusd;
+    attempt.latency_milliseconds = bindings.latency_milliseconds;
+    attempt.heartbeat_at = now;
+    attempt.finished_at = Some(now);
+    attempt.artifact_id = artifact_id.map(str::to_owned);
+    attempt.output_digest = failure.and_then(|(_, digest)| digest).map_or_else(
+        || Some(output_digest.as_str().to_owned()),
+        |digest| Some(digest.as_str().to_owned()),
+    );
+
+    let (terminal, outcome) = if let Some((failure, _)) = failure {
+        attempt.state = GenerationAttemptState::Failed.as_str().to_owned();
+        attempt.failure_class = Some(failure.code.class().as_str().to_owned());
+        attempt.failure_code = Some(failure.code.as_str().to_owned());
+        attempt.provider_status = failure.provider_status.map(i32::from);
+        attempt.provider_request_id = failure.provider_request_id.clone();
+        let attempt_count = match u8::try_from(job.attempt_count) {
+            Ok(value) => value,
+            Err(_) => return Ok(Err(GenerationJobStoreError::NumericRange)),
+        };
+        let retry = allow_retry
+            .then(|| purpose.retry_delay(failure.code, attempt_count))
+            .flatten()
+            .filter(|_| job.attempt_count < job.max_attempts);
+        if let Some(delay) = retry {
+            job.state = GenerationJobState::Queued.as_str().to_owned();
+            job.available_at = add_duration(now, delay);
+            job.last_failure_class = Some(failure.code.class().as_str().to_owned());
+            job.last_failure_code = Some(failure.code.as_str().to_owned());
+            job.output_digest = failure
+                .output_digest
+                .as_ref()
+                .map(|digest| digest.as_str().to_owned());
+            (false, GenerationAttemptFinishOutcome::RetryScheduled)
+        } else {
+            job.state = GenerationJobState::Failed.as_str().to_owned();
+            job.last_failure_class = Some(failure.code.class().as_str().to_owned());
+            job.last_failure_code = Some(failure.code.as_str().to_owned());
+            job.output_digest = failure
+                .output_digest
+                .as_ref()
+                .map(|digest| digest.as_str().to_owned());
+            job.retention_class = GenerationRetentionClass::FailedMetadata7Days
+                .as_str()
+                .to_owned();
+            job.purge_at = Some(add_duration(now, FAILED_RETENTION));
+            job.completed_at = Some(now);
+            (true, GenerationAttemptFinishOutcome::Failed)
+        }
+    } else {
+        attempt.state = GenerationAttemptState::Succeeded.as_str().to_owned();
+        job.state = GenerationJobState::Succeeded.as_str().to_owned();
+        job.output_digest = Some(output_digest.as_str().to_owned());
+        job.artifact_id = artifact_id.map(str::to_owned);
+        job.completed_at = Some(now);
+        let success_retention = match job.success_retention.parse::<SuccessRetention>() {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        match (artifact_id, success_retention) {
+            (None, _) | (Some(_), SuccessRetention::UnselectedPresentation30Days) => {
+                job.retention_class = GenerationRetentionClass::UnselectedPresentation30Days
+                    .as_str()
+                    .to_owned();
+                job.purge_at = Some(add_duration(now, UNSELECTED_RETENTION));
+            }
+            (Some(_), SuccessRetention::CampaignLifetime) => {
+                job.retention_class = GenerationRetentionClass::CampaignLifetime
+                    .as_str()
+                    .to_owned();
+                job.purge_at = None;
+            }
+        }
+        (true, GenerationAttemptFinishOutcome::Succeeded)
+    };
+    job.lease_owner = None;
+    job.lease_token_digest = None;
+    job.lease_expires_at = None;
+    job.updated_at = now;
+    if failure.is_none() {
+        job.pending_artifact_id = None;
+    } else if terminal {
+        retire_pending_artifact(store, session, &job, add_duration(now, FAILED_RETENTION)).await?;
+    }
+
+    match record_generation_attempt_usage(store, session, &job.id, purpose, usage, terminal).await?
+    {
+        Ok(()) => {}
+        Err(error) => return Ok(Err(error)),
+    }
+    let replaced = jobs
+        .replace_one(
+            doc! {
+                "_id": &job.id,
+                "state": "running",
+                "lease_owner": &lease.worker_id,
+                "lease_token_digest": &lease_digest,
+                "lease_expires_at": { "$gt": now },
+            },
+            job.clone(),
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("finish generation job", error))?;
+    if replaced.matched_count != 1 {
+        return Ok(Err(GenerationJobStoreError::LostLease));
+    }
+    if let Some(artifact) = artifact {
+        let published = store
+            .document_collection(CollectionName::GeneratedAssets)
+            .update_one(
+                doc! {
+                    "_id": &artifact.id,
+                    "job_id": &artifact.job_id,
+                    "campaign_id": &artifact.campaign_id,
+                    "entity_kind": &artifact.entity_kind,
+                    "state": &artifact.state,
+                },
+                doc! { "$set": { "state": "published", "updated_at": now } },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(|error| PersistenceError::mongo("publish generated artifact", error))?;
+        if published.matched_count != 1 {
+            return Err(PersistenceError::SchemaDrift {
+                collection: CollectionName::GeneratedAssets.as_str().to_owned(),
+                detail: "validated artifact disappeared during generation settlement".to_owned(),
+            });
+        }
+    }
+    insert_job_audit(
+        store,
+        session,
+        &job,
+        if failure.is_some() {
+            "attempt_failed"
+        } else {
+            "attempt_succeeded"
+        },
+        job.state.as_str(),
+    )
+    .await?;
+    Ok(Ok((job, outcome)))
+}
+
+pub(super) async fn load_leased_job_in_transaction(
+    store: &MongoStore,
+    session: &mut ClientSession,
+    lease: &GenerationLease,
+) -> Result<Option<GenerationJobDocument>, PersistenceError> {
+    let now = DateTime::now();
+    let lease_digest = opaque_digest("generation-lease-token/v1", &lease.lease_token);
+    generation_jobs(store)
+        .find_one(doc! {
+            "_id": &lease.job_id,
+            "state": "running",
+            "lease_owner": &lease.worker_id,
+            "lease_token_digest": &lease_digest,
+            "lease_expires_at": { "$gt": now },
+            "attempts": {
+                "$elemMatch": {
+                    "_id": &lease.attempt_id,
+                    "state": "running",
+                    "lease_owner": &lease.worker_id,
+                    "lease_token_digest": &lease_digest,
+                }
+            },
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load leased generation job", error))
+}
+
+async fn retire_pending_artifact(
+    store: &MongoStore,
+    session: &mut ClientSession,
+    job: &GenerationJobDocument,
+    purge_at: DateTime,
+) -> Result<(), PersistenceError> {
+    let Some(artifact_id) = job.pending_artifact_id.as_deref() else {
+        return Ok(());
+    };
+    let retired = store
+        .document_collection(CollectionName::GeneratedAssets)
+        .update_one(
+            doc! {
+                "_id": artifact_id,
+                "job_id": &job.id,
+                "campaign_id": &job.campaign_id,
+                "entity_kind": "turn_scene_image",
+                "state": "staged",
+            },
+            doc! {
+                "$set": {
+                    "state": "superseded",
+                    "selected": false,
+                    "purge_at": purge_at,
+                    "updated_at": DateTime::now(),
+                },
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("retire pending generation artifact", error))?;
+    if retired.matched_count != 1 {
+        return Err(PersistenceError::SchemaDrift {
+            collection: CollectionName::GeneratedAssets.as_str().to_owned(),
+            detail: "pending generation artifact is missing or no longer staged".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+impl GenerationAttemptDocument {
+    fn to_public(&self, job_id: &str) -> Result<GenerationAttempt, GenerationJobStoreError> {
+        let usage = GenerationUsage {
+            prompt_tokens: optional_i64(self.prompt_tokens)?,
+            completion_tokens: optional_i64(self.completion_tokens)?,
+            total_tokens: optional_i64(self.total_tokens)?,
+            cost_microusd: optional_i64(self.cost_microusd)?,
+            latency_milliseconds: optional_i64(self.latency_milliseconds)?,
+        };
+        validate_usage(&usage)?;
+        Ok(GenerationAttempt {
+            id: self.id.clone(),
+            job_id: job_id.to_owned(),
+            attempt_number: u8::try_from(self.attempt_number)
+                .map_err(|_| GenerationJobStoreError::NumericRange)?,
+            state: self.state.parse()?,
+            lease_owner: self.lease_owner.clone(),
+            lease_token: self.lease_token_digest.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            usage,
+            failure_class: self.failure_class.as_deref().map(str::parse).transpose()?,
+            failure_code: self.failure_code.as_deref().map(str::parse).transpose()?,
+            provider_status: self
+                .provider_status
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|_| GenerationJobStoreError::NumericRange)?,
+            provider_request_id: self.provider_request_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            output_digest: self
+                .output_digest
+                .as_deref()
+                .map(stored_digest)
+                .transpose()?,
+            started_at: date_string(self.started_at)?,
+            heartbeat_at: date_string(self.heartbeat_at)?,
+            finished_at: self.finished_at.map(date_string).transpose()?,
+            created_at: date_string(self.created_at)?,
+        })
+    }
+}
+
+async fn preflight_illustration_request_limits(
+    store: &MongoStore,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    origin_turn_id: Option<&str>,
+) -> Result<Result<(), GenerationJobStoreError>, PersistenceError> {
+    let Some(origin_turn_id) = origin_turn_id else {
+        return Ok(Err(GenerationJobStoreError::InvalidInput(
+            "illustration jobs require an origin turn",
+        )));
+    };
+    let receipts = store.document_collection(CollectionName::CommandReceipts);
+    let base = doc! {
+        "scope_kind": enqueue_scope_kind(GenerationPurpose::Illustration),
+        "scope_id": campaign_id,
+        "command_kind": "enqueue_generation_job",
+        "state": "committed",
+    };
+    let lifetime = receipts
+        .count_documents(base.clone())
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("count lifetime illustration requests", error))?;
+    let mut rolling_filter = base.clone();
+    rolling_filter.insert(
+        "created_at",
+        doc! { "$gt": DateTime::from_millis(
+            DateTime::now().timestamp_millis().saturating_sub(24 * 60 * 60 * 1_000)
+        ) },
+    );
+    let rolling = receipts
+        .count_documents(rolling_filter)
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("count rolling illustration requests", error))?;
+    let mut turn_filter = base;
+    turn_filter.insert("origin_event_id", origin_turn_id);
+    let turn = receipts
+        .count_documents(turn_filter)
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("count turn illustration requests", error))?;
+    if lifetime >= IMAGE_REQUESTS_PER_CAMPAIGN_LIFETIME || rolling >= IMAGE_REQUESTS_PER_ROLLING_DAY
+    {
+        return Ok(Err(GenerationJobStoreError::BudgetExceeded {
+            scope: GenerationBudgetScope::Campaign,
+            dimension: GenerationBudgetDimension::Requests,
+        }));
+    }
+    if turn >= IMAGE_REQUESTS_PER_TURN {
+        return Ok(Err(GenerationJobStoreError::BudgetExceeded {
+            scope: GenerationBudgetScope::Turn,
+            dimension: GenerationBudgetDimension::Requests,
+        }));
+    }
+    Ok(Ok(()))
+}
+
+async fn insert_job_audit(
+    store: &MongoStore,
+    session: &mut ClientSession,
+    job: &GenerationJobDocument,
+    action: &str,
+    outcome: &str,
+) -> Result<(), PersistenceError> {
+    store
+        .document_collection(CollectionName::AuditEvents)
+        .insert_one(doc! {
+            "_id": format!("audit:{}", Uuid::new_v4()),
+            "schema_version": SCHEMA_VERSION,
+            "category": "generation",
+            "action": action,
+            "outcome": outcome,
+            "scope_kind": "generation_job",
+            "scope_id": &job.id,
+            "correlation_id": job.correlation_id.clone()
+                .unwrap_or_else(|| format!("correlation:{}", Uuid::new_v4())),
+            "metadata": {
+                "campaign_id": &job.campaign_id,
+                "purpose": &job.purpose,
+                "attempt_count": job.attempt_count,
+            },
+            "created_at": DateTime::now(),
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("insert generation audit", error))?;
+    Ok(())
 }
 
 fn validate_new_job(job: &NewGenerationJob) -> Result<(), GenerationJobStoreError> {
@@ -1527,62 +2220,6 @@ fn validate_new_job(job: &NewGenerationJob) -> Result<(), GenerationJobStoreErro
     }
     if let Some(correlation_id) = job.correlation_id.as_deref() {
         validate_identifier(correlation_id, "correlation id is invalid")?;
-    }
-    Ok(())
-}
-
-async fn preflight_illustration_request_limits(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    origin_turn_id: Option<&str>,
-) -> Result<(), GenerationJobStoreError> {
-    let Some(origin_turn_id) = origin_turn_id else {
-        return Err(GenerationJobStoreError::InvalidInput(
-            "illustration jobs require an origin turn",
-        ));
-    };
-    let row = sqlx::query(
-        "SELECT
-            COUNT(*)::BIGINT AS lifetime_count,
-            COUNT(*) FILTER (
-                WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
-            )::BIGINT AS rolling_count,
-            COUNT(*) FILTER (WHERE origin_turn_id = $2)::BIGINT AS turn_count
-         FROM generation_governance_receipts
-         WHERE campaign_session_id = $1 AND purpose = 'illustration'",
-    )
-    .bind(campaign_session_id)
-    .bind(origin_turn_id)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(GenerationJobStoreError::Database)?;
-    let lifetime = u64::try_from(
-        row.try_get::<i64, _>("lifetime_count")
-            .map_err(GenerationJobStoreError::Database)?,
-    )
-    .map_err(|_| GenerationJobStoreError::NumericRange)?;
-    let rolling = u64::try_from(
-        row.try_get::<i64, _>("rolling_count")
-            .map_err(GenerationJobStoreError::Database)?,
-    )
-    .map_err(|_| GenerationJobStoreError::NumericRange)?;
-    let turn = u64::try_from(
-        row.try_get::<i64, _>("turn_count")
-            .map_err(GenerationJobStoreError::Database)?,
-    )
-    .map_err(|_| GenerationJobStoreError::NumericRange)?;
-    if lifetime >= IMAGE_REQUESTS_PER_CAMPAIGN_LIFETIME || rolling >= IMAGE_REQUESTS_PER_ROLLING_DAY
-    {
-        return Err(GenerationJobStoreError::BudgetExceeded {
-            scope: GenerationBudgetScope::Campaign,
-            dimension: GenerationBudgetDimension::Requests,
-        });
-    }
-    if turn >= IMAGE_REQUESTS_PER_TURN {
-        return Err(GenerationJobStoreError::BudgetExceeded {
-            scope: GenerationBudgetScope::Turn,
-            dimension: GenerationBudgetDimension::Requests,
-        });
     }
     Ok(())
 }
@@ -1668,9 +2305,6 @@ fn ensure_matching_replay(
     existing: &GenerationJob,
     requested: &NewGenerationJob,
 ) -> Result<(), GenerationJobStoreError> {
-    // The proposed row ID and transport correlation ID may differ on a retry;
-    // they do not alter the generation intent. Everything that can affect the
-    // produced artifact is bound to the idempotency key.
     if existing.campaign_session_id != requested.campaign_session_id
         || existing.origin_turn_id != requested.origin_turn_id
         || existing.origin_campaign_revision != requested.origin_campaign_revision
@@ -1688,38 +2322,73 @@ fn ensure_matching_replay(
     Ok(())
 }
 
-fn validate_identifier(value: &str, reason: &'static str) -> Result<(), GenerationJobStoreError> {
-    if !is_valid_opaque_id(value) {
-        return Err(GenerationJobStoreError::InvalidInput(reason));
+fn enqueue_fingerprint(job: &NewGenerationJob) -> Sha256Digest {
+    let governance = job.governance.as_ref();
+    let revision = job.origin_campaign_revision.to_string();
+    let max_attempts = job.max_attempts.to_string();
+    let reserved_requests = governance
+        .map(|value| value.reserved_requests)
+        .unwrap_or_default()
+        .to_string();
+    let reserved_tokens = governance
+        .map(|value| value.reserved_tokens)
+        .unwrap_or_default()
+        .to_string();
+    let reserved_latency = governance
+        .map(|value| value.reserved_latency_milliseconds)
+        .unwrap_or_default()
+        .to_string();
+    let reserved_cost = governance
+        .map(|value| value.reserved_cost_microusd)
+        .unwrap_or_default()
+        .to_string();
+    let fields = [
+        job.campaign_session_id.as_str(),
+        job.origin_turn_id.as_deref().unwrap_or(""),
+        revision.as_str(),
+        job.purpose.as_str(),
+        job.idempotency_key.as_str(),
+        job.input_digest.as_str(),
+        job.prompt_digest.as_str(),
+        job.policy_digest.as_str(),
+        job.config_digest.as_str(),
+        max_attempts.as_str(),
+        job.success_retention.as_str(),
+        governance
+            .map(|value| value.governance_fingerprint.as_str())
+            .unwrap_or(""),
+        reserved_requests.as_str(),
+        reserved_tokens.as_str(),
+        reserved_latency.as_str(),
+        reserved_cost.as_str(),
+    ];
+    let mut hasher = Sha256::new();
+    let domain = b"generation-enqueue/v1";
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
     }
-    Ok(())
+    Sha256Digest::from_bytes(hasher.finalize().into())
 }
 
-fn map_enqueue_error(error: sqlx::Error) -> GenerationJobStoreError {
-    if error
-        .as_database_error()
-        .is_some_and(|database_error| database_error.is_unique_violation())
-    {
-        GenerationJobStoreError::InvalidInput("generation job id already exists")
-    } else {
-        GenerationJobStoreError::Database(error)
+fn opaque_digest(domain: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain.as_bytes());
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn enqueue_scope_kind(purpose: GenerationPurpose) -> &'static str {
+    match purpose {
+        GenerationPurpose::IntentParsing => "generation_intent_parsing",
+        GenerationPurpose::GmPlanning => "generation_gm_planning",
+        GenerationPurpose::Narration => "generation_narration",
+        GenerationPurpose::Illustration => "generation_illustration",
     }
-}
-
-fn duration_millis(duration: Duration) -> Result<i64, GenerationJobStoreError> {
-    i64::try_from(duration.as_millis()).map_err(|_| GenerationJobStoreError::NumericRange)
-}
-
-fn to_i64(value: u64) -> Result<i64, GenerationJobStoreError> {
-    i64::try_from(value).map_err(|_| GenerationJobStoreError::NumericRange)
-}
-
-fn from_i64(value: i64) -> Result<u64, GenerationJobStoreError> {
-    u64::try_from(value).map_err(|_| GenerationJobStoreError::NumericRange)
-}
-
-fn from_i16(value: i16) -> Result<u8, GenerationJobStoreError> {
-    u8::try_from(value).map_err(|_| GenerationJobStoreError::NumericRange)
 }
 
 pub(super) struct UsageBindings {
@@ -1741,115 +2410,6 @@ pub(super) fn usage_bindings(
         cost_microusd: usage.cost_microusd.map(to_i64).transpose()?,
         latency_milliseconds: usage.latency_milliseconds.map(to_i64).transpose()?,
     })
-}
-
-fn digest_from_row(row: &PgRow, column: &str) -> Result<Sha256Digest, GenerationJobStoreError> {
-    let value: String = row
-        .try_get(column)
-        .map_err(GenerationJobStoreError::Database)?;
-    Sha256Digest::new(value)
-        .map_err(|_| GenerationJobStoreError::InvalidStoredData("invalid stored digest"))
-}
-
-fn optional_digest_from_row(
-    row: &PgRow,
-    column: &str,
-) -> Result<Option<Sha256Digest>, GenerationJobStoreError> {
-    row.try_get::<Option<String>, _>(column)
-        .map_err(GenerationJobStoreError::Database)?
-        .map(Sha256Digest::new)
-        .transpose()
-        .map_err(|_| GenerationJobStoreError::InvalidStoredData("invalid stored digest"))
-}
-
-fn job_from_row(row: PgRow) -> Result<GenerationJob, GenerationJobStoreError> {
-    let purpose: String = row
-        .try_get("purpose")
-        .map_err(GenerationJobStoreError::Database)?;
-    let state: String = row
-        .try_get("state")
-        .map_err(GenerationJobStoreError::Database)?;
-    let success_retention: String = row
-        .try_get("success_retention_class")
-        .map_err(GenerationJobStoreError::Database)?;
-    let last_failure_class: Option<String> = row
-        .try_get("last_failure_class")
-        .map_err(GenerationJobStoreError::Database)?;
-    let last_failure_code: Option<String> = row
-        .try_get("last_failure_code")
-        .map_err(GenerationJobStoreError::Database)?;
-    let job = GenerationJob {
-        id: row
-            .try_get("id")
-            .map_err(GenerationJobStoreError::Database)?,
-        campaign_session_id: row
-            .try_get("campaign_session_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        origin_turn_id: row
-            .try_get("origin_turn_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        origin_campaign_revision: from_i64(
-            row.try_get("origin_campaign_revision")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        purpose: purpose.parse()?,
-        idempotency_key: row
-            .try_get("idempotency_key")
-            .map_err(GenerationJobStoreError::Database)?,
-        state: state.parse()?,
-        input_digest: digest_from_row(&row, "input_digest")?,
-        prompt_digest: digest_from_row(&row, "prompt_digest")?,
-        policy_digest: digest_from_row(&row, "policy_digest")?,
-        config_digest: digest_from_row(&row, "config_digest")?,
-        output_digest: optional_digest_from_row(&row, "output_digest")?,
-        correlation_id: row
-            .try_get("correlation_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        attempt_count: from_i16(
-            row.try_get("attempt_count")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        max_attempts: from_i16(
-            row.try_get("max_attempts")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        retry_at: row
-            .try_get("retry_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        lease_owner: row
-            .try_get("lease_owner")
-            .map_err(GenerationJobStoreError::Database)?,
-        lease_token: row
-            .try_get("lease_token")
-            .map_err(GenerationJobStoreError::Database)?,
-        lease_expires_at: row
-            .try_get("lease_expires_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        last_failure_class: last_failure_class.map(|value| value.parse()).transpose()?,
-        last_failure_code: last_failure_code.map(|value| value.parse()).transpose()?,
-        artifact_id: row
-            .try_get("artifact_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        success_retention: success_retention.parse()?,
-        retention_class: row
-            .try_get::<String, _>("retention_class")
-            .map_err(GenerationJobStoreError::Database)?
-            .parse()?,
-        retention_delete_after: row
-            .try_get("retention_delete_after")
-            .map_err(GenerationJobStoreError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        completed_at: row
-            .try_get("completed_at")
-            .map_err(GenerationJobStoreError::Database)?,
-    };
-    validate_loaded_job(&job)?;
-    Ok(job)
 }
 
 fn validate_loaded_job(job: &GenerationJob) -> Result<(), GenerationJobStoreError> {
@@ -1874,224 +2434,89 @@ fn validate_loaded_job(job: &GenerationJob) -> Result<(), GenerationJobStoreErro
     Ok(())
 }
 
-fn attempt_from_row(row: PgRow) -> Result<GenerationAttempt, GenerationJobStoreError> {
-    let state: String = row
-        .try_get("state")
-        .map_err(GenerationJobStoreError::Database)?;
-    let failure_class: Option<String> = row
-        .try_get("failure_class")
-        .map_err(GenerationJobStoreError::Database)?;
-    let failure_code: Option<String> = row
-        .try_get("failure_code")
-        .map_err(GenerationJobStoreError::Database)?;
-    let provider_status: Option<i16> = row
-        .try_get("provider_status")
-        .map_err(GenerationJobStoreError::Database)?;
-    let usage = GenerationUsage {
-        prompt_tokens: optional_i64(
-            row.try_get("prompt_tokens")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        completion_tokens: optional_i64(
-            row.try_get("completion_tokens")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        total_tokens: optional_i64(
-            row.try_get("total_tokens")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        cost_microusd: optional_i64(
-            row.try_get("cost_microusd")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        latency_milliseconds: optional_i64(
-            row.try_get("latency_milliseconds")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-    };
-    validate_usage(&usage)?;
-    let attempt = GenerationAttempt {
-        id: row
-            .try_get("id")
-            .map_err(GenerationJobStoreError::Database)?,
-        job_id: row
-            .try_get("job_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        attempt_number: from_i16(
-            row.try_get("attempt_number")
-                .map_err(GenerationJobStoreError::Database)?,
-        )?,
-        state: state.parse()?,
-        lease_owner: row
-            .try_get("lease_owner")
-            .map_err(GenerationJobStoreError::Database)?,
-        lease_token: row
-            .try_get("lease_token")
-            .map_err(GenerationJobStoreError::Database)?,
-        provider: row
-            .try_get("provider")
-            .map_err(GenerationJobStoreError::Database)?,
-        model: row
-            .try_get("model")
-            .map_err(GenerationJobStoreError::Database)?,
-        usage,
-        failure_class: failure_class.map(|value| value.parse()).transpose()?,
-        failure_code: failure_code.map(|value| value.parse()).transpose()?,
-        provider_status: provider_status
-            .map(|value| u16::try_from(value).map_err(|_| GenerationJobStoreError::NumericRange))
-            .transpose()?,
-        provider_request_id: row
-            .try_get("provider_request_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        artifact_id: row
-            .try_get("artifact_id")
-            .map_err(GenerationJobStoreError::Database)?,
-        output_digest: optional_digest_from_row(&row, "output_digest")?,
-        started_at: row
-            .try_get("started_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        heartbeat_at: row
-            .try_get("heartbeat_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        finished_at: row
-            .try_get("finished_at")
-            .map_err(GenerationJobStoreError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(GenerationJobStoreError::Database)?,
-    };
-    validate_identifier(&attempt.id, "stored attempt id is invalid")?;
-    validate_identifier(&attempt.job_id, "stored attempt job id is invalid")?;
-    validate_identifier(&attempt.lease_owner, "stored attempt worker is invalid")?;
-    validate_identifier(&attempt.lease_token, "stored attempt lease is invalid")?;
-    if attempt.attempt_number == 0
-        || attempt.attempt_number > MAX_ATTEMPTS
-        || attempt.started_at.is_empty()
-        || attempt.heartbeat_at.is_empty()
-        || attempt.created_at.is_empty()
-    {
-        return Err(GenerationJobStoreError::InvalidStoredData(
-            "stored attempt bounds are invalid",
-        ));
+fn generation_jobs(store: &MongoStore) -> Collection<GenerationJobDocument> {
+    store.collection(CollectionName::GenerationJobs)
+}
+
+fn enqueue_receipts(store: &MongoStore) -> Collection<EnqueueReceiptDocument> {
+    store.collection(CollectionName::CommandReceipts)
+}
+
+async fn operation<T>(
+    store: &MongoStore,
+    operation: &'static str,
+    future: impl IntoFuture<Output = mongodb::error::Result<T>>,
+) -> Result<T, GenerationJobStoreError> {
+    tokio::time::timeout(store.operation_timeout(), future.into_future())
+        .await
+        .map_err(|_| {
+            GenerationJobStoreError::Database(PersistenceError::OperationTimeout { operation })
+        })?
+        .map_err(|error| {
+            GenerationJobStoreError::Database(PersistenceError::mongo(operation, error))
+        })
+}
+
+fn map_database(error: PersistenceError) -> GenerationJobStoreError {
+    if error.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey) {
+        GenerationJobStoreError::IdempotencyConflict
+    } else {
+        GenerationJobStoreError::Database(error)
     }
-    Ok(attempt)
+}
+
+fn stored_digest(value: &str) -> Result<Sha256Digest, GenerationJobStoreError> {
+    Sha256Digest::new(value.to_owned())
+        .map_err(|_| GenerationJobStoreError::InvalidStoredData("invalid stored digest"))
+}
+
+fn validate_identifier(value: &str, reason: &'static str) -> Result<(), GenerationJobStoreError> {
+    if !is_valid_opaque_id(value) {
+        return Err(GenerationJobStoreError::InvalidInput(reason));
+    }
+    Ok(())
+}
+
+fn to_i64(value: u64) -> Result<i64, GenerationJobStoreError> {
+    i64::try_from(value).map_err(|_| GenerationJobStoreError::NumericRange)
+}
+
+fn from_i64(value: i64) -> Result<u64, GenerationJobStoreError> {
+    u64::try_from(value).map_err(|_| GenerationJobStoreError::NumericRange)
 }
 
 fn optional_i64(value: Option<i64>) -> Result<Option<u64>, GenerationJobStoreError> {
     value.map(from_i64).transpose()
 }
 
+fn date_string(value: DateTime) -> Result<String, GenerationJobStoreError> {
+    value.try_to_rfc3339_string().map_err(|_| {
+        GenerationJobStoreError::InvalidStoredData("stored BSON date is outside RFC 3339 range")
+    })
+}
+
+fn add_duration(value: DateTime, duration: Duration) -> DateTime {
+    DateTime::from_millis(
+        value
+            .timestamp_millis()
+            .saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use sqlx::PgPool;
-
     use super::*;
-    use crate::repository::MIGRATOR;
-
-    fn repository(pool: PgPool) -> PostgresRepository {
-        PostgresRepository::from_pool(pool)
-    }
-
-    async fn seed_campaign(pool: &PgPool, id: &str, revision: i64) {
-        sqlx::query(
-            "INSERT INTO campaign_sessions (id, schema_version, revision, payload_json)
-             VALUES ($1, 1, $2, '{}'::jsonb)",
-        )
-        .bind(id)
-        .bind(revision)
-        .execute(pool)
-        .await
-        .expect("campaign fixture should insert");
-    }
-
-    async fn seed_turn(pool: &PgPool, campaign_id: &str, turn_id: &str) {
-        seed_turn_number(pool, campaign_id, turn_id, 1).await;
-    }
-
-    async fn seed_turn_number(pool: &PgPool, campaign_id: &str, turn_id: &str, turn_number: i64) {
-        sqlx::query(
-            "INSERT INTO turn_audits
-             (id, campaign_session_id, turn_number, schema_version, payload_json)
-             VALUES ($1, $2, $3, 1, '{}'::jsonb)",
-        )
-        .bind(turn_id)
-        .bind(campaign_id)
-        .bind(turn_number)
-        .execute(pool)
-        .await
-        .expect("turn fixture should insert");
-    }
-
-    async fn seed_artifact(pool: &PgPool, campaign_id: &str, artifact_id: &str) {
-        sqlx::query(
-            "INSERT INTO generated_assets
-             (id, campaign_session_id, asset_kind, provider, model, location, metadata_json)
-             VALUES ($1, $2, 'narration', 'fake', 'fake-v1',
-                     'campaign/artifact.json', '{}'::jsonb)",
-        )
-        .bind(artifact_id)
-        .bind(campaign_id)
-        .execute(pool)
-        .await
-        .expect("artifact fixture should insert");
-    }
-
-    fn new_job(id: &str, key: &str) -> NewGenerationJob {
-        NewGenerationJob {
-            id: id.to_owned(),
-            campaign_session_id: "campaign-1".to_owned(),
-            origin_turn_id: None,
-            origin_campaign_revision: 1,
-            purpose: GenerationPurpose::IntentParsing,
-            idempotency_key: key.to_owned(),
-            input_digest: Sha256Digest::from_bytes([1; 32]),
-            prompt_digest: Sha256Digest::from_bytes([2; 32]),
-            policy_digest: Sha256Digest::from_bytes([3; 32]),
-            config_digest: Sha256Digest::from_bytes([4; 32]),
-            correlation_id: Some("correlation-1".to_owned()),
-            max_attempts: 3,
-            success_retention: SuccessRetention::UnselectedPresentation30Days,
-            governance: None,
-        }
-    }
-
-    fn claim(worker_id: &str) -> GenerationClaim {
-        GenerationClaim {
-            worker_id: worker_id.to_owned(),
-            provider: "fake".to_owned(),
-            model: "fake-v1".to_owned(),
-            lease_duration: Duration::from_secs(30),
-        }
-    }
-
-    fn illustration_governance(turn_scope_key: &str) -> NewGenerationGovernanceReceipt {
-        let allowance = crate::config::GenerationBudgetAllowance {
-            requests: 100,
-            tokens: 100_000,
-            latency_milliseconds: 100_000,
-            cost_microusd: 100_000,
-        };
-        NewGenerationGovernanceReceipt {
-            turn_scope_key: turn_scope_key.to_owned(),
-            request_fingerprint: Sha256Digest::from_bytes([1; 32]),
-            policy_fingerprint: Sha256Digest::from_bytes([3; 32]),
-            config_fingerprint: Sha256Digest::from_bytes([4; 32]),
-            governance_fingerprint: Sha256Digest::from_bytes([5; 32]),
-            reserved_requests: 1,
-            reserved_tokens: 0,
-            reserved_latency_milliseconds: 1_000,
-            reserved_cost_microusd: 0,
-            limits: crate::config::GenerationGovernanceConfig {
-                campaign: allowance,
-                turn: allowance,
-                max_campaign_concurrency: 2,
-                worker_batch_size: 2,
-            },
-        }
-    }
+    use crate::{
+        config::{
+            GenerationBudgetAllowance, GenerationGovernanceConfig, MongoConfig, MongoSchemaPolicy,
+            SecretString,
+        },
+        persistence::SchemaReconciler,
+        repository::MongoRepository,
+    };
 
     #[test]
-    fn transient_classification_is_a_closed_allowlist() {
+    fn transient_classification_is_closed() {
         assert!(GenerationFailureCode::Timeout.retryable());
         assert!(GenerationFailureCode::ProviderUnavailable.retryable());
         assert!(GenerationFailureCode::RateLimited.retryable());
@@ -2106,825 +2531,386 @@ mod tests {
             GenerationFailureCode::Cancelled,
         ] {
             assert!(!permanent.retryable());
-            assert_eq!(permanent.class(), GenerationFailureClass::Permanent);
         }
     }
 
     #[test]
-    fn postgres_transaction_retry_classification_is_narrow() {
-        assert!(transient_postgres_sqlstate("40001"));
-        assert!(transient_postgres_sqlstate("40P01"));
-        for fail_closed in ["08006", "23505", "23503", "57014", "XX000", ""] {
-            assert!(!transient_postgres_sqlstate(fail_closed));
-        }
-        assert!(!GenerationJobStoreError::InvalidInput("fixture").retryable_database_transaction());
+    fn enqueue_fingerprint_ignores_server_row_id_and_correlation_only() {
+        let mut first = NewGenerationJob {
+            id: "generation-job:first".to_owned(),
+            campaign_session_id: "campaign:test".to_owned(),
+            origin_turn_id: None,
+            origin_campaign_revision: 1,
+            purpose: GenerationPurpose::IntentParsing,
+            idempotency_key: "generation-key:test".to_owned(),
+            input_digest: Sha256Digest::from_bytes([1; 32]),
+            prompt_digest: Sha256Digest::from_bytes([2; 32]),
+            policy_digest: Sha256Digest::from_bytes([3; 32]),
+            config_digest: Sha256Digest::from_bytes([4; 32]),
+            correlation_id: Some("correlation:first".to_owned()),
+            max_attempts: 1,
+            success_retention: SuccessRetention::UnselectedPresentation30Days,
+            governance: None,
+        };
+        let original = enqueue_fingerprint(&first);
+        first.id = "generation-job:retry".to_owned();
+        first.correlation_id = Some("correlation:retry".to_owned());
+        assert_eq!(enqueue_fingerprint(&first), original);
+        first.input_digest = Sha256Digest::from_bytes([9; 32]);
+        assert_ne!(enqueue_fingerprint(&first), original);
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn duplicate_enqueue_replays_exact_metadata_and_rejects_changed_intent(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        let original = new_job("job-1", "generation-key-1");
-        let created = repository
-            .enqueue_generation_job(&original)
-            .await
-            .expect("first enqueue should succeed");
-        assert!(matches!(created, EnqueueGenerationJobOutcome::Enqueued(_)));
+    #[test]
+    fn lease_storage_is_one_way() {
+        let raw = "generation-lease:secret";
+        let stored = opaque_digest("generation-lease-token/v1", raw);
+        assert!(stored.starts_with("sha256:"));
+        assert!(!stored.contains(raw));
+    }
 
-        sqlx::query("UPDATE campaign_sessions SET revision = 2 WHERE id = 'campaign-1'")
-            .execute(&pool)
-            .await
-            .expect("fixture revision should advance");
-        let mut replay = original.clone();
-        replay.id = "job-from-retry".to_owned();
-        replay.correlation_id = Some("correlation-from-retry".to_owned());
-        let replayed = repository
-            .enqueue_generation_job(&replay)
-            .await
-            .expect("matching retry should return the original before revision checks");
-        assert!(matches!(replayed, EnqueueGenerationJobOutcome::Existing(_)));
-        assert_eq!(replayed.job().id, "job-1");
+    #[tokio::test]
+    async fn live_mongo_enqueue_lease_budget_and_retention_contract() {
+        let Some((repository, store, database)) = isolated_mongo_repository().await else {
+            return;
+        };
+        let campaign_id = "campaign:generation-contract";
+        let budget_campaign_id = "campaign:budget-contract";
+        let turn_id = "turn:generation-contract";
+        seed_campaign(&store, campaign_id, 10).await;
+        seed_campaign(&store, budget_campaign_id, 10).await;
+        seed_turn(&store, campaign_id, turn_id, 0).await;
 
-        let mut conflict = replay;
-        conflict.input_digest = Sha256Digest::from_bytes([9; 32]);
+        let request = live_job(
+            "generation-job:lease-contract",
+            campaign_id,
+            Some(turn_id),
+            1,
+            GenerationPurpose::Narration,
+            "command:lease-contract",
+            None,
+        );
         assert!(matches!(
-            repository.enqueue_generation_job(&conflict).await,
+            repository.enqueue_generation_job(&request).await.unwrap(),
+            EnqueueGenerationJobOutcome::Enqueued(_)
+        ));
+        assert!(matches!(
+            repository.enqueue_generation_job(&request).await.unwrap(),
+            EnqueueGenerationJobOutcome::Existing(_)
+        ));
+        let mut drift = request.clone();
+        drift.input_digest = test_digest(99);
+        assert!(matches!(
+            repository.enqueue_generation_job(&drift).await,
             Err(GenerationJobStoreError::IdempotencyConflict)
         ));
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM generation_jobs")
-            .fetch_one(&pool)
-            .await
-            .expect("count should load");
-        assert_eq!(count, 1);
-    }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn concurrent_workers_claim_a_job_once(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        repository
-            .enqueue_generation_job(&new_job("job-1", "generation-key-1"))
-            .await
-            .expect("job should enqueue");
-        let first = repository.clone();
-        let second = repository.clone();
-        let first_claim = claim("worker-1");
-        let second_claim = claim("worker-2");
-        let (first_result, second_result) = tokio::join!(
-            first.claim_generation_job(&first_claim),
-            second.claim_generation_job(&second_claim),
+        let first_repository = repository.clone();
+        let second_repository = repository.clone();
+        let first_claim = live_claim("worker:first");
+        let second_claim = live_claim("worker:second");
+        let (first, second) = tokio::join!(
+            first_repository.claim_generation_job_by_id(campaign_id, &request.id, &first_claim),
+            second_repository.claim_generation_job_by_id(campaign_id, &request.id, &second_claim),
         );
-        let results = [
-            first_result.expect("first claim should not fail"),
-            second_result.expect("second claim should not fail"),
-        ];
-        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
-
-        let stored = repository
-            .load_generation_job("campaign-1", "job-1")
-            .await
-            .expect("job should load")
-            .expect("job should exist");
-        assert_eq!(stored.state, GenerationJobState::Running);
-        assert_eq!(stored.attempt_count, 1);
+        let first = first.unwrap();
+        let second = second.unwrap();
         assert_eq!(
-            repository
-                .list_generation_attempts("campaign-1", "job-1")
-                .await
-                .expect("attempts should load")
-                .len(),
+            usize::from(first.is_some()) + usize::from(second.is_some()),
             1
         );
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn exact_claim_never_leases_an_unrelated_ready_job(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        seed_campaign(&pool, "campaign-2", 1).await;
-        let repository = repository(pool.clone());
-        repository
-            .enqueue_generation_job(&new_job("job-first", "generation-key-first"))
+        let expired = first.or(second).unwrap();
+        store
+            .document_collection(CollectionName::GenerationJobs)
+            .update_one(
+                doc! { "_id": &request.id },
+                doc! {
+                    "$set": {
+                        "lease_expires_at": DateTime::from_millis(
+                            DateTime::now().timestamp_millis().saturating_sub(1_000),
+                        ),
+                    },
+                },
+            )
             .await
-            .expect("first job should enqueue");
-        repository
-            .enqueue_generation_job(&new_job("job-requested", "generation-key-requested"))
+            .unwrap();
+        let reclaimed = repository
+            .claim_generation_job_by_id(campaign_id, &request.id, &live_claim("worker:reclaimer"))
             .await
-            .expect("requested job should enqueue");
-
-        assert!(
-            repository
-                .claim_generation_job_by_id(
-                    "campaign-2",
-                    "job-requested",
-                    &claim("wrong-campaign-worker"),
-                )
-                .await
-                .expect("cross-campaign exact claim should be a safe miss")
-                .is_none()
-        );
-        let requested = repository
-            .claim_generation_job_by_id("campaign-1", "job-requested", &claim("inline-worker"))
-            .await
-            .expect("exact claim should work")
-            .expect("requested job should be ready");
-        assert_eq!(requested.job.id, "job-requested");
-
-        let first = repository
-            .load_generation_job("campaign-1", "job-first")
-            .await
-            .expect("first job should load")
-            .expect("first job should exist");
-        assert_eq!(first.state, GenerationJobState::Queued);
-        let claimed_first = repository
-            .claim_generation_job(&claim("background-worker"))
-            .await
-            .expect("general claim should work")
-            .expect("unrelated first job should remain claimable");
-        assert_eq!(claimed_first.job.id, "job-first");
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn expired_lease_is_closed_and_reclaimed_without_reusing_attempt(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        let mut job = new_job("job-1", "generation-key-1");
-        job.max_attempts = 2;
-        repository
-            .enqueue_generation_job(&job)
-            .await
-            .expect("job should enqueue");
-        let first = repository
-            .claim_generation_job(&claim("worker-1"))
-            .await
-            .expect("first claim should work")
-            .expect("job should be ready");
-        sqlx::query(
-            "UPDATE generation_jobs
-             SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
-             WHERE id = 'job-1'",
-        )
-        .execute(&pool)
-        .await
-        .expect("lease should expire");
-
-        let second = repository
-            .claim_generation_job(&claim("worker-2"))
-            .await
-            .expect("reclaim should work")
-            .expect("expired job should be reclaimed");
-        assert_ne!(first.lease.lease_token, second.lease.lease_token);
-        assert_ne!(first.attempt.id, second.attempt.id);
-        assert_eq!(second.job.attempt_count, 2);
-        let attempts = repository
-            .list_generation_attempts("campaign-1", "job-1")
-            .await
-            .expect("attempts should load");
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].state, GenerationAttemptState::Failed);
-        assert_eq!(
-            attempts[0].failure_code,
-            Some(GenerationFailureCode::LeaseExpired)
-        );
-        assert_eq!(attempts[1].state, GenerationAttemptState::Running);
+            .unwrap()
+            .unwrap();
+        assert_ne!(expired.lease.attempt_id, reclaimed.lease.attempt_id);
+        assert_eq!(reclaimed.attempt.attempt_number, 2);
         assert!(matches!(
             repository
-                .heartbeat_generation_job(&first.lease, Duration::from_secs(30))
+                .heartbeat_generation_job(&expired.lease, Duration::from_secs(30))
                 .await,
             Err(GenerationJobStoreError::LostLease)
         ));
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn attempt_cap_terminalizes_an_expired_final_lease(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        let mut job = new_job("job-1", "generation-key-1");
-        job.max_attempts = 1;
         repository
-            .enqueue_generation_job(&job)
-            .await
-            .expect("job should enqueue");
-        repository
-            .claim_generation_job(&claim("worker-1"))
-            .await
-            .expect("claim should work")
-            .expect("job should be ready");
-        sqlx::query(
-            "UPDATE generation_jobs
-             SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
-             WHERE id = 'job-1'",
-        )
-        .execute(&pool)
-        .await
-        .expect("lease should expire");
-        assert!(
-            repository
-                .claim_generation_job(&claim("worker-2"))
-                .await
-                .expect("terminalization should work")
-                .is_none()
-        );
-        let stored = repository
-            .load_generation_job("campaign-1", "job-1")
-            .await
-            .expect("job should load")
-            .expect("job should exist");
-        assert_eq!(stored.state, GenerationJobState::Failed);
-        assert_eq!(
-            stored.retention_class,
-            GenerationRetentionClass::FailedMetadata7Days
-        );
-        assert!(stored.retention_delete_after.is_some());
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn transient_failure_schedules_backoff_and_a_fresh_attempt(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        let mut job = new_job("job-1", "generation-key-1");
-        job.purpose = GenerationPurpose::GmPlanning;
-        repository
-            .enqueue_generation_job(&job)
-            .await
-            .expect("job should enqueue");
-        let first = repository
-            .claim_generation_job(&claim("worker-1"))
-            .await
-            .expect("claim should work")
-            .expect("job should be ready");
-        let outcome = repository
-            .fail_generation_attempt(
-                &first.lease,
-                &GenerationAttemptFailure {
-                    code: GenerationFailureCode::Timeout,
-                    provider_status: None,
-                    provider_request_id: None,
-                    usage: GenerationUsage::default(),
-                    output_digest: None,
-                },
-            )
-            .await
-            .expect("transient failure should commit");
-        assert_eq!(outcome, GenerationAttemptFinishOutcome::RetryScheduled);
-        assert!(
-            repository
-                .claim_generation_job(&claim("worker-too-early"))
-                .await
-                .expect("early poll should work")
-                .is_none()
-        );
-        sqlx::query(
-            "UPDATE generation_jobs
-             SET retry_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
-             WHERE id = 'job-1'",
-        )
-        .execute(&pool)
-        .await
-        .expect("retry fixture should become ready");
-        let second = repository
-            .claim_generation_job(&claim("worker-2"))
-            .await
-            .expect("second claim should work")
-            .expect("backoff should now be due");
-        assert_eq!(second.attempt.attempt_number, 2);
-        assert_ne!(second.lease.lease_token, first.lease.lease_token);
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn text_purposes_complete_metadata_only_with_thirty_day_retention(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        seed_turn(&pool, "campaign-1", "turn-1").await;
-        let repository = repository(pool.clone());
-
-        for (index, purpose) in [
-            GenerationPurpose::IntentParsing,
-            GenerationPurpose::GmPlanning,
-            GenerationPurpose::Narration,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if purpose == GenerationPurpose::Narration {
-                sqlx::query("UPDATE campaign_sessions SET revision = 2 WHERE id = 'campaign-1'")
-                    .execute(&pool)
-                    .await
-                    .expect("narration origin revision should follow turn one");
-            }
-            let mut job = new_job(
-                &format!("metadata-job-{index}"),
-                &format!("metadata-key-{index}"),
-            );
-            job.purpose = purpose;
-            job.origin_turn_id =
-                (purpose == GenerationPurpose::Narration).then(|| "turn-1".to_owned());
-            if purpose == GenerationPurpose::Narration {
-                job.origin_campaign_revision = 2;
-            }
-            // Metadata-only results never inherit campaign-lifetime retention,
-            // even if that was the artifact policy selected at enqueue time.
-            job.success_retention = SuccessRetention::CampaignLifetime;
-            repository
-                .enqueue_generation_job(&job)
-                .await
-                .expect("metadata job should enqueue");
-            let claimed = repository
-                .claim_generation_job(&claim(&format!("metadata-worker-{index}")))
-                .await
-                .expect("claim should work")
-                .expect("metadata job should be ready");
-            assert_eq!(claimed.job.purpose, purpose);
-            let completed = repository
-                .succeed_generation_job(
-                    &claimed.lease,
-                    &GenerationSuccess {
-                        artifact_id: None,
-                        output_digest: Sha256Digest::from_bytes([5; 32]),
-                        usage: GenerationUsage {
-                            prompt_tokens: Some(4),
-                            completion_tokens: Some(2),
-                            total_tokens: Some(6),
-                            cost_microusd: Some(1),
-                            latency_milliseconds: Some(10),
-                        },
-                    },
-                )
-                .await
-                .expect("text job should complete without a fake artifact");
-            assert_eq!(completed.state, GenerationJobState::Succeeded);
-            assert!(completed.artifact_id.is_none());
-            assert_eq!(
-                completed.retention_class,
-                GenerationRetentionClass::UnselectedPresentation30Days
-            );
-            assert!(completed.retention_delete_after.is_some());
-            let attempt = repository
-                .list_generation_attempts("campaign-1", &job.id)
-                .await
-                .expect("attempt should load")
-                .pop()
-                .expect("attempt should exist");
-            assert_eq!(attempt.state, GenerationAttemptState::Succeeded);
-            assert!(attempt.artifact_id.is_none());
-            assert_eq!(attempt.usage.total_tokens, Some(6));
-        }
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn illustration_success_requires_a_campaign_owned_artifact(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 2).await;
-        seed_campaign(&pool, "campaign-2", 1).await;
-        seed_turn(&pool, "campaign-1", "turn-1").await;
-        seed_artifact(&pool, "campaign-1", "artifact-owned").await;
-        seed_artifact(&pool, "campaign-2", "artifact-other-campaign").await;
-        let repository = repository(pool.clone());
-        let mut job = new_job("illustration-job", "illustration-key");
-        job.origin_campaign_revision = 2;
-        job.purpose = GenerationPurpose::Illustration;
-        job.origin_turn_id = Some("turn-1".to_owned());
-        job.governance = Some(illustration_governance("turn-1"));
-        repository
-            .enqueue_generation_job(&job)
-            .await
-            .expect("illustration should enqueue");
-        let claimed = repository
-            .claim_generation_job(&claim("illustration-worker"))
-            .await
-            .expect("claim should work")
-            .expect("illustration should be ready");
-
-        let database_bypass = sqlx::query(
-            "UPDATE generation_jobs
-             SET state = 'succeeded', retry_at = NULL, lease_owner = NULL,
-                 lease_token = NULL, lease_expires_at = NULL,
-                 completed_at = CURRENT_TIMESTAMP,
-                 retention_class = 'unselected_presentation_30d',
-                 retention_delete_after = CURRENT_TIMESTAMP + INTERVAL '30 days'
-             WHERE id = 'illustration-job'",
-        )
-        .execute(&pool)
-        .await;
-        assert!(database_bypass.is_err());
-
-        let metadata_only = GenerationSuccess {
-            artifact_id: None,
-            output_digest: Sha256Digest::from_bytes([5; 32]),
-            usage: GenerationUsage::default(),
-        };
-        assert!(matches!(
-            repository
-                .succeed_generation_job(&claimed.lease, &metadata_only)
-                .await,
-            Err(GenerationJobStoreError::InvalidInput(_))
-        ));
-        let wrong_campaign = GenerationSuccess {
-            artifact_id: Some("artifact-other-campaign".to_owned()),
-            output_digest: Sha256Digest::from_bytes([5; 32]),
-            usage: GenerationUsage::default(),
-        };
-        assert!(matches!(
-            repository
-                .succeed_generation_job(&claimed.lease, &wrong_campaign)
-                .await,
-            Err(GenerationJobStoreError::InvalidInput(_))
-        ));
-        let completed = repository
             .succeed_generation_job(
-                &claimed.lease,
+                &reclaimed.lease,
                 &GenerationSuccess {
-                    artifact_id: Some("artifact-owned".to_owned()),
-                    output_digest: Sha256Digest::from_bytes([5; 32]),
+                    artifact_id: None,
+                    output_digest: test_digest(40),
                     usage: GenerationUsage::default(),
                 },
             )
             .await
-            .expect("campaign-owned artifact should complete illustration");
-        assert_eq!(completed.state, GenerationJobState::Succeeded);
-        assert_eq!(completed.artifact_id.as_deref(), Some("artifact-owned"));
-    }
+            .unwrap();
+        store
+            .document_collection(CollectionName::GenerationJobs)
+            .update_one(
+                doc! { "_id": &request.id },
+                doc! {
+                    "$set": {
+                        "purge_at": DateTime::from_millis(
+                            DateTime::now().timestamp_millis().saturating_sub(1),
+                        ),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .cleanup_generation_metadata(10)
+                .await
+                .unwrap()
+                .operational_jobs_deleted,
+            1
+        );
+        assert!(matches!(
+            repository.enqueue_generation_job(&request).await,
+            Err(GenerationJobStoreError::IdempotencyReceiptClosed)
+        ));
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn illustration_limits_enforce_three_per_day_and_ten_per_lifetime(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 20).await;
-        for number in 1..=11_i64 {
-            seed_turn_number(&pool, "campaign-1", &format!("image-turn-{number}"), number).await;
-        }
-        let repository = repository(pool.clone());
-
-        for number in 1..=10_u64 {
-            if matches!(number, 4 | 7 | 10) {
-                let rejected_number = number;
-                let turn_id = format!("image-turn-{rejected_number}");
-                let mut rejected = new_job(
-                    &format!("image-job-{rejected_number}"),
-                    &format!("image-key-{rejected_number}"),
-                );
-                rejected.origin_turn_id = Some(turn_id.clone());
-                rejected.origin_campaign_revision = rejected_number + 1;
-                rejected.purpose = GenerationPurpose::Illustration;
-                rejected.governance = Some(illustration_governance(&turn_id));
-                assert!(matches!(
-                    repository.enqueue_generation_job(&rejected).await,
+        let governance = live_governance("turn-scope:budget-contract");
+        let first_budget = live_job(
+            "generation-job:budget-one",
+            budget_campaign_id,
+            None,
+            10,
+            GenerationPurpose::IntentParsing,
+            "command:budget-one",
+            Some(governance.clone()),
+        );
+        let mut second_budget = first_budget.clone();
+        second_budget.id = "generation-job:budget-two".to_owned();
+        second_budget.idempotency_key = "command:budget-two".to_owned();
+        second_budget.input_digest = test_digest(41);
+        let first_repository = repository.clone();
+        let second_repository = repository.clone();
+        let (first, second) = tokio::join!(
+            first_repository.enqueue_generation_job(&first_budget),
+            second_repository.enqueue_generation_job(&second_budget),
+        );
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Ok(EnqueueGenerationJobOutcome::Enqueued(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(
+                    result,
                     Err(GenerationJobStoreError::BudgetExceeded {
                         scope: GenerationBudgetScope::Campaign,
                         dimension: GenerationBudgetDimension::Requests,
                     })
-                ));
-                sqlx::query(
-                    "UPDATE generation_governance_receipts
-                     SET created_at = CURRENT_TIMESTAMP - INTERVAL '25 hours'
-                     WHERE campaign_session_id = 'campaign-1'
-                       AND purpose = 'illustration'",
-                )
-                .execute(&pool)
-                .await
-                .unwrap();
-            }
+                ))
+                .count(),
+            1
+        );
+        let accepted = outcomes
+            .into_iter()
+            .find_map(Result::ok)
+            .unwrap()
+            .job()
+            .clone();
+        let claimed = repository
+            .claim_generation_job_by_id(
+                budget_campaign_id,
+                &accepted.id,
+                &live_claim("worker:budget"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .succeed_generation_job(
+                &claimed.lease,
+                &GenerationSuccess {
+                    artifact_id: None,
+                    output_digest: test_digest(42),
+                    usage: GenerationUsage {
+                        prompt_tokens: Some(50),
+                        completion_tokens: Some(100),
+                        total_tokens: Some(150),
+                        cost_microusd: Some(25),
+                        latency_milliseconds: Some(300),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let budget = repository
+            .generation_budget_status(budget_campaign_id, &governance.limits)
+            .await
+            .unwrap();
+        assert_eq!(budget.campaign_tokens.used, 150);
+        let overage = store
+            .document_collection(CollectionName::GenerationBudgetReservations)
+            .count_documents(doc! {
+                "job_id": &accepted.id,
+                "dimension": "tokens",
+                "overage": true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(overage, 1);
 
-            let turn_id = format!("image-turn-{number}");
-            let mut job = new_job(
-                &format!("image-job-{number}"),
-                &format!("image-key-{number}"),
-            );
-            job.origin_turn_id = Some(turn_id.clone());
-            job.origin_campaign_revision = number + 1;
-            job.purpose = GenerationPurpose::Illustration;
-            job.governance = Some(illustration_governance(&turn_id));
-            repository
-                .enqueue_generation_job(&job)
-                .await
-                .expect("request inside the rolling and lifetime caps should enqueue");
-            repository
-                .cancel_generation_job("campaign-1", &job.id)
-                .await
-                .unwrap();
-        }
+        assert!(
+            database.starts_with("mdnd_generation_test_") && database != "manchester_dnd",
+            "cleanup safeguard"
+        );
+        store.database().drop().await.unwrap();
+    }
 
-        sqlx::query(
-            "UPDATE generation_governance_receipts
-             SET created_at = CURRENT_TIMESTAMP - INTERVAL '25 hours'
-             WHERE campaign_session_id = 'campaign-1' AND purpose = 'illustration'",
-        )
-        .execute(&pool)
+    async fn isolated_mongo_repository() -> Option<(MongoRepository, MongoStore, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping generation MongoDB contract: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(
+            !uri.trim().is_empty(),
+            "MONGODB_TEST_URI must not be empty when set"
+        );
+        let database = format!("mdnd_generation_test_{}", Uuid::new_v4().simple());
+        let store = MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 8,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 4,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
         .await
         .unwrap();
-        let mut eleventh = new_job("image-job-11", "image-key-11");
-        eleventh.origin_turn_id = Some("image-turn-11".to_owned());
-        eleventh.origin_campaign_revision = 12;
-        eleventh.purpose = GenerationPurpose::Illustration;
-        eleventh.governance = Some(illustration_governance("image-turn-11"));
-        assert!(matches!(
-            repository.enqueue_generation_job(&eleventh).await,
-            Err(GenerationJobStoreError::BudgetExceeded {
-                scope: GenerationBudgetScope::Campaign,
-                dimension: GenerationBudgetDimension::Requests,
-            })
-        ));
+        SchemaReconciler::new(store.clone()).apply().await.unwrap();
+        Some((MongoRepository::new(store.clone()), store, database))
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn illustration_claims_one_running_job_per_campaign_and_one_replacement(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 5).await;
-        seed_turn_number(&pool, "campaign-1", "image-turn-1", 1).await;
-        let repository = repository(pool);
-        for number in 1..=2_u64 {
-            let mut job = new_job(
-                &format!("image-job-{number}"),
-                &format!("image-key-{number}"),
-            );
-            job.origin_turn_id = Some("image-turn-1".to_owned());
-            job.origin_campaign_revision = 2;
-            job.purpose = GenerationPurpose::Illustration;
-            job.governance = Some(illustration_governance("image-turn-1"));
-            repository.enqueue_generation_job(&job).await.unwrap();
+    async fn seed_campaign(store: &MongoStore, id: &str, revision: i64) {
+        let now = DateTime::now();
+        store
+            .document_collection(CollectionName::Campaigns)
+            .insert_one(doc! {
+                "_id": id,
+                "schema_version": 1_i32,
+                "owner_account_id": format!("account:owner-{id}"),
+                "revision": revision,
+                "title_normalized": format!("test-{id}"),
+                "members": [],
+                "rules_snapshot": {},
+                "created_at": now,
+                "updated_at": now,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_turn(store: &MongoStore, campaign_id: &str, turn_id: &str, sequence: i64) {
+        store
+            .document_collection(CollectionName::TurnEvents)
+            .insert_one(doc! {
+                "_id": turn_id,
+                "schema_version": 1_i32,
+                "campaign_id": campaign_id,
+                "play_session_id": format!("play-session:{campaign_id}"),
+                "sequence": sequence,
+                "correlation_id": format!("correlation:{turn_id}"),
+                "created_at": DateTime::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn live_job(
+        id: &str,
+        campaign_id: &str,
+        turn_id: Option<&str>,
+        revision: u64,
+        purpose: GenerationPurpose,
+        key: &str,
+        governance: Option<NewGenerationGovernanceReceipt>,
+    ) -> NewGenerationJob {
+        NewGenerationJob {
+            id: id.to_owned(),
+            campaign_session_id: campaign_id.to_owned(),
+            origin_turn_id: turn_id.map(str::to_owned),
+            origin_campaign_revision: revision,
+            purpose,
+            idempotency_key: key.to_owned(),
+            input_digest: test_digest(31),
+            prompt_digest: test_digest(32),
+            policy_digest: test_digest(33),
+            config_digest: test_digest(34),
+            correlation_id: Some(format!("correlation:{id}")),
+            max_attempts: 2,
+            success_retention: SuccessRetention::UnselectedPresentation30Days,
+            governance,
         }
-
-        let first = repository
-            .claim_generation_job_for_purpose(
-                GenerationPurpose::Illustration,
-                &claim("image-worker-1"),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            repository
-                .claim_generation_job_for_purpose(
-                    GenerationPurpose::Illustration,
-                    &claim("image-worker-2"),
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        repository
-            .cancel_generation_job("campaign-1", &first.job.id)
-            .await
-            .unwrap();
-        let second = repository
-            .claim_generation_job_for_purpose(
-                GenerationPurpose::Illustration,
-                &claim("image-worker-2"),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        repository
-            .cancel_generation_job("campaign-1", &second.job.id)
-            .await
-            .unwrap();
-
-        let mut third = new_job("image-job-3", "image-key-3");
-        third.origin_turn_id = Some("image-turn-1".to_owned());
-        third.origin_campaign_revision = 2;
-        third.purpose = GenerationPurpose::Illustration;
-        third.governance = Some(illustration_governance("image-turn-1"));
-        assert!(matches!(
-            repository.enqueue_generation_job(&third).await,
-            Err(GenerationJobStoreError::BudgetExceeded {
-                scope: GenerationBudgetScope::Turn,
-                dimension: GenerationBudgetDimension::Requests,
-            })
-        ));
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn success_is_atomic_and_terminal_transitions_reject_stale_workers(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        seed_artifact(&pool, "campaign-1", "artifact-1").await;
-        let repository = repository(pool.clone());
-        repository
-            .enqueue_generation_job(&new_job("job-1", "generation-key-1"))
-            .await
-            .expect("job should enqueue");
-        let claimed = repository
-            .claim_generation_job(&claim("worker-1"))
-            .await
-            .expect("claim should work")
-            .expect("job should be ready");
-        repository
-            .heartbeat_generation_job(&claimed.lease, Duration::from_secs(30))
-            .await
-            .expect("current lease should heartbeat");
-        let success = GenerationSuccess {
-            artifact_id: Some("artifact-1".to_owned()),
-            output_digest: Sha256Digest::from_bytes([5; 32]),
-            usage: GenerationUsage {
-                prompt_tokens: Some(10),
-                completion_tokens: Some(5),
-                total_tokens: Some(15),
-                cost_microusd: Some(25),
-                latency_milliseconds: Some(20),
+    fn live_claim(worker_id: &str) -> GenerationClaim {
+        GenerationClaim {
+            worker_id: worker_id.to_owned(),
+            provider: "provider:test".to_owned(),
+            model: "deterministic-test".to_owned(),
+            lease_duration: Duration::from_secs(30),
+        }
+    }
+
+    fn live_governance(turn_scope_key: &str) -> NewGenerationGovernanceReceipt {
+        let limits = GenerationGovernanceConfig {
+            campaign: GenerationBudgetAllowance {
+                requests: 1,
+                tokens: 200,
+                latency_milliseconds: 1_000,
+                cost_microusd: 100,
             },
+            turn: GenerationBudgetAllowance {
+                requests: 1,
+                tokens: 200,
+                latency_milliseconds: 1_000,
+                cost_microusd: 100,
+            },
+            max_campaign_concurrency: 2,
+            worker_batch_size: 2,
         };
-        let completed = repository
-            .succeed_generation_job(&claimed.lease, &success)
-            .await
-            .expect("success should commit");
-        assert_eq!(completed.state, GenerationJobState::Succeeded);
-        assert_eq!(completed.artifact_id.as_deref(), Some("artifact-1"));
-        assert_eq!(
-            completed.retention_class,
-            GenerationRetentionClass::UnselectedPresentation30Days
-        );
-        assert!(completed.retention_delete_after.is_some());
-        assert!(matches!(
-            repository
-                .fail_generation_attempt(
-                    &claimed.lease,
-                    &GenerationAttemptFailure {
-                        code: GenerationFailureCode::Timeout,
-                        provider_status: None,
-                        provider_request_id: None,
-                        usage: GenerationUsage::default(),
-                        output_digest: None,
-                    },
-                )
-                .await,
-            Err(GenerationJobStoreError::LostLease)
-        ));
-        assert!(matches!(
-            repository
-                .cancel_generation_job("campaign-1", "job-1")
-                .await,
-            Err(GenerationJobStoreError::InvalidTransition { .. })
-        ));
-        let attempt = repository
-            .list_generation_attempts("campaign-1", "job-1")
-            .await
-            .expect("attempt should load")
-            .pop()
-            .expect("attempt should exist");
-        assert_eq!(attempt.state, GenerationAttemptState::Succeeded);
-        assert_eq!(attempt.usage, success.usage);
+        NewGenerationGovernanceReceipt {
+            turn_scope_key: turn_scope_key.to_owned(),
+            request_fingerprint: test_digest(50),
+            policy_fingerprint: test_digest(51),
+            config_fingerprint: test_digest(52),
+            governance_fingerprint: limits.non_secret_fingerprint(),
+            reserved_requests: 1,
+            reserved_tokens: 10,
+            reserved_latency_milliseconds: 100,
+            reserved_cost_microusd: 10,
+            limits,
+        }
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn cancellation_is_idempotent_and_invalidates_a_running_lease(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        repository
-            .enqueue_generation_job(&new_job("job-1", "generation-key-1"))
-            .await
-            .expect("job should enqueue");
-        let claimed = repository
-            .claim_generation_job(&claim("worker-1"))
-            .await
-            .expect("claim should work")
-            .expect("job should be ready");
-        let cancelled = repository
-            .cancel_generation_job("campaign-1", "job-1")
-            .await
-            .expect("cancel should work");
-        assert_eq!(cancelled.state, GenerationJobState::Cancelled);
-        let replay = repository
-            .cancel_generation_job("campaign-1", "job-1")
-            .await
-            .expect("cancel replay should return the terminal job");
-        assert_eq!(replay, cancelled);
-        assert!(matches!(
-            repository
-                .heartbeat_generation_job(&claimed.lease, Duration::from_secs(30))
-                .await,
-            Err(GenerationJobStoreError::LostLease)
-        ));
-        let attempt = repository
-            .list_generation_attempts("campaign-1", "job-1")
-            .await
-            .expect("attempt should load")
-            .pop()
-            .expect("attempt should exist");
-        assert_eq!(attempt.state, GenerationAttemptState::Cancelled);
-        assert_eq!(attempt.failure_code, Some(GenerationFailureCode::Cancelled));
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn attempt_insert_failure_rolls_back_claim_and_preserves_enqueue_receipt(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        repository
-            .enqueue_generation_job(&new_job("job-1", "generation-key-1"))
-            .await
-            .expect("job should enqueue");
-        sqlx::query(
-            "ALTER TABLE generation_attempts
-             ADD CONSTRAINT reject_test_provider CHECK (provider <> 'force-rollback')",
-        )
-        .execute(&pool)
-        .await
-        .expect("test constraint should install");
-        let mut rejected_claim = claim("worker-1");
-        rejected_claim.provider = "force-rollback".to_owned();
-        assert!(matches!(
-            repository.claim_generation_job(&rejected_claim).await,
-            Err(GenerationJobStoreError::Database(_))
-        ));
-
-        let stored = repository
-            .load_generation_job("campaign-1", "job-1")
-            .await
-            .expect("job should load")
-            .expect("enqueue receipt should remain");
-        assert_eq!(stored.state, GenerationJobState::Queued);
-        assert_eq!(stored.attempt_count, 0);
-        assert!(
-            repository
-                .list_generation_attempts("campaign-1", "job-1")
-                .await
-                .expect("attempt lookup should work")
-                .is_empty()
-        );
-        let replay = repository
-            .enqueue_generation_job(&new_job("different-job-id", "generation-key-1"))
-            .await
-            .expect("original idempotency row should still replay");
-        assert_eq!(replay.job().id, "job-1");
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn failure_storage_has_no_provider_or_prompt_body_channel(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 1).await;
-        let repository = repository(pool.clone());
-        repository
-            .enqueue_generation_job(&new_job("job-1", "generation-key-1"))
-            .await
-            .expect("job should enqueue");
-        let claimed = repository
-            .claim_generation_job(&claim("worker-1"))
-            .await
-            .expect("claim should work")
-            .expect("job should be ready");
-
-        let secret_sentinel = "SECRET provider body with spaces";
-        let rejected = GenerationAttemptFailure {
-            code: GenerationFailureCode::ProviderRejected,
-            provider_status: Some(400),
-            provider_request_id: Some(secret_sentinel.to_owned()),
-            usage: GenerationUsage::default(),
-            output_digest: None,
-        };
-        assert!(matches!(
-            repository
-                .fail_generation_attempt(&claimed.lease, &rejected)
-                .await,
-            Err(GenerationJobStoreError::InvalidInput(_))
-        ));
-
-        let safe = GenerationAttemptFailure {
-            code: GenerationFailureCode::ProviderRejected,
-            provider_status: Some(400),
-            provider_request_id: Some("provider-request-1".to_owned()),
-            usage: GenerationUsage::default(),
-            output_digest: Some(Sha256Digest::from_bytes([5; 32])),
-        };
-        assert_eq!(
-            repository
-                .finish_generation_attempt(&claimed.lease, GenerationAttemptFinish::Failed(safe),)
-                .await
-                .expect("redacted failure should commit"),
-            GenerationAttemptFinishOutcome::Failed
-        );
-        let row_json: String = sqlx::query_scalar(
-            "SELECT row_to_json(generation_attempts)::text
-             FROM generation_attempts WHERE job_id = 'job-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("attempt JSON should load");
-        assert!(!row_json.contains(secret_sentinel));
-        assert!(!row_json.contains("provider_body"));
-        assert!(!row_json.contains("prompt_body"));
-
-        let prohibited_columns: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM information_schema.columns
-             WHERE table_schema = current_schema()
-               AND table_name IN ('generation_jobs', 'generation_attempts')
-               AND column_name IN (
-                   'provider_body', 'response_body', 'raw_response', 'error_message',
-                   'prompt_body', 'prompt_text', 'input_body', 'input_json'
-               )",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("schema should be inspectable");
-        assert_eq!(prohibited_columns, 0);
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn narration_and_illustration_require_a_campaign_owned_turn(pool: PgPool) {
-        seed_campaign(&pool, "campaign-1", 3).await;
-        seed_turn(&pool, "campaign-1", "turn-1").await;
-        let repository = repository(pool);
-        let mut narration = new_job("job-1", "generation-key-1");
-        narration.purpose = GenerationPurpose::Narration;
-        assert!(matches!(
-            repository.enqueue_generation_job(&narration).await,
-            Err(GenerationJobStoreError::InvalidInput(_))
-        ));
-        narration.origin_turn_id = Some("turn-1".to_owned());
-        narration.origin_campaign_revision = 2;
-        repository
-            .enqueue_generation_job(&narration)
-            .await
-            .expect("historical campaign-owned turn should enqueue after later commits");
+    fn test_digest(byte: u8) -> Sha256Digest {
+        Sha256Digest::from_bytes([byte; 32])
     }
 }

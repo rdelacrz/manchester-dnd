@@ -14,12 +14,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    application::LOCAL_HERO_OWNER_KEY,
     config::{GenerationGovernanceConfig, LlmBackend, LlmProfile},
     repository::{
         GeneratedTextPresentation, GeneratedTextPresentationReplay,
-        GeneratedTextPresentationSource, NewGeneratedTextPresentation,
-        NewGenerationGovernanceReceipt, NewTypedIntentCommandReceipt, PostgresRepository,
-        TextPresentationStoreError, TypedIntentCommandReceipt,
+        GeneratedTextPresentationSource, MongoRepository, NewGeneratedTextPresentation,
+        NewGenerationGovernanceReceipt, NewTypedIntentCommandReceipt, TextPresentationStoreError,
+        TypedIntentCommandReceipt,
         jobs::{
             GenerationAttemptFailure, GenerationAttemptFinish, GenerationFailureCode,
             GenerationJobState, GenerationPurpose, GenerationSuccess, GenerationUsage,
@@ -106,7 +107,7 @@ struct PresentationCompletion<'a> {
 
 #[derive(Clone)]
 pub struct InlineGenerationLedger {
-    repository: PostgresRepository,
+    repository: MongoRepository,
     provider: String,
     model: String,
     lease_duration: Duration,
@@ -120,7 +121,7 @@ pub struct InlineGenerationLedger {
 
 impl InlineGenerationLedger {
     pub fn new(
-        repository: PostgresRepository,
+        repository: MongoRepository,
         profile: &LlmProfile,
         governance: &GenerationGovernanceConfig,
     ) -> Self {
@@ -238,7 +239,7 @@ impl InlineGenerationLedger {
         event_sequence: u64,
     ) -> Result<String, GenerationLedgerError> {
         self.repository
-            .list_session_events(campaign_session_id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, campaign_session_id)
             .await?
             .into_iter()
             .find(|audit| audit.turn_number == event_sequence)
@@ -252,7 +253,7 @@ impl InlineGenerationLedger {
         event_sequence: u64,
     ) -> Result<CommittedEncounterOutcomeDto, GenerationLedgerError> {
         self.repository
-            .list_session_events(campaign_session_id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, campaign_session_id)
             .await?
             .into_iter()
             .find_map(|audit| {
@@ -633,10 +634,14 @@ const fn map_failure(failure: TypedFailureClass) -> GenerationFailureCode {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::PgPool;
+    use manchester_dnd_core::{RULESET, SESSION_SCHEMA_VERSION, SessionDto, SessionStatus};
+    use mongodb::bson::{DateTime, doc};
 
     use super::*;
-    use crate::repository::MIGRATOR;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{CollectionName, MongoStore, SchemaReconciler},
+    };
 
     fn disabled_profile() -> LlmProfile {
         LlmProfile {
@@ -682,6 +687,73 @@ mod tests {
         }
     }
 
+    async fn isolated_mongo_repository() -> Option<(MongoRepository, MongoStore, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping generation-ledger MongoDB test: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(
+            uri.starts_with("mongodb://root:") && uri.contains("127.0.0.1"),
+            "MONGODB_TEST_URI must be the explicit local root test URI"
+        );
+        let database = format!("mdnd_generation_ledger_test_{}", Uuid::new_v4().simple());
+        let store = MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 8,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 4,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .unwrap();
+        SchemaReconciler::new(store.clone()).apply().await.unwrap();
+        Some((MongoRepository::new(store.clone()), store, database))
+    }
+
+    async fn seed_campaign(repository: &MongoRepository, store: &MongoStore, revision: u64) {
+        repository
+            .create_campaign(
+                LOCAL_HERO_OWNER_KEY,
+                &SessionDto {
+                    schema_version: SESSION_SCHEMA_VERSION,
+                    id: "campaign-ledger".to_owned(),
+                    ruleset: RULESET,
+                    title: "Generation ledger test".to_owned(),
+                    status: SessionStatus::Active,
+                    character_ids: Vec::new(),
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                    last_event_sequence: 0,
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        if revision != 1 {
+            store
+                .document_collection(CollectionName::Campaigns)
+                .update_one(
+                    doc! { "_id": "campaign-ledger" },
+                    doc! { "$set": { "revision": i64::try_from(revision).unwrap() } },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn drop_test_database(store: &MongoStore, database: &str) {
+        assert!(
+            database.starts_with("mdnd_generation_ledger_test_") && database != "manchester_dnd",
+            "cleanup safeguard"
+        );
+        store.database().drop().await.unwrap();
+    }
+
     #[test]
     fn typed_failures_map_to_the_closed_durable_code_set() {
         assert_eq!(
@@ -710,16 +782,12 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn inline_begin_leases_only_its_exact_durable_job(pool: PgPool) {
-        sqlx::query(
-            "INSERT INTO campaign_sessions (id, schema_version, revision, payload_json)
-             VALUES ('campaign-ledger', 1, 1, '{}'::jsonb)",
-        )
-        .execute(&pool)
-        .await
-        .expect("campaign fixture should insert");
-        let repository = PostgresRepository::from_pool(pool.clone());
+    #[tokio::test]
+    async fn inline_begin_leases_only_its_exact_durable_job() {
+        let Some((repository, store, database)) = isolated_mongo_repository().await else {
+            return;
+        };
+        seed_campaign(&repository, &store, 1).await;
         let ledger = InlineGenerationLedger::new(
             repository.clone(),
             &disabled_profile(),
@@ -744,28 +812,33 @@ mod tests {
                 state: GenerationJobState::Running
             })
         ));
+        drop_test_database(&store, &database).await;
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn completed_presentation_attempt_replays_despite_fresh_server_uuid(pool: PgPool) {
-        sqlx::query(
-            "INSERT INTO campaign_sessions (id, schema_version, revision, payload_json)
-             VALUES ('campaign-ledger', 1, 2, '{}'::jsonb)",
-        )
-        .execute(&pool)
-        .await
-        .expect("campaign fixture should insert");
-        sqlx::query(
-            "INSERT INTO turn_audits
-             (id, campaign_session_id, turn_number, schema_version, payload_json)
-             VALUES ('turn-ledger', 'campaign-ledger', 1, 1, '{}'::jsonb)",
-        )
-        .execute(&pool)
-        .await
-        .expect("turn fixture should insert");
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let ledger =
-            InlineGenerationLedger::new(repository, &disabled_profile(), &governance_config());
+    #[tokio::test]
+    async fn completed_presentation_attempt_replays_despite_fresh_server_uuid() {
+        let Some((repository, store, database)) = isolated_mongo_repository().await else {
+            return;
+        };
+        seed_campaign(&repository, &store, 2).await;
+        store
+            .document_collection(CollectionName::TurnEvents)
+            .insert_one(doc! {
+                "_id": "turn-ledger",
+                "schema_version": 1_i32,
+                "campaign_id": "campaign-ledger",
+                "play_session_id": "play-session:ledger",
+                "sequence": 1_i64,
+                "correlation_id": "correlation:turn-ledger",
+                "created_at": DateTime::now(),
+            })
+            .await
+            .expect("turn fixture should insert");
+        let ledger = InlineGenerationLedger::new(
+            repository.clone(),
+            &disabled_profile(),
+            &governance_config(),
+        );
         let attempt = ledger
             .begin(InlineGenerationRequest {
                 campaign_session_id: "campaign-ledger".to_owned(),
@@ -800,13 +873,18 @@ mod tests {
             .await
             .expect("fresh presentation UUID must resolve to the original attempt row");
         assert_eq!(replay, first);
-        let governance_state: String = sqlx::query_scalar(
-            "SELECT state FROM generation_governance_receipts WHERE job_id = $1",
-        )
-        .bind(&attempt.job_id)
-        .fetch_one(&pool)
-        .await
-        .expect("presentation completion should retain its governance receipt");
-        assert_eq!(governance_state, "settled");
+        let governance_reservations = store
+            .document_collection(CollectionName::GenerationBudgetReservations)
+            .count_documents(doc! { "job_id": &attempt.job_id })
+            .await
+            .expect("presentation completion should retain its governance receipt");
+        let settled_reservations = store
+            .document_collection(CollectionName::GenerationBudgetReservations)
+            .count_documents(doc! { "job_id": &attempt.job_id, "state": "settled" })
+            .await
+            .expect("presentation completion should settle its governance receipt");
+        assert_eq!(governance_reservations, 4);
+        assert_eq!(settled_reservations, governance_reservations);
+        drop_test_database(&store, &database).await;
     }
 }

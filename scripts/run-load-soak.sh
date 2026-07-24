@@ -16,8 +16,8 @@ if ! [[ "$SOAK_CASE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SOAK_CASE_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 1
 fi
-if [[ -z "${DATABASE_URL:-}" ]]; then
-  echo "DATABASE_URL is required for the PostgreSQL load/soak gate" >&2
+if [[ -z "${MONGODB_TEST_URI:-}" ]]; then
+  echo "MONGODB_TEST_URI is required for the MongoDB load/soak gate" >&2
   exit 1
 fi
 
@@ -96,4 +96,4 @@ suite_end=$(date +%s%3N)
   printf 'category=%s\n' "${labels[@]}"
 } >"$OUTPUT_DIR/SUMMARY"
 
-echo "load/soak passed: $((SOAK_ROUNDS * ${#labels[@]})) PostgreSQL contract runs"
+echo "load/soak passed: $((SOAK_ROUNDS * ${#labels[@]})) MongoDB contract runs"

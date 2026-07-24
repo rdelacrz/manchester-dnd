@@ -20,7 +20,7 @@ TextGenerator.generate_text(TextGenerationRequest) -> TextGenerationResponse
 ImageGenerator.generate_image(ImageGenerationRequest) -> ImageGenerationResponse
 ```
 
-`OpenAiCompatibleGenerator` implements both traits; deterministic fake and disabled adapters keep CI/local development network-free and prevent accidental paid calls. The application now wraps illustration calls in durable PostgreSQL jobs with leases, retries, cancellation, governance receipts, artifact validation, and protected delivery; that orchestration remains deliberately outside the provider trait. Later adapters should declare structured-output, image-size, seed, moderation, and usage capabilities.
+`OpenAiCompatibleGenerator` implements both traits; deterministic fake and disabled adapters keep CI/local development network-free and prevent accidental paid calls. The application wraps illustration calls in durable MongoDB jobs with leases, retries, cancellation, governance receipts, artifact validation, and protected delivery; Dragonfly notifications are optional and that orchestration remains outside the provider trait. Later adapters declare capabilities rather than relying on provider name checks.
 
 Startup configuration comes from the independent `TEXT_LLM_*` and `IMAGE_LLM_*` profiles loaded through `dotenvy`: backend, base URL, API key, model, timeout, text temperature/output tokens, and image size. No provider/model is hard-coded into `game-core`. Credentials never enter fingerprints, logs, client DTOs, or saved prompts.
 
@@ -101,7 +101,7 @@ Images are optional presentation artifacts, never input to rules resolution.
 1. After a committed encounter, the player may make a manual image request. Automatic generation is not an MVP capability.
 2. The server reconstructs a closed `ImageBrief` from engine-authored visible fictional facts in the committed audit. It excludes player/narration text, private source material, names, contact data, hidden state, and real-person likeness descriptions.
 3. Policy and governance validation run transactionally before enqueue. The worker recomputes the brief and fingerprints before submission; provider rejection and application validation failures fail closed.
-4. A durable PostgreSQL job is leased by the illustration worker. Provider bytes enter quarantine, are signature/format/dimension/pixel checked, re-encoded to metadata-free PNG originals and bounded variants, hashed, and stored beneath a non-public protected root with provenance.
+4. A durable MongoDB job is leased by the illustration worker using atomic lease-token/revision checks. Provider bytes enter quarantine, are signature/format/dimension/pixel checked, re-encoded to metadata-free PNG originals and bounded variants, hashed, and stored beneath a non-public protected root with provenance.
 5. Only campaign-authorized selected web/thumbnail variants are delivered. Provider URLs and originals have no delivery route.
 6. The UI shows a stable placeholder and queued/running/retry/rejected/unavailable/cancelled status, then swaps in the verified result with authored alt text. Failure never blocks the turn or save.
 

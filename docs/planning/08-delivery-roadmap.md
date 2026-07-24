@@ -4,9 +4,9 @@
 
 Build vertical slices that can be demonstrated through the real Leptos UI, server boundary, domain engine, and persistence path. A partially implemented subsystem does not count as progress if no playable path uses it. Each slice leaves the main branch deployable and retains deterministic provider fakes.
 
-The sequence below is dependency order, not a calendar estimate. Slices 0–7 together are MVP. The repository already contains part of Slice 0 and a d20 demonstration: the `app`/`frontend`/`server` Leptos workspace, `game-core`/`game-server` crates, PostgreSQL migration/repository, typed LLM profiles, rules types, and server-authoritative demo check. “Deliver” below includes finishing and proving that baseline, not rebuilding it under speculative crate names.
+The sequence below is dependency order, not a calendar estimate. Slices 0–7 together are MVP. The repository contains the Leptos workspace, deterministic core/server crates, MongoDB repository/schema catalog, optional Dragonfly cache/pub-sub, typed LLM profiles, rules types, authentication, and server-authoritative checks. “Deliver” includes proving that baseline, not rebuilding it under speculative crate names.
 
-Progress as of 2026-07-14: the walking skeleton now has explicit loopback-only local mode, redacted application errors, liveness/readiness probes, PostgreSQL row-locked persistence, and a persisted Slice 1A exploration command. This does not mark all Slice 0 acceptance criteria complete: browser/hydration manual evidence, CI/artifact secret scanning, broader request limits, and the eventual authenticated hosted boundary remain release work.
+Progress as of 2026-07-24: the walking skeleton has authenticated local/hosted configuration, redacted errors, liveness/readiness probes, MongoDB transactional persistence, Dragonfly-safe degradation, and persisted gameplay. Remaining acceptance work is tracked in the checklist rather than inferred from this summary.
 
 ## Slice 0 — Full-stack walking skeleton
 
@@ -16,7 +16,7 @@ Deliver:
 
 - Rust workspace and crate boundaries from [architecture](02-architecture.md);
 - Leptos 0.8/Axum SSR, hydration, routing, semantic shell, error boundary, and one progressive-enhancement form;
-- PostgreSQL/SQLx connection, repository, and first migration;
+- MongoDB replica-set connection, repository, managed validators/indexes, and optional Dragonfly cache/pub-sub;
 - typed startup configuration using `dotenvy`, `.env.example`, and secret-redacting types;
 - initial `thiserror` families and safe transport mapping;
 - tracing/correlation IDs, readiness/liveness checks, CI formatting/lint/test/build, and a provider-free deployment.
@@ -40,7 +40,7 @@ Deliver:
 - pinned `srd-5.1-cc` profile and source traceability skeleton;
 - prebuilt hero, one original creature, one exploration check, initiative, movement/action budget, attack, damage, HP, and encounter completion;
 - bounded dice parser, injected/versioned dice source, roll records, command and turn-audit types;
-- revisioned PostgreSQL campaign/character documents, append-only turn audits, row locks plus optimistic revision checks, idempotent command, and load;
+- revisioned MongoDB campaign/character documents, append-only turn audits, short transactions plus optimistic revision checks, idempotent command, and load;
 - authored deterministic GM text and visible “why this result?” details.
 
 Acceptance:
@@ -100,7 +100,7 @@ Deliver:
 - selected MVP identity mode, campaign membership authorization, secure browser sessions;
 - autosave status, play-session boundaries, turn-audit pagination, durable generation jobs, and recap artifact;
 - canonical private export and player-readable export;
-- archive/delete flows, PostgreSQL backup/restore, document/audit schema fixtures, and correction audits;
+- archive/delete flows, encrypted MongoDB backup/isolated restore, document/audit schema fixtures, and correction audits;
 - authorized private asset delivery and retention classifications.
 
 Acceptance:
@@ -178,7 +178,7 @@ Acceptance:
 3. **Creator platform:** authoring/validation CLI, signed packs, safe review workflow, distribution policy.
 4. **Richer media:** portraits, map generation, voice/accessibility narration, consistency tools, each with separate rights/safety gates.
 5. **Alternative rules profile:** assign and implement SRD 5.2.1 as a separate adapter and compendium, then design an explicit conversion report/workflow.
-6. **Scale storage:** evolve PostgreSQL topology and add object storage only after measured pool, lock, database-size, artifact, or multi-instance operational limits, using repository contract tests and verified export/import.
+6. **Scale storage:** evolve MongoDB topology and add object storage only after measured transaction, replication, database-size, artifact, or multi-instance limits, using repository contract tests and verified export/restore; keep Dragonfly non-authoritative.
 
 ## Major risks and early proofs
 

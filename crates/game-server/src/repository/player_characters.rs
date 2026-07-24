@@ -1,19 +1,23 @@
-//! Parameterized PostgreSQL access for account-owned player characters.
-//!
-//! All methods take a server-derived `account_id`. No method accepts a
-//! browser-provided owner ID. Cross-account access returns the same
-//! `not_found` result as a missing character.
+//! MongoDB persistence for account-owned, level-less player characters.
 
 use manchester_dnd_core::{
-    PLAYER_CHARACTER_SCHEMA_VERSION, PlayerCharacter,
+    PlayerCharacter,
     hero::{HeroChoices, HeroError},
     is_valid_opaque_id,
 };
-use serde::Serialize;
-use sqlx::Row;
+use mongodb::{
+    Collection,
+    bson::{DateTime, doc},
+};
+use serde::{Deserialize, Serialize};
 
-use super::PostgresRepository;
-use crate::error::RepositoryError;
+use super::MongoRepository;
+use crate::{
+    error::{MongoFailureKind, PersistenceError, RepositoryError},
+    persistence::CollectionName,
+};
+
+const DRAFT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlayerCharacterSummary {
@@ -38,10 +42,82 @@ pub struct PlayerCharacterDraftSummary {
     pub updated_at: String,
 }
 
-impl PostgresRepository {
-    /// Creates a new player character owned by `account_id`.
-    /// The `account_id` must be server-derived; it is never accepted from
-    /// browser input.
+#[derive(Debug, Clone)]
+pub struct NewPlayerCharacterReceipt<'a> {
+    pub owner_account_id: &'a str,
+    pub character_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub command_kind: &'a str,
+    pub request_fingerprint: String,
+    pub result_revision: u64,
+    pub response_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPlayerCharacterReceipt {
+    pub character_id: String,
+    pub owner_account_id: String,
+    pub idempotency_key: String,
+    pub command_kind: String,
+    pub request_fingerprint: String,
+    pub result_revision: u64,
+    pub response_json: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlayerCharacterDocument {
+    #[serde(rename = "_id")]
+    pub(crate) id: String,
+    pub(crate) schema_version: i64,
+    pub(crate) revision: i64,
+    pub(crate) owner_account_id: String,
+    pub(crate) display_name: String,
+    pub(crate) display_name_normalized: String,
+    pub(crate) ruleset_id: String,
+    pub(crate) build_blueprint: HeroChoices,
+    pub(crate) created_at: DateTime,
+    pub(crate) updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayerCharacterDraftDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    revision: i64,
+    owner_account_id: String,
+    step: String,
+    state: String,
+    choices: Option<HeroChoices>,
+    committed_character_id: Option<String>,
+    expires_at: DateTime,
+    purge_at: DateTime,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayerCharacterReceiptDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    scope_kind: String,
+    scope_id: String,
+    actor_account_id: String,
+    command_kind: String,
+    idempotency_key: String,
+    request_fingerprint: String,
+    result_revision: i64,
+    response_json: serde_json::Value,
+    state: String,
+    created_at: DateTime,
+}
+
+impl MongoRepository {
     pub async fn create_player_character(
         &self,
         account_id: &str,
@@ -59,42 +135,35 @@ impl PostgresRepository {
         character.validate().map_err(|error| {
             to_repository_error("player_character", &character.character_id, &error)
         })?;
-        let choices_json = serde_json::to_value(&character.choices).map_err(|error| {
-            RepositoryError::Serialize {
-                entity: "player_character",
-                source: error,
-            }
-        })?;
-        sqlx::query(
-            "INSERT INTO player_characters
-             (id, owner_account_id, revision, display_name, choices_json, schema_version)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(&character.character_id)
-        .bind(account_id)
-        .bind(
-            i64::try_from(character.revision)
-                .map_err(|_| RepositoryError::NumericRange { field: "revision" })?,
-        )
-        .bind(&character.display_name)
-        .bind(&choices_json)
-        .bind(PLAYER_CHARACTER_SCHEMA_VERSION as i32)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| map_insert_error(error, "player_character", &character.character_id))?;
-        Ok(PlayerCharacter {
-            schema_version: character.schema_version,
-            character_id: character.character_id.clone(),
+        require_account(self, account_id).await?;
+
+        let now = DateTime::now();
+        let stored = PlayerCharacterDocument {
+            id: character.character_id.clone(),
+            schema_version: i64::from(character.schema_version),
+            revision: revision_to_i64(character.revision)?,
             owner_account_id: account_id.to_owned(),
-            revision: character.revision,
             display_name: character.display_name.clone(),
-            choices: character.choices.clone(),
-        })
+            display_name_normalized: normalize_display_name(&character.display_name),
+            ruleset_id: character.choices.pins.ruleset_id.as_str().to_owned(),
+            build_blueprint: character.choices.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.player_characters()
+            .insert_one(stored)
+            .await
+            .map_err(|error| {
+                map_mongo_write(
+                    error,
+                    "create player character",
+                    "player_character",
+                    &character.character_id,
+                )
+            })?;
+        Ok(character.clone())
     }
 
-    /// Loads a player character by ID, scoped to `account_id`.
-    /// Returns `None` if the character does not exist or is owned by a
-    /// different account. This prevents cross-account enumeration.
     pub async fn load_player_character(
         &self,
         account_id: &str,
@@ -102,42 +171,42 @@ impl PostgresRepository {
     ) -> Result<Option<PlayerCharacter>, RepositoryError> {
         validate_account_id(account_id)?;
         validate_character_id(character_id)?;
-        let row = sqlx::query(
-            "SELECT id, owner_account_id, revision, display_name, choices_json, schema_version
-             FROM player_characters
-             WHERE id = $1 AND owner_account_id = $2",
-        )
-        .bind(character_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(|row| player_character_from_row(&row)).transpose()
+        self.player_characters()
+            .find_one(doc! {
+                "_id": character_id,
+                "owner_account_id": account_id,
+            })
+            .await
+            .map_err(|error| mongo_error("load player character", error))?
+            .map(player_character_from_document)
+            .transpose()
     }
 
-    /// Lists all player characters owned by `account_id`, sorted by
-    /// most recently updated.
     pub async fn list_player_characters(
         &self,
         account_id: &str,
     ) -> Result<Vec<PlayerCharacterSummary>, RepositoryError> {
         validate_account_id(account_id)?;
-        let rows = sqlx::query(
-            "SELECT id, owner_account_id, revision, display_name,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM player_characters
-             WHERE owner_account_id = $1
-             ORDER BY updated_at DESC, id",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        rows.iter().map(player_character_summary_from_row).collect()
+        let mut cursor = self
+            .player_characters()
+            .find(doc! { "owner_account_id": account_id })
+            .sort(doc! { "updated_at": -1, "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("list player characters", error))?;
+        let mut output = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|error| mongo_error("read player character list", error))?
+        {
+            let stored = cursor
+                .deserialize_current()
+                .map_err(|error| mongo_error("decode player character list", error))?;
+            output.push(player_character_summary(stored)?);
+        }
+        Ok(output)
     }
 
-    /// Updates a player character's display name, scoped to `account_id`.
-    /// Uses optimistic revision control.
     pub async fn update_player_character_display_name(
         &self,
         account_id: &str,
@@ -147,61 +216,43 @@ impl PostgresRepository {
     ) -> Result<u64, RepositoryError> {
         validate_account_id(account_id)?;
         validate_character_id(character_id)?;
-        if new_display_name.trim().is_empty()
-            || new_display_name.chars().count() > 200
-            || new_display_name.chars().any(char::is_control)
-        {
-            return invalid(
-                "player_character",
-                character_id,
-                "display name must be 1-200 non-control characters",
-            );
-        }
-        let result = sqlx::query(
-            "UPDATE player_characters
-             SET display_name = $3, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND owner_account_id = $2 AND revision = $4",
-        )
-        .bind(character_id)
-        .bind(account_id)
-        .bind(new_display_name)
-        .bind(
-            i64::try_from(expected_revision)
-                .map_err(|_| RepositoryError::NumericRange { field: "revision" })?,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if result.rows_affected() == 0 {
-            // Distinguish revision conflict from not-found: if the character
-            // exists for this owner but with a different revision, return
-            // RevisionConflict; otherwise return NotFound.
-            let current: Option<i64> = sqlx::query_scalar(
-                "SELECT revision FROM player_characters
-                 WHERE id = $1 AND owner_account_id = $2",
+        validate_display_name(new_display_name)?;
+        let expected = revision_to_i64(expected_revision)?;
+        let next = expected_revision
+            .checked_add(1)
+            .ok_or(RepositoryError::NumericRange { field: "revision" })?;
+        let result = self
+            .player_characters()
+            .update_one(
+                doc! {
+                    "_id": character_id,
+                    "owner_account_id": account_id,
+                    "revision": expected,
+                },
+                doc! {
+                    "$set": {
+                        "display_name": new_display_name,
+                        "display_name_normalized": normalize_display_name(new_display_name),
+                        "updated_at": DateTime::now(),
+                    },
+                    "$inc": { "revision": 1_i64 },
+                },
             )
-            .bind(character_id)
-            .bind(account_id)
-            .fetch_optional(&self.pool)
             .await
-            .map_err(RepositoryError::Database)?;
-            return match current {
-                Some(rev) => Err(RepositoryError::RevisionConflict {
-                    entity: "player_character",
-                    id: character_id.to_owned(),
-                    expected: expected_revision,
-                    actual: u64::try_from(rev).unwrap_or(0),
-                }),
-                None => Err(RepositoryError::NotFound {
-                    entity: "player_character",
-                    id: character_id.to_owned(),
-                }),
-            };
+            .map_err(|error| {
+                map_mongo_write(
+                    error,
+                    "update player character display name",
+                    "player_character",
+                    character_id,
+                )
+            })?;
+        if result.modified_count == 1 {
+            return Ok(next);
         }
-        Ok(expected_revision + 1)
+        character_write_miss(self, account_id, character_id, expected_revision).await
     }
 
-    /// Deletes a player character, scoped to `account_id`.
     pub async fn delete_player_character(
         &self,
         account_id: &str,
@@ -209,19 +260,63 @@ impl PostgresRepository {
     ) -> Result<bool, RepositoryError> {
         validate_account_id(account_id)?;
         validate_character_id(character_id)?;
-        let result =
-            sqlx::query("DELETE FROM player_characters WHERE id = $1 AND owner_account_id = $2")
-                .bind(character_id)
-                .bind(account_id)
-                .execute(&self.pool)
-                .await
-                .map_err(RepositoryError::Database)?;
-        Ok(result.rows_affected() > 0)
+        let characters = self.player_characters();
+        let instances = self
+            .store()
+            .document_collection(CollectionName::CampaignCharacterInstances);
+        let account_id = account_id.to_owned();
+        let character_id = character_id.to_owned();
+        self.with_transaction(move |session| {
+            let characters = characters.clone();
+            let instances = instances.clone();
+            let account_id = account_id.clone();
+            let character_id = character_id.clone();
+            Box::pin(async move {
+                let owned = characters
+                    .find_one(doc! {
+                        "_id": &character_id,
+                        "owner_account_id": &account_id,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load character before delete", error)
+                    })?;
+                if owned.is_none() {
+                    return Ok(false);
+                }
+                let active_reference = instances
+                    .find_one(doc! {
+                        "account_id": &account_id,
+                        "source_player_character_id": &character_id,
+                        "state": "active",
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check active character instances", error)
+                    })?;
+                if active_reference.is_some() {
+                    return Err(PersistenceError::AlreadyExists {
+                        entity: "active campaign character instance",
+                        id: character_id,
+                    });
+                }
+                let deleted = characters
+                    .delete_one(doc! {
+                        "_id": &character_id,
+                        "owner_account_id": &account_id,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("delete player character", error))?;
+                Ok(deleted.deleted_count == 1)
+            })
+        })
+        .await
+        .map_err(map_persistence_error)
     }
 
-    // ── Drafts ──
-
-    /// Creates a new character creation draft owned by `account_id`.
     pub async fn create_player_character_draft(
         &self,
         account_id: &str,
@@ -230,28 +325,42 @@ impl PostgresRepository {
     ) -> Result<PlayerCharacterDraftSummary, RepositoryError> {
         validate_account_id(account_id)?;
         validate_draft_id(draft_id)?;
-        let row = sqlx::query(
-            "INSERT INTO player_character_drafts (id, owner_account_id, expires_at)
-             VALUES ($1, $2, TO_TIMESTAMP($3))
-             RETURNING id, owner_account_id, revision,
-                       expires_at::text AS expires_at, step, reviewed,
-                       committed_character_id, created_at::text AS created_at,
-                       updated_at::text AS updated_at",
-        )
-        .bind(draft_id)
-        .bind(account_id)
-        .bind(i64::try_from(expires_at_epoch_seconds).map_err(|_| {
-            RepositoryError::NumericRange {
-                field: "expires_at",
-            }
-        })?)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| map_insert_error(error, "player_character_draft", draft_id))?;
-        draft_summary_from_row(&row)
+        require_account(self, account_id).await?;
+        let expires_at = epoch_seconds_to_date(expires_at_epoch_seconds)?;
+        let purge_at = DateTime::from_millis(
+            expires_at
+                .timestamp_millis()
+                .saturating_add(DRAFT_RETENTION_SECONDS.saturating_mul(1_000)),
+        );
+        let now = DateTime::now();
+        let stored = PlayerCharacterDraftDocument {
+            id: draft_id.to_owned(),
+            schema_version: 1,
+            revision: 0,
+            owner_account_id: account_id.to_owned(),
+            step: "campaign_theme".to_owned(),
+            state: "editing".to_owned(),
+            choices: None,
+            committed_character_id: None,
+            expires_at,
+            purge_at,
+            created_at: now,
+            updated_at: now,
+        };
+        self.player_character_drafts()
+            .insert_one(stored.clone())
+            .await
+            .map_err(|error| {
+                map_mongo_write(
+                    error,
+                    "create player character draft",
+                    "player_character_draft",
+                    draft_id,
+                )
+            })?;
+        draft_summary(stored)
     }
 
-    /// Loads a draft by ID, scoped to `account_id`.
     pub async fn load_player_character_draft(
         &self,
         account_id: &str,
@@ -259,40 +368,20 @@ impl PostgresRepository {
     ) -> Result<Option<(PlayerCharacterDraftSummary, Option<HeroChoices>)>, RepositoryError> {
         validate_account_id(account_id)?;
         validate_draft_id(draft_id)?;
-        let row = sqlx::query(
-            "SELECT id, owner_account_id, revision,
-                    expires_at::text AS expires_at, step, reviewed,
-                    committed_character_id, choices_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM player_character_drafts
-             WHERE id = $1 AND owner_account_id = $2",
-        )
-        .bind(draft_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(|row| {
-            let summary = draft_summary_from_row(&row)?;
-            let choices = row
-                .try_get::<Option<serde_json::Value>, _>("choices_json")
-                .map_err(RepositoryError::Database)?
-                .map(|value| {
-                    serde_json::from_value::<HeroChoices>(value).map_err(|error| {
-                        RepositoryError::InvalidStoredData {
-                            entity: "player_character_draft",
-                            id: draft_id.to_owned(),
-                            source: error,
-                        }
-                    })
-                })
-                .transpose()?;
-            Ok((summary, choices))
-        })
-        .transpose()
+        self.player_character_drafts()
+            .find_one(doc! {
+                "_id": draft_id,
+                "owner_account_id": account_id,
+            })
+            .await
+            .map_err(|error| mongo_error("load player character draft", error))?
+            .map(|stored| {
+                let choices = stored.choices.clone();
+                Ok((draft_summary(stored)?, choices))
+            })
+            .transpose()
     }
 
-    /// Saves draft choices, scoped to `account_id`, with optimistic revision.
     pub async fn save_player_character_draft_choices(
         &self,
         account_id: &str,
@@ -303,42 +392,40 @@ impl PostgresRepository {
     ) -> Result<u64, RepositoryError> {
         validate_account_id(account_id)?;
         validate_draft_id(draft_id)?;
+        validate_step(step)?;
         choices
             .validate()
             .map_err(|error| to_repository_error("player_character_draft", draft_id, &error))?;
-        let choices_json =
-            serde_json::to_value(choices).map_err(|error| RepositoryError::Serialize {
-                entity: "player_character_draft",
-                source: error,
-            })?;
-        let result = sqlx::query(
-            "UPDATE player_character_drafts
-             SET choices_json = $3, step = $4, revision = revision + 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND owner_account_id = $2 AND revision = $5",
-        )
-        .bind(draft_id)
-        .bind(account_id)
-        .bind(&choices_json)
-        .bind(step)
-        .bind(
-            i64::try_from(expected_revision)
-                .map_err(|_| RepositoryError::NumericRange { field: "revision" })?,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound {
-                entity: "player_character_draft",
-                id: draft_id.to_owned(),
-            });
+        let expected = revision_to_i64(expected_revision)?;
+        let choices = mongodb::bson::to_bson(choices)?;
+        let result = self
+            .player_character_drafts()
+            .update_one(
+                doc! {
+                    "_id": draft_id,
+                    "owner_account_id": account_id,
+                    "revision": expected,
+                    "state": "editing",
+                },
+                doc! {
+                    "$set": {
+                        "choices": choices,
+                        "step": step,
+                        "updated_at": DateTime::now(),
+                    },
+                    "$inc": { "revision": 1_i64 },
+                },
+            )
+            .await
+            .map_err(|error| mongo_error("save player character draft", error))?;
+        if result.modified_count == 1 {
+            return expected_revision
+                .checked_add(1)
+                .ok_or(RepositoryError::NumericRange { field: "revision" });
         }
-        Ok(expected_revision + 1)
+        draft_write_miss(self, account_id, draft_id, expected_revision).await
     }
 
-    /// Marks a draft as reviewed and links the committed character, scoped to
-    /// `account_id`.
     pub async fn commit_player_character_draft(
         &self,
         account_id: &str,
@@ -349,33 +436,89 @@ impl PostgresRepository {
         validate_account_id(account_id)?;
         validate_draft_id(draft_id)?;
         validate_character_id(character_id)?;
-        let result = sqlx::query(
-            "UPDATE player_character_drafts
-             SET reviewed = TRUE, committed_character_id = $3,
-                 revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND owner_account_id = $2 AND revision = $4
-                AND reviewed = FALSE",
-        )
-        .bind(draft_id)
-        .bind(account_id)
-        .bind(character_id)
-        .bind(
-            i64::try_from(expected_revision)
-                .map_err(|_| RepositoryError::NumericRange { field: "revision" })?,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound {
-                entity: "player_character_draft",
-                id: draft_id.to_owned(),
-            });
+        let expected = revision_to_i64(expected_revision)?;
+        let drafts = self.player_character_drafts();
+        let characters = self.player_characters();
+        let account_id = account_id.to_owned();
+        let draft_id = draft_id.to_owned();
+        let character_id = character_id.to_owned();
+        let account_id_for_miss = account_id.clone();
+        let draft_id_for_miss = draft_id.clone();
+        let result = self
+            .with_transaction(move |session| {
+                let drafts = drafts.clone();
+                let characters = characters.clone();
+                let account_id = account_id.clone();
+                let draft_id = draft_id.clone();
+                let character_id = character_id.clone();
+                Box::pin(async move {
+                    let character = characters
+                        .find_one(doc! {
+                            "_id": &character_id,
+                            "owner_account_id": &account_id,
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load committed character", error)
+                        })?;
+                    if character.is_none() {
+                        return Err(PersistenceError::NotFound {
+                            entity: "player_character",
+                            id: character_id,
+                        });
+                    }
+                    let update = drafts
+                        .update_one(
+                            doc! {
+                                "_id": &draft_id,
+                                "owner_account_id": &account_id,
+                                "revision": expected,
+                                "state": "editing",
+                            },
+                            doc! {
+                                "$set": {
+                                    "state": "committed",
+                                    "committed_character_id": &character_id,
+                                    "updated_at": DateTime::now(),
+                                },
+                                "$inc": { "revision": 1_i64 },
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("commit player character draft", error)
+                        })?;
+                    if update.modified_count != 1 {
+                        return Err(PersistenceError::RevisionConflict {
+                            entity: "player_character_draft",
+                            id: draft_id,
+                            expected: expected_revision,
+                            actual: expected_revision.saturating_add(1),
+                        });
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+        match result {
+            Ok(()) => expected_revision
+                .checked_add(1)
+                .ok_or(RepositoryError::NumericRange { field: "revision" }),
+            Err(PersistenceError::RevisionConflict { .. }) => {
+                draft_write_miss(
+                    self,
+                    account_id_for_miss.as_str(),
+                    draft_id_for_miss.as_str(),
+                    expected_revision,
+                )
+                .await
+            }
+            Err(error) => Err(map_persistence_error(error)),
         }
-        Ok(expected_revision + 1)
     }
 
-    /// Deletes a draft, scoped to `account_id`.
     pub async fn delete_player_character_draft(
         &self,
         account_id: &str,
@@ -383,35 +526,26 @@ impl PostgresRepository {
     ) -> Result<bool, RepositoryError> {
         validate_account_id(account_id)?;
         validate_draft_id(draft_id)?;
-        let result = sqlx::query(
-            "DELETE FROM player_character_drafts
-             WHERE id = $1 AND owner_account_id = $2",
-        )
-        .bind(draft_id)
-        .bind(account_id)
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        Ok(result.rows_affected() > 0)
+        let deleted = self
+            .player_character_drafts()
+            .delete_one(doc! {
+                "_id": draft_id,
+                "owner_account_id": account_id,
+            })
+            .await
+            .map_err(|error| mongo_error("delete player character draft", error))?;
+        Ok(deleted.deleted_count == 1)
     }
 
-    /// Cleans up expired drafts. Returns the count of deleted rows.
     pub async fn cleanup_expired_player_character_drafts(&self) -> Result<u64, RepositoryError> {
-        let result = sqlx::query(
-            "DELETE FROM player_character_drafts WHERE expires_at <= CURRENT_TIMESTAMP",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        Ok(result.rows_affected())
+        let deleted = self
+            .player_character_drafts()
+            .delete_many(doc! { "purge_at": { "$lte": DateTime::now() } })
+            .await
+            .map_err(|error| mongo_error("clean expired player character drafts", error))?;
+        Ok(deleted.deleted_count)
     }
 
-    // ── Immutable audits ──
-
-    /// Appends an immutable audit row scoped to `account_id`. The caller is
-    /// responsible for ensuring the audit JSON is canonical and complete. The
-    /// `character_id` and `owner_account_id` are rebound server-side to prevent
-    /// a stale or cross-account audit from being written.
     pub async fn insert_player_character_audit(
         &self,
         account_id: &str,
@@ -430,32 +564,66 @@ impl PostgresRepository {
                 "audit payload must be a JSON object",
             );
         }
-        sqlx::query(
-            "INSERT INTO player_character_audits
-             (character_id, owner_account_id, action, revision, audit_json)
-             VALUES ($1, $2, $3, $4, $5::jsonb)",
-        )
-        .bind(character_id)
-        .bind(account_id)
-        .bind(action)
-        .bind(
-            i64::try_from(revision)
-                .map_err(|_| RepositoryError::NumericRange { field: "revision" })?,
-        )
-        .bind(&audit_json)
-        .execute(&self.pool)
+        let audit_bson = mongodb::bson::to_bson(&audit_json)?;
+        let revision = revision_to_i64(revision)?;
+        let characters = self.player_characters();
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let account_id = account_id.to_owned();
+        let character_id = character_id.to_owned();
+        let action = action.to_owned();
+        self.with_transaction(move |session| {
+            let characters = characters.clone();
+            let audits = audits.clone();
+            let account_id = account_id.clone();
+            let character_id = character_id.clone();
+            let action = action.clone();
+            let audit_bson = audit_bson.clone();
+            Box::pin(async move {
+                let owned = characters
+                    .find_one(doc! {
+                        "_id": &character_id,
+                        "owner_account_id": &account_id,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("authorize player character audit", error)
+                    })?;
+                if owned.is_none() {
+                    return Err(PersistenceError::NotFound {
+                        entity: "player_character",
+                        id: character_id,
+                    });
+                }
+                audits
+                    .insert_one(doc! {
+                        "_id": format!("audit:{}", uuid::Uuid::new_v4()),
+                        "schema_version": 1_i64,
+                        "category": "player_character",
+                        "action": action,
+                        "outcome": "committed",
+                        "scope_kind": "player_character",
+                        "scope_id": character_id,
+                        "actor_account_id": account_id,
+                        "revision": revision,
+                        "metadata": audit_bson,
+                        "created_at": DateTime::now(),
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("insert player character audit", error)
+                    })?;
+                Ok(())
+            })
+        })
         .await
-        .map_err(|error| map_insert_error(error, "player_character_audit", character_id))?;
+        .map_err(map_persistence_error)?;
         Ok(())
     }
 
-    // ── Idempotency receipts ──
-
-    /// Loads an idempotency receipt scoped to `account_id` and `character_id`.
-    /// Returns `None` if no receipt exists or if the receipt belongs to a
-    /// different account/character pair. The unique key is
-    /// `(character_id, idempotency_key)`; the `account_id` is an authorization
-    /// scope that must match the receipt's stored owner.
     pub async fn load_player_character_command_receipt(
         &self,
         account_id: &str,
@@ -465,26 +633,21 @@ impl PostgresRepository {
         validate_account_id(account_id)?;
         validate_receipt_entity_id(character_id)?;
         validate_idempotency_key(idempotency_key)?;
-        let row = sqlx::query(
-            "SELECT character_id, owner_account_id, idempotency_key, command_kind,
-                    request_fingerprint, result_revision, response_json,
-                    created_at::text AS created_at
-             FROM player_character_command_receipts
-             WHERE character_id = $1 AND idempotency_key = $2 AND owner_account_id = $3",
-        )
-        .bind(character_id)
-        .bind(idempotency_key)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(player_character_receipt_from_row).transpose()
+        let scope_kind = receipt_scope_kind(character_id);
+        self.player_character_receipts()
+            .find_one(doc! {
+                "scope_kind": scope_kind,
+                "scope_id": character_id,
+                "actor_account_id": account_id,
+                "idempotency_key": idempotency_key,
+                "state": "committed",
+            })
+            .await
+            .map_err(|error| mongo_error("load player character receipt", error))?
+            .map(stored_receipt)
+            .transpose()
     }
 
-    /// Inserts an idempotency receipt scoped to `account_id` and `character_id`.
-    /// On a duplicate `(character_id, idempotency_key)` the unique constraint
-    /// fires and is mapped to `AlreadyExists`. The caller must check for that
-    /// and reload the existing receipt.
     pub async fn insert_player_character_command_receipt(
         &self,
         receipt: &NewPlayerCharacterReceipt<'_>,
@@ -494,234 +657,244 @@ impl PostgresRepository {
         validate_idempotency_key(receipt.idempotency_key)?;
         validate_command_kind(receipt.command_kind)?;
         validate_fingerprint(&receipt.request_fingerprint)?;
-        sqlx::query(
-            "INSERT INTO player_character_command_receipts
-             (owner_account_id, character_id, idempotency_key, command_kind,
-              request_fingerprint, result_revision, response_json)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
-        )
-        .bind(receipt.owner_account_id)
-        .bind(receipt.character_id)
-        .bind(receipt.idempotency_key)
-        .bind(receipt.command_kind)
-        .bind(&receipt.request_fingerprint)
-        .bind(i64::try_from(receipt.result_revision).map_err(|_| {
-            RepositoryError::NumericRange {
-                field: "result_revision",
-            }
-        })?)
-        .bind(receipt.response_json.clone())
-        .execute(&self.pool)
-        .await
-        .map_err(|error| {
-            map_insert_error(
-                error,
-                "player_character_command_receipt",
-                receipt.character_id,
-            )
-        })?;
+        let stored = PlayerCharacterReceiptDocument {
+            id: format!("receipt:{}", uuid::Uuid::new_v4()),
+            schema_version: 1,
+            scope_kind: receipt_scope_kind(receipt.character_id).to_owned(),
+            scope_id: receipt.character_id.to_owned(),
+            actor_account_id: receipt.owner_account_id.to_owned(),
+            command_kind: receipt.command_kind.to_owned(),
+            idempotency_key: receipt.idempotency_key.to_owned(),
+            request_fingerprint: receipt.request_fingerprint.clone(),
+            result_revision: revision_to_i64(receipt.result_revision)?,
+            response_json: receipt.response_json.clone(),
+            state: "committed".to_owned(),
+            created_at: DateTime::now(),
+        };
+        let subjects = if receipt.character_id.starts_with("draft:") {
+            self.store()
+                .document_collection(CollectionName::PlayerCharacterDrafts)
+        } else {
+            self.store()
+                .document_collection(CollectionName::PlayerCharacters)
+        };
+        let receipts = self.player_character_receipts();
+        let owner_account_id = receipt.owner_account_id.to_owned();
+        let subject_id = receipt.character_id.to_owned();
+        let result = self
+            .with_transaction(move |session| {
+                let subjects = subjects.clone();
+                let receipts = receipts.clone();
+                let owner_account_id = owner_account_id.clone();
+                let subject_id = subject_id.clone();
+                let stored = stored.clone();
+                Box::pin(async move {
+                    let owned = subjects
+                        .find_one(doc! {
+                            "_id": &subject_id,
+                            "owner_account_id": &owner_account_id,
+                        })
+                        .projection(doc! { "_id": 1 })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("authorize player character receipt", error)
+                        })?;
+                    if owned.is_none() {
+                        return Err(PersistenceError::NotFound {
+                            entity: "player_character_receipt_subject",
+                            id: subject_id,
+                        });
+                    }
+                    receipts
+                        .insert_one(stored)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("insert player character receipt", error)
+                        })?;
+                    Ok(())
+                })
+            })
+            .await;
+        if let Err(error) = result {
+            return Err(match error.mongo_failure_kind() {
+                Some(MongoFailureKind::DuplicateKey) => RepositoryError::AlreadyExists {
+                    entity: "player_character_command_receipt",
+                    id: receipt.character_id.to_owned(),
+                },
+                Some(MongoFailureKind::DocumentValidation) => RepositoryError::InvalidDomainState {
+                    entity: "player_character_command_receipt",
+                    id: receipt.character_id.to_owned(),
+                    reason: "document failed MongoDB schema validation",
+                },
+                _ => map_persistence_error(error),
+            });
+        }
         Ok(())
     }
+
+    fn player_characters(&self) -> Collection<PlayerCharacterDocument> {
+        self.store().collection(CollectionName::PlayerCharacters)
+    }
+
+    fn player_character_drafts(&self) -> Collection<PlayerCharacterDraftDocument> {
+        self.store()
+            .collection(CollectionName::PlayerCharacterDrafts)
+    }
+
+    fn player_character_receipts(&self) -> Collection<PlayerCharacterReceiptDocument> {
+        self.store().collection(CollectionName::CommandReceipts)
+    }
 }
 
-/// A new idempotency receipt for a player character command. All fields are
-/// server-derived; the `owner_account_id` is rebound from server authority.
-#[derive(Debug, Clone)]
-pub struct NewPlayerCharacterReceipt<'a> {
-    pub owner_account_id: &'a str,
-    pub character_id: &'a str,
-    pub idempotency_key: &'a str,
-    pub command_kind: &'a str,
-    pub request_fingerprint: String,
-    pub result_revision: u64,
-    pub response_json: serde_json::Value,
+async fn require_account(
+    repository: &MongoRepository,
+    account_id: &str,
+) -> Result<(), RepositoryError> {
+    let account = repository
+        .store()
+        .document_collection(CollectionName::Accounts)
+        .find_one(doc! { "_id": account_id })
+        .projection(doc! { "_id": 1 })
+        .await
+        .map_err(|error| mongo_error("load character owner account", error))?;
+    if account.is_none() {
+        return Err(RepositoryError::NotFound {
+            entity: "account",
+            id: account_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
-/// A stored idempotency receipt loaded from the database.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredPlayerCharacterReceipt {
-    pub character_id: String,
-    pub owner_account_id: String,
-    pub idempotency_key: String,
-    pub command_kind: String,
-    pub request_fingerprint: String,
-    pub result_revision: u64,
-    pub response_json: serde_json::Value,
-    pub created_at: String,
+async fn character_write_miss(
+    repository: &MongoRepository,
+    account_id: &str,
+    character_id: &str,
+    expected_revision: u64,
+) -> Result<u64, RepositoryError> {
+    let current = repository
+        .player_characters()
+        .find_one(doc! {
+            "_id": character_id,
+            "owner_account_id": account_id,
+        })
+        .await
+        .map_err(|error| mongo_error("resolve player character write", error))?;
+    match current {
+        Some(stored) => Err(RepositoryError::RevisionConflict {
+            entity: "player_character",
+            id: character_id.to_owned(),
+            expected: expected_revision,
+            actual: revision_from_i64(stored.revision, "revision")?,
+        }),
+        None => Err(RepositoryError::NotFound {
+            entity: "player_character",
+            id: character_id.to_owned(),
+        }),
+    }
 }
 
-fn player_character_receipt_from_row(
-    row: sqlx::postgres::PgRow,
-) -> Result<StoredPlayerCharacterReceipt, RepositoryError> {
-    let result_revision: i64 = row
-        .try_get("result_revision")
-        .map_err(RepositoryError::Database)?;
-    let response_json: serde_json::Value = row
-        .try_get("response_json")
-        .map_err(RepositoryError::Database)?;
-    Ok(StoredPlayerCharacterReceipt {
-        character_id: row
-            .try_get("character_id")
-            .map_err(RepositoryError::Database)?,
-        owner_account_id: row
-            .try_get("owner_account_id")
-            .map_err(RepositoryError::Database)?,
-        idempotency_key: row
-            .try_get("idempotency_key")
-            .map_err(RepositoryError::Database)?,
-        command_kind: row
-            .try_get("command_kind")
-            .map_err(RepositoryError::Database)?,
-        request_fingerprint: row
-            .try_get("request_fingerprint")
-            .map_err(RepositoryError::Database)?,
-        result_revision: u64::try_from(result_revision).map_err(|_| {
+async fn draft_write_miss(
+    repository: &MongoRepository,
+    account_id: &str,
+    draft_id: &str,
+    expected_revision: u64,
+) -> Result<u64, RepositoryError> {
+    let current = repository
+        .player_character_drafts()
+        .find_one(doc! {
+            "_id": draft_id,
+            "owner_account_id": account_id,
+        })
+        .await
+        .map_err(|error| mongo_error("resolve player character draft write", error))?;
+    match current {
+        Some(stored) => Err(RepositoryError::RevisionConflict {
+            entity: "player_character_draft",
+            id: draft_id.to_owned(),
+            expected: expected_revision,
+            actual: revision_from_i64(stored.revision, "revision")?,
+        }),
+        None => Err(RepositoryError::NotFound {
+            entity: "player_character_draft",
+            id: draft_id.to_owned(),
+        }),
+    }
+}
+
+pub(crate) fn player_character_from_document(
+    stored: PlayerCharacterDocument,
+) -> Result<PlayerCharacter, RepositoryError> {
+    if stored.ruleset_id != stored.build_blueprint.pins.ruleset_id.as_str()
+        || stored.display_name_normalized != normalize_display_name(&stored.display_name)
+    {
+        return invalid(
+            "player_character",
+            &stored.id,
+            "stored library envelope is inconsistent",
+        );
+    }
+    let character = PlayerCharacter {
+        schema_version: u16::try_from(stored.schema_version).map_err(|_| {
             RepositoryError::NumericRange {
-                field: "result_revision",
+                field: "player character schema version",
             }
         })?,
-        response_json,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn validate_idempotency_key(key: &str) -> Result<(), RepositoryError> {
-    // Matches the database CHECK: ^[a-zA-Z0-9_-]{1,128}$
-    if key.is_empty()
-        || key.len() > 128
-        || !key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-    {
-        return invalid(
-            "player_character_command_receipt",
-            key,
-            "idempotency key must be 1-128 ASCII alphanumeric, underscore, or hyphen characters",
-        );
-    }
-    Ok(())
-}
-
-fn validate_command_kind(kind: &str) -> Result<(), RepositoryError> {
-    if kind.is_empty() || kind.len() > 64 {
-        return invalid(
-            "player_character_command_receipt",
-            kind,
-            "command kind must be 1-64 bytes",
-        );
-    }
-    Ok(())
-}
-
-fn validate_fingerprint(fingerprint: &str) -> Result<(), RepositoryError> {
-    if !fingerprint.starts_with("sha256:")
-        || fingerprint.len() != 71
-        || !fingerprint["sha256:".len()..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return invalid(
-            "player_character_command_receipt",
-            fingerprint,
-            "request fingerprint must be a canonical sha256: hex digest",
-        );
-    }
-    Ok(())
-}
-
-fn validate_audit_action(action: &str) -> Result<(), RepositoryError> {
-    if action.is_empty() || action.len() > 64 {
-        return invalid(
-            "player_character_audit",
-            action,
-            "audit action must be 1-64 bytes",
-        );
-    }
-    Ok(())
-}
-
-fn player_character_from_row(
-    row: &sqlx::postgres::PgRow,
-) -> Result<PlayerCharacter, RepositoryError> {
-    let choices_json: serde_json::Value = row
-        .try_get("choices_json")
-        .map_err(RepositoryError::Database)?;
-    let choices = serde_json::from_value::<HeroChoices>(choices_json).map_err(|error| {
-        RepositoryError::InvalidStoredData {
-            entity: "player_character",
-            id: row.try_get::<String, _>("id").unwrap_or_default(),
-            source: error,
-        }
+        character_id: stored.id.clone(),
+        owner_account_id: stored.owner_account_id,
+        revision: revision_from_i64(stored.revision, "revision")?,
+        display_name: stored.display_name,
+        choices: stored.build_blueprint,
+    };
+    character.validate().map_err(|error| {
+        to_repository_error("player_character", &character.character_id, &error)
     })?;
-    let schema_version: i32 = row
-        .try_get("schema_version")
-        .map_err(RepositoryError::Database)?;
-    Ok(PlayerCharacter {
-        schema_version: schema_version as u16,
-        character_id: row.try_get("id").map_err(RepositoryError::Database)?,
-        owner_account_id: row
-            .try_get("owner_account_id")
-            .map_err(RepositoryError::Database)?,
-        revision: row
-            .try_get::<i64, _>("revision")
-            .map_err(RepositoryError::Database)? as u64,
-        display_name: row
-            .try_get("display_name")
-            .map_err(RepositoryError::Database)?,
-        choices,
-    })
+    Ok(character)
 }
 
-fn player_character_summary_from_row(
-    row: &sqlx::postgres::PgRow,
+fn player_character_summary(
+    stored: PlayerCharacterDocument,
 ) -> Result<PlayerCharacterSummary, RepositoryError> {
     Ok(PlayerCharacterSummary {
-        id: row.try_get("id").map_err(RepositoryError::Database)?,
-        owner_account_id: row
-            .try_get("owner_account_id")
-            .map_err(RepositoryError::Database)?,
-        revision: row
-            .try_get::<i64, _>("revision")
-            .map_err(RepositoryError::Database)? as u64,
-        display_name: row
-            .try_get("display_name")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
+        id: stored.id,
+        owner_account_id: stored.owner_account_id,
+        revision: revision_from_i64(stored.revision, "revision")?,
+        display_name: stored.display_name,
+        created_at: date_string(stored.created_at, "player_characters")?,
+        updated_at: date_string(stored.updated_at, "player_characters")?,
     })
 }
 
-fn draft_summary_from_row(
-    row: &sqlx::postgres::PgRow,
+fn draft_summary(
+    stored: PlayerCharacterDraftDocument,
 ) -> Result<PlayerCharacterDraftSummary, RepositoryError> {
     Ok(PlayerCharacterDraftSummary {
-        id: row.try_get("id").map_err(RepositoryError::Database)?,
-        owner_account_id: row
-            .try_get("owner_account_id")
-            .map_err(RepositoryError::Database)?,
-        revision: row
-            .try_get::<i64, _>("revision")
-            .map_err(RepositoryError::Database)? as u64,
-        expires_at: row
-            .try_get("expires_at")
-            .map_err(RepositoryError::Database)?,
-        step: row.try_get("step").map_err(RepositoryError::Database)?,
-        reviewed: row.try_get("reviewed").map_err(RepositoryError::Database)?,
-        committed_character_id: row
-            .try_get("committed_character_id")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
+        id: stored.id,
+        owner_account_id: stored.owner_account_id,
+        revision: revision_from_i64(stored.revision, "revision")?,
+        expires_at: date_string(stored.expires_at, "player_character_drafts")?,
+        step: stored.step,
+        reviewed: stored.state == "committed",
+        committed_character_id: stored.committed_character_id,
+        created_at: date_string(stored.created_at, "player_character_drafts")?,
+        updated_at: date_string(stored.updated_at, "player_character_drafts")?,
+    })
+}
+
+fn stored_receipt(
+    stored: PlayerCharacterReceiptDocument,
+) -> Result<StoredPlayerCharacterReceipt, RepositoryError> {
+    Ok(StoredPlayerCharacterReceipt {
+        character_id: stored.scope_id,
+        owner_account_id: stored.actor_account_id,
+        idempotency_key: stored.idempotency_key,
+        command_kind: stored.command_kind,
+        request_fingerprint: stored.request_fingerprint,
+        result_revision: revision_from_i64(stored.result_revision, "result_revision")?,
+        response_json: stored.response_json,
+        created_at: date_string(stored.created_at, "command_receipts")?,
     })
 }
 
@@ -760,16 +933,10 @@ fn validate_draft_id(draft_id: &str) -> Result<(), RepositoryError> {
     Ok(())
 }
 
-/// Validates an entity ID used in idempotency receipts. Both `character:` and
-/// `draft:` prefixed IDs are accepted because draft mutations also write
-/// receipts scoped to the draft ID.
 fn validate_receipt_entity_id(entity_id: &str) -> Result<(), RepositoryError> {
     if (entity_id.starts_with("character:") || entity_id.starts_with("draft:"))
         && is_valid_opaque_id(entity_id)
     {
-        return Ok(());
-    }
-    if entity_id.starts_with("character:local-") {
         return Ok(());
     }
     invalid(
@@ -777,6 +944,99 @@ fn validate_receipt_entity_id(entity_id: &str) -> Result<(), RepositoryError> {
         entity_id,
         "entity identifier is invalid",
     )
+}
+
+fn validate_display_name(name: &str) -> Result<(), RepositoryError> {
+    if name.trim().is_empty() || name.chars().count() > 200 || name.chars().any(char::is_control) {
+        return invalid(
+            "player_character",
+            "display-name",
+            "display name must be 1-200 non-control characters",
+        );
+    }
+    Ok(())
+}
+
+fn validate_step(step: &str) -> Result<(), RepositoryError> {
+    if step.is_empty()
+        || step.len() > 64
+        || !step
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return invalid(
+            "player_character_draft",
+            "step",
+            "draft step must be a bounded opaque label",
+        );
+    }
+    Ok(())
+}
+
+fn validate_idempotency_key(key: &str) -> Result<(), RepositoryError> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return invalid(
+            "player_character_command_receipt",
+            key,
+            "idempotency key must be 1-128 ASCII alphanumeric, underscore, or hyphen characters",
+        );
+    }
+    Ok(())
+}
+
+fn validate_command_kind(kind: &str) -> Result<(), RepositoryError> {
+    if kind.is_empty() || kind.len() > 64 {
+        return invalid(
+            "player_character_command_receipt",
+            kind,
+            "command kind must be 1-64 bytes",
+        );
+    }
+    Ok(())
+}
+
+fn validate_fingerprint(fingerprint: &str) -> Result<(), RepositoryError> {
+    if !fingerprint.starts_with("sha256:")
+        || fingerprint.len() != 71
+        || !fingerprint["sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return invalid(
+            "player_character_command_receipt",
+            fingerprint,
+            "request fingerprint must be a canonical sha256: hex digest",
+        );
+    }
+    Ok(())
+}
+
+fn validate_audit_action(action: &str) -> Result<(), RepositoryError> {
+    if action.is_empty() || action.len() > 64 {
+        return invalid(
+            "player_character_audit",
+            action,
+            "audit action must be 1-64 bytes",
+        );
+    }
+    Ok(())
+}
+
+fn normalize_display_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+fn receipt_scope_kind(id: &str) -> &'static str {
+    if id.starts_with("draft:") {
+        "player_character_draft"
+    } else {
+        "player_character"
+    }
 }
 
 fn to_repository_error(entity: &'static str, id: &str, _error: &HeroError) -> RepositoryError {
@@ -787,29 +1047,77 @@ fn to_repository_error(entity: &'static str, id: &str, _error: &HeroError) -> Re
     }
 }
 
-#[allow(clippy::collapsible_if)]
-fn map_insert_error(error: sqlx::Error, entity: &'static str, id: &str) -> RepositoryError {
-    if let sqlx::Error::Database(db_error) = &error {
-        if let Some(code) = db_error.code().as_deref() {
-            match code {
-                "23505" => {
-                    return RepositoryError::AlreadyExists {
-                        entity,
-                        id: id.to_owned(),
-                    };
-                }
-                "23503" => {
-                    return RepositoryError::InvalidDomainState {
-                        entity,
-                        id: id.to_owned(),
-                        reason: "referenced account does not exist",
-                    };
-                }
-                _ => {}
-            }
-        }
+fn revision_to_i64(value: u64) -> Result<i64, RepositoryError> {
+    i64::try_from(value).map_err(|_| RepositoryError::NumericRange { field: "revision" })
+}
+
+fn revision_from_i64(value: i64, field: &'static str) -> Result<u64, RepositoryError> {
+    u64::try_from(value).map_err(|_| RepositoryError::NumericRange { field })
+}
+
+fn epoch_seconds_to_date(value: u64) -> Result<DateTime, RepositoryError> {
+    let milliseconds = value
+        .checked_mul(1_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RepositoryError::NumericRange {
+            field: "expires_at",
+        })?;
+    Ok(DateTime::from_millis(milliseconds))
+}
+
+fn date_string(value: DateTime, collection: &str) -> Result<String, RepositoryError> {
+    value.try_to_rfc3339_string().map_err(|_| {
+        RepositoryError::Persistence(PersistenceError::SchemaDrift {
+            collection: collection.to_owned(),
+            detail: "stored BSON date is outside RFC 3339 range".to_owned(),
+        })
+    })
+}
+
+fn mongo_error(operation: &'static str, error: mongodb::error::Error) -> RepositoryError {
+    RepositoryError::Persistence(PersistenceError::mongo(operation, error))
+}
+
+fn map_mongo_write(
+    error: mongodb::error::Error,
+    operation: &'static str,
+    entity: &'static str,
+    id: &str,
+) -> RepositoryError {
+    let persistence = PersistenceError::mongo(operation, error);
+    match persistence.mongo_failure_kind() {
+        Some(MongoFailureKind::DuplicateKey) => RepositoryError::AlreadyExists {
+            entity,
+            id: id.to_owned(),
+        },
+        Some(MongoFailureKind::DocumentValidation) => RepositoryError::InvalidDomainState {
+            entity,
+            id: id.to_owned(),
+            reason: "document failed MongoDB schema validation",
+        },
+        _ => RepositoryError::Persistence(persistence),
     }
-    RepositoryError::Database(error)
+}
+
+fn map_persistence_error(error: PersistenceError) -> RepositoryError {
+    match error {
+        PersistenceError::NotFound { entity, id } => RepositoryError::NotFound { entity, id },
+        PersistenceError::AlreadyExists { entity, id } => {
+            RepositoryError::AlreadyExists { entity, id }
+        }
+        PersistenceError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        } => RepositoryError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        },
+        other => RepositoryError::Persistence(other),
+    }
 }
 
 fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T, RepositoryError> {
@@ -822,19 +1130,73 @@ fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T,
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::repository::MIGRATOR;
+    use std::time::Duration;
+
     use manchester_dnd_core::hero::{
         AncestryId, BackgroundId, BackgroundSelection, ClassSelection, EquipmentId,
         EquipmentSelection, FightingStyleId, HeroChoices, HeroConceptId, HeroPins,
         HeroPresentation, SkillId, StandardArrayAssignment, ThemeId,
     };
-    use sqlx::PgPool;
+    use mongodb::bson::doc;
     use uuid::Uuid;
 
-    fn test_choices(theme: ThemeId) -> HeroChoices {
+    use super::*;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::SchemaReconciler,
+    };
+
+    async fn test_repository() -> Option<(MongoRepository, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping MongoDB contract: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(!uri.trim().is_empty());
+        let database = format!("mdnd_test_characters_{}", Uuid::new_v4().simple());
+        let store = crate::persistence::MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 4,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 2,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("schema must apply");
+        Some((MongoRepository::new(store), database))
+    }
+
+    async fn insert_account(repository: &MongoRepository, account_id: &str) {
+        repository
+            .store()
+            .document_collection(CollectionName::Accounts)
+            .insert_one(doc! {
+                "_id": account_id,
+                "schema_version": 1_i64,
+                "revision": 1_i64,
+                "role": "user",
+                "username_normalized": format!("user-{}", Uuid::new_v4()),
+                "email_lookup_hmac": format!("hmac-sha256:{}", Uuid::new_v4().simple()),
+                "password_phc": "$argon2id$test",
+                "login_enabled": false,
+                "created_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            })
+            .await
+            .expect("account fixture must insert");
+    }
+
+    fn choices() -> HeroChoices {
         HeroChoices {
-            pins: HeroPins::mvp(theme),
+            pins: HeroPins::mvp(ThemeId::RainboundBorough),
             concept: HeroConceptId::CanalGuardian,
             ancestry: AncestryId::Human,
             class: ClassSelection::Fighter {
@@ -867,250 +1229,166 @@ mod tests {
             presentation: HeroPresentation {
                 name: "Test Hero".to_owned(),
                 pronouns: "they/them".to_owned(),
-                appearance: "A weathered adventurer".to_owned(),
-                ideal: "Justice for all".to_owned(),
-                bond: "Owes a life debt".to_owned(),
+                appearance: "Weathered".to_owned(),
+                ideal: "Justice".to_owned(),
+                bond: "The canal".to_owned(),
                 flaw: "Too trusting".to_owned(),
                 tone_limits: Vec::new(),
             },
         }
     }
 
-    fn new_character(account_id: &str, name: &str) -> PlayerCharacter {
-        PlayerCharacter::new(
-            format!("character:{}", Uuid::new_v4()),
-            account_id.to_owned(),
-            name.to_owned(),
-            test_choices(ThemeId::RainboundBorough),
-        )
-        .expect("test character should be valid")
-    }
-
-    async fn insert_test_account(pool: &PgPool, account_id: &str) {
-        sqlx::query(
-            "INSERT INTO accounts (id, display_name, login_enabled) VALUES ($1, $2, FALSE)",
-        )
-        .bind(account_id)
-        .bind("Test Account")
-        .execute(pool)
-        .await
-        .expect("test account should insert");
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn create_load_list_and_delete_player_character(pool: PgPool) {
-        let account = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, account).await;
-        let repo = PostgresRepository::from_pool(pool);
-        let character = new_character(account, "First Hero");
-
-        let created = repo
-            .create_player_character(account, &character)
-            .await
-            .expect("create should succeed");
-        assert_eq!(created.character_id, character.character_id);
-        assert_eq!(created.owner_account_id, account);
-
-        let loaded = repo
-            .load_player_character(account, &character.character_id)
-            .await
-            .expect("load should succeed")
-            .expect("character should exist");
-        assert_eq!(loaded.display_name, "First Hero");
-        assert_eq!(loaded.choices, character.choices);
-
-        let listed = repo
-            .list_player_characters(account)
-            .await
-            .expect("list should succeed");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].display_name, "First Hero");
-
-        assert!(
-            repo.delete_player_character(account, &character.character_id)
-                .await
-                .expect("delete should succeed")
-        );
-        assert!(
-            repo.load_player_character(account, &character.character_id)
-                .await
-                .expect("load should succeed")
-                .is_none()
-        );
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn cross_account_access_returns_not_found(pool: PgPool) {
-        let account_a = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let account_b = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, account_a).await;
-        insert_test_account(&pool, account_b).await;
-        let repo = PostgresRepository::from_pool(pool);
-        let character = new_character(account_a, "Account A Hero");
-
-        repo.create_player_character(account_a, &character)
-            .await
-            .expect("create should succeed");
-
-        // Account B cannot load account A's character.
-        let result = repo
-            .load_player_character(account_b, &character.character_id)
-            .await
-            .expect("query should succeed");
-        assert!(result.is_none(), "cross-account load should return None");
-
-        // Account B cannot list account A's characters.
-        let listed = repo
-            .list_player_characters(account_b)
-            .await
-            .expect("list should succeed");
-        assert!(listed.is_empty(), "cross-account list should be empty");
-
-        // Account B cannot delete account A's character.
-        assert!(
-            !repo
-                .delete_player_character(account_b, &character.character_id)
-                .await
-                .expect("delete should succeed"),
-            "cross-account delete should return false"
-        );
-
-        // Account A can still load the character.
-        assert!(
-            repo.load_player_character(account_a, &character.character_id)
-                .await
-                .expect("load should succeed")
-                .is_some()
-        );
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn update_display_name_with_optimistic_revision(pool: PgPool) {
-        let account = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, account).await;
-        let repo = PostgresRepository::from_pool(pool);
-        let character = new_character(account, "Original Name");
-        repo.create_player_character(account, &character)
-            .await
-            .expect("create should succeed");
-
-        let new_revision = repo
-            .update_player_character_display_name(account, &character.character_id, 0, "New Name")
-            .await
-            .expect("update should succeed");
-        assert_eq!(new_revision, 1);
-
-        let loaded = repo
-            .load_player_character(account, &character.character_id)
-            .await
-            .expect("load should succeed")
-            .expect("character should exist");
-        assert_eq!(loaded.display_name, "New Name");
-        assert_eq!(loaded.revision, 1);
-
-        // Stale revision fails.
-        let result = repo
-            .update_player_character_display_name(account, &character.character_id, 0, "Stale")
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn draft_create_load_save_commit_and_delete(pool: PgPool) {
-        let account = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, account).await;
-        let repo = PostgresRepository::from_pool(pool);
-        let draft_id = format!("draft:{}", Uuid::new_v4());
-
-        let draft = repo
-            .create_player_character_draft(account, &draft_id, 9999999999)
-            .await
-            .expect("create draft should succeed");
-        assert_eq!(draft.step, "campaign_theme");
-        assert!(!draft.reviewed);
-
-        let (loaded, choices) = repo
-            .load_player_character_draft(account, &draft_id)
-            .await
-            .expect("load should succeed")
-            .expect("draft should exist");
-        assert_eq!(loaded.id, draft_id);
-        assert!(choices.is_none());
-
-        let choices = test_choices(ThemeId::RainboundBorough);
-        let new_rev = repo
-            .save_player_character_draft_choices(account, &draft_id, 0, &choices, "review")
-            .await
-            .expect("save should succeed");
-        assert_eq!(new_rev, 1);
-
-        let (_, loaded_choices) = repo
-            .load_player_character_draft(account, &draft_id)
-            .await
-            .expect("load should succeed")
-            .expect("draft should exist");
-        assert!(loaded_choices.is_some());
-
+    #[tokio::test]
+    async fn mongo_character_contract_covers_isolation_revision_drafts_and_level_boundary() {
+        let Some((repository, database)) = test_repository().await else {
+            return;
+        };
+        let account_a = format!("account:{}", Uuid::new_v4());
+        let account_b = format!("account:{}", Uuid::new_v4());
+        insert_account(&repository, &account_a).await;
+        insert_account(&repository, &account_b).await;
         let character_id = format!("character:{}", Uuid::new_v4());
         let character = PlayerCharacter::new(
             character_id.clone(),
-            account.to_owned(),
-            "Draft Hero".to_owned(),
-            test_choices(ThemeId::RainboundBorough),
+            account_a.clone(),
+            "Mara".to_owned(),
+            choices(),
         )
-        .expect("character should be valid");
-        repo.create_player_character(account, &character)
-            .await
-            .expect("create character should succeed");
-        repo.commit_player_character_draft(account, &draft_id, 1, &character_id)
-            .await
-            .expect("commit should succeed");
+        .expect("character fixture must validate");
 
-        let (committed, _) = repo
-            .load_player_character_draft(account, &draft_id)
+        repository
+            .create_player_character(&account_a, &character)
             .await
-            .expect("load should succeed")
-            .expect("draft should exist");
-        assert!(committed.reviewed);
-        assert_eq!(committed.committed_character_id, Some(character_id));
-
+            .expect("create must work");
         assert!(
-            repo.delete_player_character_draft(account, &draft_id)
+            repository
+                .load_player_character(&account_b, &character_id)
                 .await
-                .expect("delete should succeed")
+                .expect("foreign load must be safe")
+                .is_none()
         );
-    }
+        let raw = repository
+            .store()
+            .document_collection(CollectionName::PlayerCharacters)
+            .find_one(doc! { "_id": &character_id })
+            .await
+            .expect("raw read must work")
+            .expect("character must exist");
+        for forbidden in [
+            "level",
+            "experience_points",
+            "current_hit_points",
+            "maximum_hit_points",
+            "campaign_id",
+            "runtime",
+            "progression",
+        ] {
+            assert!(!raw.contains_key(forbidden), "{forbidden}");
+        }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn cross_account_draft_access_returns_not_found(pool: PgPool) {
-        let account_a = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let account_b = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, account_a).await;
-        insert_test_account(&pool, account_b).await;
-        let repo = PostgresRepository::from_pool(pool);
+        assert_eq!(
+            repository
+                .update_player_character_display_name(&account_a, &character_id, 0, "Mara Venn")
+                .await
+                .expect("CAS update must work"),
+            1
+        );
+        assert!(matches!(
+            repository
+                .update_player_character_display_name(&account_a, &character_id, 0, "Stale")
+                .await,
+            Err(RepositoryError::RevisionConflict { .. })
+        ));
+
         let draft_id = format!("draft:{}", Uuid::new_v4());
-
-        repo.create_player_character_draft(account_a, &draft_id, 9999999999)
+        repository
+            .create_player_character_draft(&account_a, &draft_id, 4_102_444_800)
             .await
-            .expect("create should succeed");
-
-        // Account B cannot load account A's draft.
-        let result = repo
-            .load_player_character_draft(account_b, &draft_id)
+            .expect("draft create must work");
+        repository
+            .save_player_character_draft_choices(&account_a, &draft_id, 0, &choices(), "review")
             .await
-            .expect("query should succeed");
+            .expect("draft save must work");
+        assert!(matches!(
+            repository
+                .save_player_character_draft_choices(&account_a, &draft_id, 0, &choices(), "stale",)
+                .await,
+            Err(RepositoryError::RevisionConflict { .. })
+        ));
+        repository
+            .commit_player_character_draft(&account_a, &draft_id, 1, &character_id)
+            .await
+            .expect("draft commit must work");
+        let (draft, loaded_choices) = repository
+            .load_player_character_draft(&account_a, &draft_id)
+            .await
+            .expect("draft load must work")
+            .expect("draft must exist");
+        assert!(draft.reviewed);
+        assert!(loaded_choices.is_some());
         assert!(
-            result.is_none(),
-            "cross-account draft load should return None"
-        );
-
-        // Account B cannot delete account A's draft.
-        assert!(
-            !repo
-                .delete_player_character_draft(account_b, &draft_id)
+            repository
+                .load_player_character_draft(&account_b, &draft_id)
                 .await
-                .expect("delete should succeed"),
-            "cross-account draft delete should return false"
+                .expect("foreign draft load must be safe")
+                .is_none()
         );
+
+        let fingerprint = format!("sha256:{}", "a".repeat(64));
+        let foreign_receipt = NewPlayerCharacterReceipt {
+            owner_account_id: &account_b,
+            character_id: &character_id,
+            idempotency_key: "foreign-receipt",
+            command_kind: "player_character_update_display_name",
+            request_fingerprint: fingerprint.clone(),
+            result_revision: 1,
+            response_json: serde_json::json!({ "result_revision": 1 }),
+        };
+        assert!(matches!(
+            repository
+                .insert_player_character_command_receipt(&foreign_receipt)
+                .await,
+            Err(RepositoryError::NotFound { .. })
+        ));
+        let receipt = NewPlayerCharacterReceipt {
+            owner_account_id: &account_a,
+            character_id: &character_id,
+            idempotency_key: "rename-once",
+            command_kind: "player_character_update_display_name",
+            request_fingerprint: fingerprint.clone(),
+            result_revision: 1,
+            response_json: serde_json::json!({ "result_revision": 1 }),
+        };
+        repository
+            .insert_player_character_command_receipt(&receipt)
+            .await
+            .expect("receipt insert must work");
+        assert_eq!(
+            repository
+                .load_player_character_command_receipt(&account_a, &character_id, "rename-once")
+                .await
+                .expect("receipt load must work")
+                .expect("receipt must exist")
+                .request_fingerprint,
+            fingerprint
+        );
+        assert!(
+            repository
+                .load_player_character_command_receipt(&account_b, &character_id, "rename-once")
+                .await
+                .expect("foreign receipt lookup must be safe")
+                .is_none()
+        );
+
+        assert!(
+            database.starts_with("mdnd_test_characters_"),
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
+            .await
+            .expect("test database must drop");
     }
 }

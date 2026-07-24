@@ -6,6 +6,7 @@
 
 mod ability;
 mod action;
+pub mod action_points;
 mod ai;
 pub mod ai_turn;
 pub mod campaign_pins;

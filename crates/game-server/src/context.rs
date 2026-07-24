@@ -10,7 +10,8 @@ use crate::{
     generation_ledger::InlineGenerationLedger,
     gm::GameMasterService,
     inspiration::PrivateInspirationApplicationService,
-    repository::PostgresRepository,
+    persistence::{MongoAccountRepository, MongoStore, SchemaReconciler},
+    repository::MongoRepository,
     scene_images::SceneImageService,
     seed::SeedVault,
     typed_gm::{TypedGmService, TypedGmServiceConfig},
@@ -23,6 +24,8 @@ pub struct ServerContext {
     pub active_content: Arc<ActiveContentCatalog>,
     pub application: GameApplicationService,
     pub authentication: crate::auth::AuthService,
+    pub mongo: MongoStore,
+    pub cache: crate::cache::CacheService,
     pub text_generator: Arc<dyn TextGenerator>,
     pub image_generator: Arc<dyn ImageGenerator>,
     pub game_master: GameMasterService,
@@ -43,17 +46,29 @@ impl ServerContext {
         // Content is validated before opening the database or creating secrets:
         // an absent, quarantined, or unpinned required pack aborts boot cleanly.
         let active_content = load_active_content(&config.content_packs)?;
-        let repository =
-            PostgresRepository::connect(config.database_url.expose_secret(), config.database)
-                .await?;
-        let authentication =
-            crate::auth::AuthService::new(repository.clone(), config.authentication.clone())
-                .map_err(|_| {
-                    BootstrapError::Config(ConfigError::InvalidValue {
-                        name: "AUTH_ARGON2_*",
-                        reason: "Argon2id parameter construction failed".to_owned(),
-                    })
-                })?;
+        let mongo = MongoStore::connect(&config.persistence.mongodb).await?;
+        let schema = SchemaReconciler::new(mongo.clone());
+        match config.persistence.mongodb.schema_policy {
+            crate::config::MongoSchemaPolicy::ApplyAndVerify => {
+                schema.apply().await?;
+            }
+            crate::config::MongoSchemaPolicy::VerifyOnly => {
+                schema.verify().await?;
+            }
+        }
+        let repository = MongoRepository::new(mongo.clone());
+        let cache = crate::cache::CacheService::from_config(&config.dragonfly)?;
+        let authentication = crate::auth::AuthService::new(
+            MongoAccountRepository::new(mongo.clone()),
+            cache.clone(),
+            config.authentication.clone(),
+        )
+        .map_err(|_| {
+            BootstrapError::Config(ConfigError::InvalidValue {
+                name: "AUTH_CRYPTO",
+                reason: "authentication cryptographic configuration is invalid".to_owned(),
+            })
+        })?;
         let generation_ledger = InlineGenerationLedger::new(
             repository.clone(),
             &config.text_llm,
@@ -92,6 +107,8 @@ impl ServerContext {
             active_content,
             application,
             authentication,
+            mongo,
+            cache,
             text_generator: providers.text,
             image_generator: providers.image,
             game_master,

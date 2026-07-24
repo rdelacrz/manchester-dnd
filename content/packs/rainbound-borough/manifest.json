@@ -2,7 +2,7 @@
   "pack_schema": "content-pack/v1",
   "id": "dev.manchester-arcana.rainbound-borough",
   "version": "1.0.0",
-  "digest": "sha256:9b92fc08979605e05d2f3213e1c8e2df62cc24a55ee294f292418b00a94f7a61",
+  "digest": "sha256:40178f823a99cafebc469ff73e2d99d0598370f87c65fd19fd7a343188a51563",
   "display_name": "Rainbound Borough",
   "categories": ["theme"],
   "compatible_rulesets": ["srd-5.1-cc"],
@@ -22,7 +22,7 @@
     {
       "id": "dev.manchester-arcana.core-mvp",
       "version": "1.0.0",
-      "digest": "sha256:c62468355cc42f51b433fc19b8b32869b35cd308e9a937a6b8bea6df7dcfb7ca"
+      "digest": "sha256:ec42825e68316f286c027dbbc1a08d0dfa9f4f97c304d5685b178c933a5ca924"
     }
   ],
   "license": {

@@ -21,32 +21,32 @@ This remains a private working build. Hosted identity, real-provider approval, t
 
 ## Run locally
 
-Prerequisites are the repository's pinned Rust toolchain, the `wasm32-unknown-unknown` target, `cargo-leptos` 0.3.7, and PostgreSQL. The included Compose service provides the development database.
+Prerequisites are the repository's pinned Rust toolchain, the `wasm32-unknown-unknown` target, `cargo-leptos` 0.3.7, Docker Compose, MongoDB 8 replica-set support, and optional DragonflyDB. The included Compose services provide both data services.
 
 ```sh
 rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
 cargo install --locked --version 0.3.7 cargo-leptos
-docker compose up -d --wait postgres
+docker compose up -d --wait mongodb dragonfly
+cargo run --locked -p manchester-dnd-server --bin mongo-admin -- schema apply
 cargo leptos watch
 ```
 
 Open <http://127.0.0.1:6789>. Model calls and private inspiration are disabled in `.env.example`, so local development cannot accidentally make paid requests or read a private source tree. Keep those gates off unless their documented prerequisites are satisfied.
 
-`APP_ACCESS_MODE` defaults to `local`. Local mode must bind to a loopback address, denies browser framing, and the current game server functions accept only matching loopback HTTP `Host`/`Origin` authorities. These browser controls are not authentication and do not protect against another local process. The mode is deliberately unsuitable for reverse-proxy or remote exposure. Setting `APP_ACCESS_MODE=hosted` fails startup until authenticated browser sessions and campaign authorization exist.
+`APP_ACCESS_MODE` defaults to `local`. Local mode must bind to a loopback address and denies browser framing. Authentication uses MongoDB-backed accounts/sessions with one-use signup access codes. Hosted mode additionally requires explicit secure cookies, a canonical HTTPS origin, MongoDB TLS/authentication, and separate email-lookup/encryption keys.
 
 Loading the page creates or resumes the local campaign. Complete the guided hero creator, use **Inspect the runes**, then play only the legal actions rendered by the encounter. Reloading at any point projects the stored revision, dice, HP, resources, and outcome without rerolling.
 
 Operational probes are available at `GET /health/live` (process liveness) and `GET /health/ready` (database readiness).
 
-Repository/application tests use SQLx's isolated PostgreSQL test databases. The configured role must be allowed to create and drop databases; the development Compose role has that permission:
+Repository/application tests use randomly named isolated MongoDB databases on the local replica set. The test URI must be an explicit loopback test administrator because each test applies validators/indexes and drops only its safeguarded random database:
 
 ```sh
-DATABASE_URL=postgresql://manchester_arcana:manchester_arcana@127.0.0.1:5432/manchester_arcana cargo test --workspace
+MONGODB_TEST_URI='mongodb://root:<local-test-password>@127.0.0.1:27017/?authSource=admin&replicaSet=rs0&directConnection=true' \
+  cargo test --locked --workspace -- --test-threads=1
 ```
 
-The credentials in `.env.example` and `compose.yaml` are local-development defaults only. Deployments must inject a secret-managed URL for a least-privilege PostgreSQL role and require encrypted database connections where traffic leaves the host/private network.
-
-Existing embedded-database files are not imported automatically. Preserve a backup and complete the verified one-time export/import described in the [persistence plan](docs/planning/05-persistence.md) before retiring any legacy file.
+The credentials in `.env.example` and `compose.yaml` are local-development defaults only. Deployments must inject secret-managed least-privilege MongoDB/Dragonfly credentials and require certificate-validated TLS outside loopback. MongoDB is authoritative; DragonflyDB may be flushed or lost without losing durable state.
 
 ## Workspace
 
@@ -56,7 +56,7 @@ app/src/components/   Reusable UI components and server-function boundary
 app/src/views/        Route-level views
 crates/game-core/     Deterministic, framework-independent game rules
 crates/game-server/   Application commands, configuration, AI, events, persistence
-migrations/           PostgreSQL schema
+crates/game-server/src/persistence/ MongoDB validators, indexes, auth, and schema reconciliation
 prompts/               AI-GM, theme, and private event-pack conventions
 docs/planning/         Product, architecture, safety, and delivery plans
 ```

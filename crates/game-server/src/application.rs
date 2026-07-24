@@ -22,9 +22,7 @@ use manchester_dnd_core::{
         SOOT_WIGHT_ENCOUNTER_ID, SOOT_WIGHT_POLICY_ID, player_legal_actions,
         require_player_control, resolve_encounter, select_soot_wight_policy_intent,
     },
-    hero::{
-        DamageType as HeroDamageType, HeroCharacter, HeroClass, ResourceKind, SkillId, ThemeId,
-    },
+    hero::{DamageType as HeroDamageType, HeroCharacter, HeroClass, ResourceKind, SkillId},
     is_valid_opaque_id,
     rules_matrix::{
         AttitudeShift, ClockKind, D20TestOutcome, ExplorationSocialCommand, ExplorationSocialFact,
@@ -45,7 +43,7 @@ use crate::{
     config::AccessMode,
     error::{ApplicationError, RepositoryError},
     repository::{
-        EncounterHeroUpdate, NewCommandReceipt, PostgresRepository, StoredDocument, TurnAudit,
+        EncounterHeroUpdate, MongoRepository, NewCommandReceipt, StoredDocument, TurnAudit,
     },
     seed::SeedVault,
 };
@@ -64,8 +62,14 @@ pub use player_characters::{
     PLAYER_CHARACTER_DRAFT_RETENTION_SECONDS, PLAYER_CHARACTER_DRAFT_TTL_SECONDS,
 };
 
+#[cfg(not(test))]
 pub const LOCAL_CAMPAIGN_SESSION_ID: &str = "local-campaign";
+#[cfg(test)]
+pub const LOCAL_CAMPAIGN_SESSION_ID: &str = "campaign:local";
+#[cfg(not(test))]
 pub const LOCAL_CHARACTER_ID: &str = "local-hero";
+#[cfg(test)]
+pub const LOCAL_CHARACTER_ID: &str = "character:local";
 pub const LOCAL_EXPLORATION_ACTION_ID: &str = "inspect-viaduct-runes";
 pub const LOCAL_SOCIAL_ACTION_ID: &str = "parley-lockkeeper";
 
@@ -188,7 +192,7 @@ where
 #[derive(Clone)]
 pub struct GameApplicationService {
     access_mode: AccessMode,
-    repository: PostgresRepository,
+    repository: MongoRepository,
     seed_vault: Arc<SeedVault>,
     campaign_pins: Arc<CampaignPinRuntime>,
     dice: Arc<StdMutex<Box<dyn DiceSource + Send>>>,
@@ -199,7 +203,7 @@ pub struct GameApplicationService {
 impl GameApplicationService {
     pub fn new(
         access_mode: AccessMode,
-        repository: PostgresRepository,
+        repository: MongoRepository,
         seed_vault: Arc<SeedVault>,
         campaign_pins: Arc<CampaignPinRuntime>,
     ) -> Self {
@@ -217,7 +221,7 @@ impl GameApplicationService {
     /// do not belong to the game application service (e.g. player character
     /// library operations).
     #[must_use]
-    pub fn repository(&self) -> &PostgresRepository {
+    pub fn repository(&self) -> &MongoRepository {
         &self.repository
     }
 
@@ -257,7 +261,7 @@ impl GameApplicationService {
     #[cfg(test)]
     pub fn with_sources(
         access_mode: AccessMode,
-        repository: PostgresRepository,
+        repository: MongoRepository,
         seed_vault: Arc<SeedVault>,
         dice: impl DiceSource + Send + 'static,
         clock: impl UnixTimeSource + 'static,
@@ -274,7 +278,7 @@ impl GameApplicationService {
 
     fn with_sources_and_pins(
         access_mode: AccessMode,
-        repository: PostgresRepository,
+        repository: MongoRepository,
         seed_vault: Arc<SeedVault>,
         campaign_pins: Arc<CampaignPinRuntime>,
         dice: impl DiceSource + Send + 'static,
@@ -347,7 +351,11 @@ impl GameApplicationService {
 
         if let Some(receipt) = self
             .repository
-            .load_command_receipt(&command.campaign_session_id, &command.idempotency_key)
+            .load_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
+                &command.campaign_session_id,
+                &command.idempotency_key,
+            )
             .await
             .map_err(ApplicationError::Repository)?
         {
@@ -358,7 +366,7 @@ impl GameApplicationService {
 
         let existing_events = self
             .repository
-            .list_session_events(&stored_session.id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, &stored_session.id)
             .await
             .map_err(ApplicationError::Repository)?;
         validate_event_stream(&stored_session, &existing_events)?;
@@ -447,6 +455,7 @@ impl GameApplicationService {
         let response_json =
             serde_json::to_string(&outcome).map_err(ApplicationError::Serialization)?;
         let receipt = NewCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             campaign_session_id: command.campaign_session_id.clone(),
             idempotency_key: command.idempotency_key.clone(),
             command_kind: SOCIAL_COMMAND_KIND.to_owned(),
@@ -483,7 +492,11 @@ impl GameApplicationService {
             }) => {
                 let stored = self
                     .repository
-                    .load_command_receipt(&command.campaign_session_id, &command.idempotency_key)
+                    .load_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
+                        &command.campaign_session_id,
+                        &command.idempotency_key,
+                    )
                     .await
                     .map_err(ApplicationError::Repository)?
                     .ok_or(ApplicationError::InvalidStoredState)?;
@@ -527,7 +540,11 @@ impl GameApplicationService {
 
         if let Some(receipt) = self
             .repository
-            .load_command_receipt(&command.campaign_session_id, &command.idempotency_key)
+            .load_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
+                &command.campaign_session_id,
+                &command.idempotency_key,
+            )
             .await
             .map_err(ApplicationError::Repository)?
         {
@@ -537,7 +554,7 @@ impl GameApplicationService {
         validate_local_command(&command, &stored_session, &stored_character)?;
         let existing_events = self
             .repository
-            .list_session_events(&stored_session.id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, &stored_session.id)
             .await
             .map_err(ApplicationError::Repository)?;
         validate_event_stream(&stored_session, &existing_events)?;
@@ -615,6 +632,7 @@ impl GameApplicationService {
         let response_json =
             serde_json::to_string(&outcome).map_err(ApplicationError::Serialization)?;
         let receipt = NewCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             campaign_session_id: command.campaign_session_id.clone(),
             idempotency_key: command.idempotency_key.clone(),
             command_kind: EXPLORATION_COMMAND_KIND.to_owned(),
@@ -651,7 +669,11 @@ impl GameApplicationService {
             }) => {
                 let stored = self
                     .repository
-                    .load_command_receipt(&command.campaign_session_id, &command.idempotency_key)
+                    .load_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
+                        &command.campaign_session_id,
+                        &command.idempotency_key,
+                    )
                     .await
                     .map_err(ApplicationError::Repository)?
                     .ok_or(ApplicationError::InvalidStoredState)?;
@@ -724,7 +746,11 @@ impl GameApplicationService {
 
         if let Some(receipt) = self
             .repository
-            .load_command_receipt(mutation.campaign_session_id(), mutation.idempotency_key())
+            .load_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
+                mutation.campaign_session_id(),
+                mutation.idempotency_key(),
+            )
             .await
             .map_err(ApplicationError::Repository)?
         {
@@ -733,7 +759,7 @@ impl GameApplicationService {
 
         let events = self
             .repository
-            .list_session_events(&stored_session.id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, &stored_session.id)
             .await
             .map_err(ApplicationError::Repository)?;
         validate_event_stream(&stored_session, &events)?;
@@ -852,6 +878,7 @@ impl GameApplicationService {
         let response_json =
             serde_json::to_string(&outcome).map_err(ApplicationError::Serialization)?;
         let receipt = NewCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             campaign_session_id: stored_session.id.clone(),
             idempotency_key: mutation.idempotency_key().to_owned(),
             command_kind: mutation.command_kind().to_owned(),
@@ -900,7 +927,11 @@ impl GameApplicationService {
             Err(RepositoryError::RevisionConflict { actual, .. }) => {
                 if let Some(stored) = self
                     .repository
-                    .load_command_receipt(&command.campaign_session_id, mutation.idempotency_key())
+                    .load_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
+                        &command.campaign_session_id,
+                        mutation.idempotency_key(),
+                    )
                     .await
                     .map_err(ApplicationError::Repository)?
                 {
@@ -922,7 +953,11 @@ impl GameApplicationService {
             }) => {
                 let stored = self
                     .repository
-                    .load_command_receipt(&command.campaign_session_id, mutation.idempotency_key())
+                    .load_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
+                        &command.campaign_session_id,
+                        mutation.idempotency_key(),
+                    )
                     .await
                     .map_err(ApplicationError::Repository)?
                     .ok_or(ApplicationError::InvalidStoredState)?;
@@ -948,7 +983,7 @@ impl GameApplicationService {
     ) -> Result<(StoredDocument<SessionDto>, StoredDocument<Character>), ApplicationError> {
         if self
             .repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .map_err(ApplicationError::Repository)?
             .is_none()
@@ -959,7 +994,11 @@ impl GameApplicationService {
             let character = local_character()?;
             match self
                 .repository
-                .create_campaign(&session, std::slice::from_ref(&character))
+                .create_campaign(
+                    LOCAL_HERO_OWNER_KEY,
+                    &session,
+                    std::slice::from_ref(&character),
+                )
                 .await
             {
                 Ok(_) | Err(RepositoryError::AlreadyExists { .. }) => {}
@@ -971,13 +1010,17 @@ impl GameApplicationService {
 
         let session = self
             .repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::InvalidStoredState)?;
         let character = self
             .repository
-            .load_character(LOCAL_CHARACTER_ID)
+            .load_character(
+                LOCAL_HERO_OWNER_KEY,
+                LOCAL_CAMPAIGN_SESSION_ID,
+                LOCAL_CHARACTER_ID,
+            )
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::InvalidStoredState)?;
@@ -1016,7 +1059,7 @@ impl GameApplicationService {
 
         if let Some(stored) = self
             .repository
-            .load_campaign_pins(&session.id)
+            .load_campaign_pins(LOCAL_HERO_OWNER_KEY, &session.id)
             .await
             .map_err(map_campaign_pin_repository_error)?
         {
@@ -1024,59 +1067,11 @@ impl GameApplicationService {
                 .validate(&stored.evidence.pins)
                 .map_err(|_| ApplicationError::CampaignPinsQuarantined)?;
             if session.value.ruleset != stored.evidence.pins.hero.ruleset_id
-                || selected_hero_pins.is_some_and(|hero_pins| {
-                    hero_pins != &stored.evidence.pins.hero
-                        && stored.evidence.legacy_source.as_ref() != Some(hero_pins)
-                })
+                || selected_hero_pins
+                    .is_some_and(|hero_pins| hero_pins != &stored.evidence.pins.hero)
             {
                 return Err(ApplicationError::CampaignPinsQuarantined);
             }
-            return Ok(CampaignPinStatusDto::Sealed {
-                evidence: Box::new(stored.evidence),
-            });
-        }
-
-        let legacy_eligible = self
-            .repository
-            .campaign_pin_legacy_eligible(&session.id)
-            .await
-            .map_err(ApplicationError::Repository)?;
-        if legacy_eligible {
-            let (theme_id, mut seal_reason) = selected_hero_pins.map_or(
-                (
-                    ThemeId::RainboundBorough,
-                    CampaignPinSealReason::LegacyDefaultRainbound,
-                ),
-                |pins| (pins.theme_id, CampaignPinSealReason::LegacySelectedTheme),
-            );
-            let pins = self
-                .campaign_pins
-                .pins_for_theme(theme_id)
-                .map_err(|_| ApplicationError::CampaignPinsQuarantined)?;
-            let legacy_source = selected_hero_pins
-                .filter(|selected| selected.is_legacy_dev_alias())
-                .cloned();
-            if legacy_source.is_some() {
-                seal_reason = CampaignPinSealReason::LegacyDigestAlias;
-            }
-            if selected_hero_pins
-                .is_some_and(|selected| selected != &pins.hero && !selected.is_legacy_dev_alias())
-                || session.value.ruleset != pins.hero.ruleset_id
-            {
-                return Err(ApplicationError::CampaignPinsQuarantined);
-            }
-            let stored = self
-                .repository
-                .seal_legacy_campaign_pins(
-                    &session.id,
-                    &SealedCampaignPins {
-                        seal_reason,
-                        pins,
-                        legacy_source,
-                    },
-                )
-                .await
-                .map_err(ApplicationError::Repository)?;
             return Ok(CampaignPinStatusDto::Sealed {
                 evidence: Box::new(stored.evidence),
             });
@@ -1133,7 +1128,7 @@ impl GameApplicationService {
     ) -> Result<LocalCampaignViewDto, ApplicationError> {
         let events = self
             .repository
-            .list_session_events(&session.id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, &session.id)
             .await
             .map_err(ApplicationError::Repository)?;
         validate_event_stream(session, &events)?;
@@ -2409,26 +2404,86 @@ impl UnixTimeSource for SystemClock {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
-    use manchester_dnd_core::encounter::{EncounterCommand, EncounterIntent, EncounterStatus};
-    use sqlx::PgPool;
+    use manchester_dnd_core::{
+        encounter::{EncounterCommand, EncounterIntent, EncounterStatus},
+        hero::ThemeId,
+    };
+    use mongodb::bson::doc;
 
     use super::*;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{CollectionName, MongoStore, SchemaReconciler},
+        repository::{
+            CAMPAIGN_LIFECYCLE_SCHEMA_VERSION, CampaignLifecycleCommand, StartPlaySessionCommand,
+        },
+    };
+
+    struct TestDatabase {
+        store: MongoStore,
+        name: String,
+    }
+
+    impl TestDatabase {
+        async fn new() -> Option<Self> {
+            let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+                eprintln!("skipping MongoDB application test: MONGODB_TEST_URI is not set");
+                return None;
+            };
+            assert!(
+                uri.starts_with("mongodb://root:") && uri.contains("127.0.0.1"),
+                "MONGODB_TEST_URI must be the explicit local root test URI"
+            );
+            let name = format!("mdnd_application_test_{}", Uuid::new_v4().simple());
+            let store = MongoStore::connect(&MongoConfig {
+                uri: SecretString::new(uri),
+                database: name.clone(),
+                max_pool_size: 4,
+                min_pool_size: 0,
+                connect_timeout: Duration::from_secs(5),
+                server_selection_timeout: Duration::from_secs(5),
+                operation_timeout: Duration::from_secs(15),
+                transaction_timeout: Duration::from_secs(10),
+                transaction_max_retries: 2,
+                schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+            })
+            .await
+            .unwrap();
+            SchemaReconciler::new(store.clone()).apply().await.unwrap();
+            Some(Self { store, name })
+        }
+
+        fn store(&self) -> MongoStore {
+            self.store.clone()
+        }
+
+        async fn drop(self) {
+            assert!(
+                self.name.starts_with("mdnd_application_test_") && self.name != "manchester_dnd",
+                "cleanup safeguard"
+            );
+            self.store.database().drop().await.unwrap();
+        }
+    }
 
     async fn test_service(
         access_mode: AccessMode,
-        pool: PgPool,
-    ) -> (GameApplicationService, PostgresRepository, Arc<AtomicUsize>) {
-        test_service_with_roll(access_mode, pool, 12).await
+        store: MongoStore,
+    ) -> (GameApplicationService, MongoRepository, Arc<AtomicUsize>) {
+        test_service_with_roll(access_mode, store, 12).await
     }
 
     async fn test_service_with_roll(
         access_mode: AccessMode,
-        pool: PgPool,
+        store: MongoStore,
         roll: u16,
-    ) -> (GameApplicationService, PostgresRepository, Arc<AtomicUsize>) {
-        let repository = PostgresRepository::from_pool(pool);
+    ) -> (GameApplicationService, MongoRepository, Arc<AtomicUsize>) {
+        let repository = MongoRepository::new(store);
         let roll_count = Arc::new(AtomicUsize::new(0));
         let observed_rolls = roll_count.clone();
         let dice = move |sides| {
@@ -2454,7 +2509,30 @@ mod tests {
                 legacy_source: None,
             };
             repository
-                .seal_campaign_pins_for_test(LOCAL_CAMPAIGN_SESSION_ID, &evidence)
+                .seal_campaign_pins_for_test(
+                    LOCAL_HERO_OWNER_KEY,
+                    LOCAL_CAMPAIGN_SESSION_ID,
+                    &evidence,
+                )
+                .await
+                .unwrap();
+            let summary = service
+                .list_local_campaigns()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|campaign| campaign.campaign_session_id == LOCAL_CAMPAIGN_SESSION_ID)
+                .unwrap();
+            service
+                .start_local_play_session(StartPlaySessionCommand {
+                    lifecycle: CampaignLifecycleCommand {
+                        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                        campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
+                        expected_lifecycle_revision: summary.lifecycle_revision,
+                        idempotency_key: "application-test-play-start".to_owned(),
+                    },
+                    play_session_id: "play-session:application-test".to_owned(),
+                })
                 .await
                 .unwrap();
         }
@@ -2559,9 +2637,13 @@ mod tests {
         service.load_local_campaign().await.unwrap()
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn local_campaign_is_created_once_and_resumed(pool: PgPool) {
-        let (service, repository, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn local_campaign_is_created_once_and_resumed() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, repository, _) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let first = service.load_local_campaign().await.unwrap();
         let resumed = GameApplicationService::with_sources(
             AccessMode::LocalSingleUser,
@@ -2578,16 +2660,24 @@ mod tests {
         assert_eq!(first.revision, 1);
         assert_eq!(first.last_event_sequence, 0);
         let character = repository
-            .load_character(LOCAL_CHARACTER_ID)
+            .load_character(
+                LOCAL_HERO_OWNER_KEY,
+                LOCAL_CAMPAIGN_SESSION_ID,
+                LOCAL_CHARACTER_ID,
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(character.value.level().value(), 1);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn unsealed_creator_scaffold_exposes_status_but_blocks_gameplay(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool);
+    #[tokio::test]
+    async fn unsealed_creator_scaffold_exposes_status_but_blocks_gameplay() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let repository = MongoRepository::new(database.store());
         let service = GameApplicationService::with_sources(
             AccessMode::LocalSingleUser,
             repository.clone(),
@@ -2608,178 +2698,82 @@ mod tests {
         ));
         assert!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .is_empty()
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn legacy_save_without_theme_evidence_seals_recorded_rainbound_default(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let service = GameApplicationService::with_sources(
-            AccessMode::LocalSingleUser,
-            repository.clone(),
-            Arc::new(SeedVault::from_key([7; 32])),
-            |_| 12,
-            || 1_000,
-        );
-        let unsealed = service.load_local_campaign().await.unwrap();
-        assert!(unsealed.content_pins.sealed().is_none());
-        sqlx::query(
-            "UPDATE campaign_sessions
-             SET content_pin_legacy_eligible = TRUE
-             WHERE id = $1",
-        )
-        .bind(LOCAL_CAMPAIGN_SESSION_ID)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let migrated = service.load_local_campaign().await.unwrap();
-        let evidence = migrated.content_pins.sealed().unwrap();
-        assert_eq!(
-            evidence.seal_reason,
-            CampaignPinSealReason::LegacyDefaultRainbound
-        );
-        assert_eq!(evidence.pins.hero.theme_id, ThemeId::RainboundBorough);
-        assert_eq!(
-            repository
-                .load_campaign_pins(LOCAL_CAMPAIGN_SESSION_ID)
-                .await
-                .unwrap()
-                .unwrap()
-                .evidence,
-            *evidence
-        );
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn legacy_pre_release_digests_are_aliased_with_original_evidence(pool: PgPool) {
-        use manchester_dnd_core::hero::{
-            HeroPins, LEGACY_DEV_CORE_CONTENT_PACK_DIGEST, LEGACY_DEV_RAINBOUND_THEME_PACK_DIGEST,
+    #[tokio::test]
+    async fn active_catalog_fingerprint_drift_quarantines_resume() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
         };
-
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let service = GameApplicationService::with_sources(
-            AccessMode::LocalSingleUser,
-            repository,
-            Arc::new(SeedVault::from_key([7; 32])),
-            |_| 12,
-            || 1_000,
-        );
-        service.load_local_campaign().await.unwrap();
-        let draft = service.start_local_hero_creation().await.unwrap();
-        let mut legacy = HeroPins::mvp(ThemeId::RainboundBorough);
-        legacy.core_content.digest =
-            Sha256Digest::new(LEGACY_DEV_CORE_CONTENT_PACK_DIGEST).unwrap();
-        legacy.theme.digest = Sha256Digest::new(LEGACY_DEV_RAINBOUND_THEME_PACK_DIGEST).unwrap();
-        legacy.validate().unwrap();
-        sqlx::query(
-            "UPDATE hero_creation_drafts
-             SET payload_json = jsonb_set(
-                     jsonb_set(
-                         jsonb_set(payload_json, '{pins}', $2::jsonb),
-                         '{step}', to_jsonb('concept'::text)
-                     ),
-                     '{revision}', '1'::jsonb
-                 ),
-                 revision = 2
-             WHERE id = $1",
-        )
-        .bind(&draft.draft_id)
-        .bind(serde_json::to_string(&legacy).unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE campaign_sessions
-             SET content_pin_legacy_eligible = TRUE WHERE id = $1",
-        )
-        .bind(LOCAL_CAMPAIGN_SESSION_ID)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let view = service.load_local_campaign().await.unwrap();
-        let evidence = view.content_pins.sealed().unwrap();
-        assert_eq!(
-            evidence.seal_reason,
-            CampaignPinSealReason::LegacyDigestAlias
-        );
-        assert_eq!(evidence.legacy_source.as_ref(), Some(&legacy));
-        assert_eq!(
-            evidence.pins.hero,
-            manchester_dnd_core::hero::HeroPins::mvp(ThemeId::RainboundBorough)
-        );
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn active_catalog_fingerprint_drift_quarantines_resume(pool: PgPool) {
-        let (service, _, _) = test_service(AccessMode::LocalSingleUser, pool.clone()).await;
-        sqlx::query(
-            "UPDATE campaign_content_pins
-             SET payload_json = jsonb_set(
-                 payload_json,
-                 '{active_catalog_fingerprint}',
-                 to_jsonb($2::text)
-             )
-             WHERE campaign_session_id = $1",
-        )
-        .bind(LOCAL_CAMPAIGN_SESSION_ID)
-        .bind(format!("sha256:{}", "9".repeat(64)))
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (service, _, _) = test_service(AccessMode::LocalSingleUser, database.store()).await;
+        database
+            .store
+            .document_collection(CollectionName::Campaigns)
+            .update_one(
+                doc! { "_id": LOCAL_CAMPAIGN_SESSION_ID },
+                doc! {
+                    "$set": {
+                        "rules_snapshot.campaign_pins.pins.active_catalog_fingerprint":
+                            format!("sha256:{}", "9".repeat(64)),
+                    }
+                },
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             service.load_local_campaign().await,
             Err(ApplicationError::CampaignPinsQuarantined)
         ));
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn saved_pack_version_and_digest_drift_quarantine_resume(pool: PgPool) {
+    #[tokio::test]
+    async fn saved_pack_version_and_digest_drift_quarantine_resume() {
         use manchester_dnd_core::hero::{CORE_CONTENT_PACK_DIGEST, MVP_PACK_VERSION};
 
-        let (service, _, _) = test_service(AccessMode::LocalSingleUser, pool.clone()).await;
-        sqlx::query(
-            "UPDATE campaign_content_pins
-             SET payload_json = jsonb_set(
-                 payload_json,
-                 '{hero,core_content,version}',
-                 to_jsonb('1.0.1'::text)
-             )
-             WHERE campaign_session_id = $1",
-        )
-        .bind(LOCAL_CAMPAIGN_SESSION_ID)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, _) = test_service(AccessMode::LocalSingleUser, database.store()).await;
+        let campaigns = database
+            .store
+            .document_collection(CollectionName::Campaigns);
+        campaigns
+            .update_one(
+                doc! { "_id": LOCAL_CAMPAIGN_SESSION_ID },
+                doc! {
+                    "$set": {
+                        "rules_snapshot.campaign_pins.pins.hero.core_content.version": "1.0.1",
+                    }
+                },
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             service.load_local_campaign().await,
             Err(ApplicationError::CampaignPinsQuarantined)
         ));
 
-        sqlx::query(
-            "UPDATE campaign_content_pins
-             SET payload_json = jsonb_set(
-                 jsonb_set(
-                     payload_json,
-                     '{hero,core_content,version}',
-                     to_jsonb($2::text)
-                 ),
-                 '{hero,core_content,digest}',
-                 to_jsonb($3::text)
-             )
-             WHERE campaign_session_id = $1",
-        )
-        .bind(LOCAL_CAMPAIGN_SESSION_ID)
-        .bind(MVP_PACK_VERSION)
-        .bind(format!("sha256:{}", "8".repeat(64)))
-        .execute(&pool)
-        .await
-        .unwrap();
+        campaigns
+            .update_one(
+                doc! { "_id": LOCAL_CAMPAIGN_SESSION_ID },
+                doc! {
+                    "$set": {
+                        "rules_snapshot.campaign_pins.pins.hero.core_content.version":
+                            MVP_PACK_VERSION,
+                        "rules_snapshot.campaign_pins.pins.hero.core_content.digest":
+                            format!("sha256:{}", "8".repeat(64)),
+                    }
+                },
+            )
+            .await
+            .unwrap();
         assert_ne!(
             CORE_CONTENT_PACK_DIGEST,
             format!("sha256:{}", "8".repeat(64))
@@ -2788,12 +2782,16 @@ mod tests {
             service.load_local_campaign().await,
             Err(ApplicationError::CampaignPinsQuarantined)
         ));
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn social_failure_commits_trusted_state_and_resumes_without_rerolling(pool: PgPool) {
+    #[tokio::test]
+    async fn social_failure_commits_trusted_state_and_resumes_without_rerolling() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
         let (service, repository, roll_count) =
-            test_service(AccessMode::LocalSingleUser, pool).await;
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let initial = service.load_local_campaign().await.unwrap();
         let initial_social = initial.social.as_ref().unwrap();
         assert_eq!(initial_social.state.turn, 1);
@@ -2846,7 +2844,7 @@ mod tests {
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
 
         let audits = repository
-            .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap();
         assert_eq!(audits.len(), 1);
@@ -2854,12 +2852,16 @@ mod tests {
             audits[0].correlation_id.as_deref(),
             Some("request:social-failure")
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn social_success_completes_objective_and_improves_attitude(pool: PgPool) {
+    #[tokio::test]
+    async fn social_success_completes_objective_and_improves_attitude() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
         let (service, _, roll_count) =
-            test_service_with_roll(AccessMode::LocalSingleUser, pool, 20).await;
+            test_service_with_roll(AccessMode::LocalSingleUser, database.store(), 20).await;
         let initial = service.load_local_campaign().await.unwrap();
 
         let outcome = service
@@ -2879,12 +2881,16 @@ mod tests {
             NpcAttitude::Friendly
         );
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn concurrent_social_duplicates_share_one_roll_event_and_receipt(pool: PgPool) {
+    #[tokio::test]
+    async fn concurrent_social_duplicates_share_one_roll_event_and_receipt() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
         let (service, repository, roll_count) =
-            test_service(AccessMode::LocalSingleUser, pool).await;
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let request = social_command(&view, "social-concurrent");
 
@@ -2897,7 +2903,7 @@ mod tests {
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .len(),
@@ -2905,16 +2911,25 @@ mod tests {
         );
         assert!(
             repository
-                .load_command_receipt(LOCAL_CAMPAIGN_SESSION_ID, &request.idempotency_key)
+                .load_command_receipt(
+                    LOCAL_HERO_OWNER_KEY,
+                    LOCAL_CAMPAIGN_SESSION_ID,
+                    &request.idempotency_key
+                )
                 .await
                 .unwrap()
                 .is_some()
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn invalid_and_stale_social_intents_are_rejected_before_dice(pool: PgPool) {
-        let (service, _, roll_count) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn invalid_and_stale_social_intents_are_rejected_before_dice() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, roll_count) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
 
         let mut wrong_action = social_command(&view, "social-wrong-action");
@@ -2947,12 +2962,16 @@ mod tests {
             }
         ));
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn deterministic_check_commits_and_reloads_without_rerolling(pool: PgPool) {
+    #[tokio::test]
+    async fn deterministic_check_commits_and_reloads_without_rerolling() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
         let (service, repository, roll_count) =
-            test_service(AccessMode::LocalSingleUser, pool).await;
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let outcome = service
             .attempt_exploration_check_with_correlation(
@@ -2985,7 +3004,7 @@ mod tests {
         );
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
         let audits = repository
-            .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap();
         assert_eq!(audits.len(), 1);
@@ -2993,36 +3012,16 @@ mod tests {
             audits[0].correlation_id.as_deref(),
             Some("request:test-correlation")
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn failed_latest_exploration_check_selects_the_misread_opening(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool);
-        let service = GameApplicationService::with_sources(
-            AccessMode::LocalSingleUser,
-            repository.clone(),
-            Arc::new(SeedVault::from_key([7; 32])),
-            |sides| {
-                assert_eq!(sides, 20);
-                1
-            },
-            || 1_000,
-        );
-        service.load_local_campaign().await.unwrap();
-        repository
-            .seal_campaign_pins_for_test(
-                LOCAL_CAMPAIGN_SESSION_ID,
-                &SealedCampaignPins {
-                    seal_reason: CampaignPinSealReason::SelectedTheme,
-                    pins: service
-                        .campaign_pins
-                        .pins_for_theme(ThemeId::RainboundBorough)
-                        .unwrap(),
-                    legacy_source: None,
-                },
-            )
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn failed_latest_exploration_check_selects_the_misread_opening() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, _) =
+            test_service_with_roll(AccessMode::LocalSingleUser, database.store(), 1).await;
         let initial = service.load_local_campaign().await.unwrap();
         let outcome = service
             .attempt_exploration_check(command(&initial, "failed-rune-check"))
@@ -3042,11 +3041,16 @@ mod tests {
         );
         assert_eq!(encounter.state.hero.hit_points.temporary, 0);
         assert_eq!(encounter.state.creature.hit_points.temporary, 4);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn matching_receipt_replays_before_revision_validation_without_rerolling(pool: PgPool) {
-        let (service, _, roll_count) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn matching_receipt_replays_before_revision_validation_without_rerolling() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, roll_count) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let request = command(&view, "check-replay");
 
@@ -3058,11 +3062,16 @@ mod tests {
 
         assert_eq!(replay, first);
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn encounter_start_commits_canonical_rolls_and_reloads_equivalently(pool: PgPool) {
-        let (service, repository, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn encounter_start_commits_canonical_rolls_and_reloads_equivalently() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, repository, _) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let ready = resolve_exploration(&service).await;
         let request = encounter_command(&ready, "encounter-start", EncounterIntent::StartEncounter);
 
@@ -3107,7 +3116,7 @@ mod tests {
         assert_eq!(encounter.latest_outcome, Some(outcome));
 
         let audits = repository
-            .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap();
         assert_eq!(audits.len(), 2);
@@ -3115,11 +3124,16 @@ mod tests {
             audits[1].correlation_id.as_deref(),
             Some("request:encounter-start-correlation")
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn encounter_receipt_retry_is_exact_and_does_not_append_or_advance(pool: PgPool) {
-        let (service, repository, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn encounter_receipt_retry_is_exact_and_does_not_append_or_advance() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, repository, _) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let ready = resolve_exploration(&service).await;
         let request = encounter_command(&ready, "encounter-retry", EncounterIntent::StartEncounter);
 
@@ -3133,24 +3147,27 @@ mod tests {
         assert_eq!(replay.roll_records[0].cursor_before, 0);
         assert_eq!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .len(),
             2
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn player_endpoint_rejects_every_client_selected_intent_on_the_creature_turn(
-        pool: PgPool,
-    ) {
-        let (service, repository, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn player_endpoint_rejects_every_client_selected_intent_on_the_creature_turn() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, repository, _) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let ready = resolve_exploration(&service).await;
         let npc_turn = advance_to_npc_turn(&service, &ready, "controller-boundary").await;
         let before = npc_turn.encounter.as_ref().unwrap().state.clone();
         let event_count = repository
-            .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap()
             .len();
@@ -3171,17 +3188,22 @@ mod tests {
         assert_eq!(reloaded.encounter.unwrap().state, before);
         assert_eq!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .len(),
             event_count
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn npc_policy_receipts_are_atomic_replayable_and_record_the_pinned_origin(pool: PgPool) {
-        let (service, repository, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn npc_policy_receipts_are_atomic_replayable_and_record_the_pinned_origin() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, repository, _) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let ready = resolve_exploration(&service).await;
         let npc_turn = advance_to_npc_turn(&service, &ready, "npc-policy").await;
         let first_request = npc_advance_command(&npc_turn, "npc-policy-move");
@@ -3208,7 +3230,7 @@ mod tests {
             || 2_000,
         );
         let before_count = repository
-            .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap()
             .len();
@@ -3222,7 +3244,7 @@ mod tests {
         assert!(committed.legal_actions.is_empty());
         assert_eq!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .len(),
@@ -3233,21 +3255,25 @@ mod tests {
         assert_eq!(replay, committed);
         assert_eq!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .len(),
             before_count + 1
         );
         let receipt = repository
-            .load_command_receipt(LOCAL_CAMPAIGN_SESSION_ID, &request.idempotency_key)
+            .load_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
+                LOCAL_CAMPAIGN_SESSION_ID,
+                &request.idempotency_key,
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(receipt.command_kind, NPC_ADVANCE_COMMAND_KIND);
 
         let audits = repository
-            .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap();
         let SessionEventPayload::EncounterResolved {
@@ -3265,11 +3291,15 @@ mod tests {
                 policy_id: SOOT_WIGHT_POLICY_ID.to_owned(),
             }
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn stale_campaign_revision_does_not_spend_the_first_encounter_cursor(pool: PgPool) {
-        let (service, _, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn stale_campaign_revision_does_not_spend_the_first_encounter_cursor() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, _) = test_service(AccessMode::LocalSingleUser, database.store()).await;
         let ready = resolve_exploration(&service).await;
         let mut stale =
             encounter_command(&ready, "encounter-stale", EncounterIntent::StartEncounter);
@@ -3293,11 +3323,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(committed.roll_records[0].cursor_before, 0);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn stale_encounter_revision_is_separate_from_campaign_revision(pool: PgPool) {
-        let (service, _, _) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn stale_encounter_revision_is_separate_from_campaign_revision() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, _) = test_service(AccessMode::LocalSingleUser, database.store()).await;
         let ready = resolve_exploration(&service).await;
         let mut stale = encounter_command(
             &ready,
@@ -3316,12 +3350,16 @@ mod tests {
         ));
         assert_eq!(error.current_revision(), None);
         assert_eq!(error.current_encounter_revision(), Some(1));
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn concurrent_duplicate_requests_share_one_roll_and_commit(pool: PgPool) {
+    #[tokio::test]
+    async fn concurrent_duplicate_requests_share_one_roll_and_commit() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
         let (service, repository, roll_count) =
-            test_service(AccessMode::LocalSingleUser, pool).await;
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let request = command(&view, "check-concurrent");
         let first_service = service.clone();
@@ -3337,17 +3375,22 @@ mod tests {
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             repository
-                .list_session_events(LOCAL_CAMPAIGN_SESSION_ID)
+                .list_session_events(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .len(),
             1
         );
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn stale_revision_is_rejected_before_dice_are_consumed(pool: PgPool) {
-        let (service, _, roll_count) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn stale_revision_is_rejected_before_dice_are_consumed() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, roll_count) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         service
             .attempt_exploration_check(command(&view, "check-first"))
@@ -3367,11 +3410,16 @@ mod tests {
         ));
         assert_eq!(error.current_revision(), Some(2));
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn idempotency_key_cannot_be_reused_for_a_different_command(pool: PgPool) {
-        let (service, _, roll_count) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn idempotency_key_cannot_be_reused_for_a_different_command() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, roll_count) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let original = command(&view, "same-key");
         service
@@ -3386,11 +3434,16 @@ mod tests {
             Err(ApplicationError::IdempotencyConflict)
         ));
         assert_eq!(roll_count.load(Ordering::SeqCst), 1);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn unknown_action_and_wrong_character_are_rejected(pool: PgPool) {
-        let (service, _, roll_count) = test_service(AccessMode::LocalSingleUser, pool).await;
+    #[tokio::test]
+    async fn unknown_action_and_wrong_character_are_rejected() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, _, roll_count) =
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let mut wrong_action = command(&view, "wrong-action");
         wrong_action.action_id = "search-somewhere-else".to_owned();
@@ -3406,15 +3459,19 @@ mod tests {
             Err(ApplicationError::WrongCharacter)
         ));
         assert_eq!(roll_count.load(Ordering::SeqCst), 0);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn completed_campaign_rejects_new_checks(pool: PgPool) {
+    #[tokio::test]
+    async fn completed_campaign_rejects_new_checks() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
         let (service, repository, roll_count) =
-            test_service(AccessMode::LocalSingleUser, pool).await;
+            test_service(AccessMode::LocalSingleUser, database.store()).await;
         let view = service.load_local_campaign().await.unwrap();
         let stored = repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap()
             .unwrap();
@@ -3431,7 +3488,7 @@ mod tests {
             payload: SessionEventPayload::SessionEnded,
         };
         repository
-            .commit_session_event("test-end", &completed, 1, &event, &[])
+            .commit_session_event(LOCAL_HERO_OWNER_KEY, "test-end", &completed, 1, &event, &[])
             .await
             .unwrap();
         let mut request = command(&view, "after-end");
@@ -3442,11 +3499,15 @@ mod tests {
             Err(ApplicationError::CampaignCompleted)
         ));
         assert_eq!(roll_count.load(Ordering::SeqCst), 0);
+        database.drop().await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn hosted_mode_fails_closed_for_loads_and_mutations(pool: PgPool) {
-        let (service, repository, _) = test_service(AccessMode::Hosted, pool).await;
+    #[tokio::test]
+    async fn hosted_mode_fails_closed_for_loads_and_mutations() {
+        let Some(database) = TestDatabase::new().await else {
+            return;
+        };
+        let (service, repository, _) = test_service(AccessMode::Hosted, database.store()).await;
 
         assert!(matches!(
             service.load_local_campaign().await,
@@ -3466,10 +3527,11 @@ mod tests {
         ));
         assert!(
             repository
-                .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+                .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .is_none()
         );
+        database.drop().await;
     }
 }

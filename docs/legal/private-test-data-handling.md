@@ -5,9 +5,9 @@ not a public-service privacy policy and does not authorize collection from the p
 
 ## Deployment and data controller
 
-The private-test operator who provided the build controls the local PostgreSQL
-database, protected files, optional provider accounts, backups, source vault, and
-reporting channel. The application has no hosted account system, public share links,
+The private-test operator who provided the build controls the local MongoDB system of
+record, optional Dragonfly cache, protected files, provider accounts, backups, source
+vault, and reporting channel. The application has no public share links,
 behavioral analytics service, or built-in report submission endpoint.
 
 ## Data categories and purposes

@@ -945,7 +945,7 @@ pub fn CampaignLifecyclePanel(
             match load_private_recap().await {
                 Ok(PrivateRecapResponse::Ready(Some(recap))) => {
                     private_recap.set(Some(*recap));
-                    notice.set("Saved private recap loaded from PostgreSQL.".to_owned());
+                    notice.set("Saved private recap loaded from MongoDB.".to_owned());
                 }
                 Ok(PrivateRecapResponse::Ready(None)) => {
                     private_recap.set(None);
@@ -1069,7 +1069,7 @@ pub fn CampaignLifecyclePanel(
                 <span class="status-pill">"Local owner"</span>
             </div>
             <p>
-                "Campaign lifecycle changes are revision-checked and saved in PostgreSQL. Archives do not expire automatically."
+                "Campaign lifecycle changes are revision-checked and saved in MongoDB. Archives do not expire automatically."
             </p>
             <p class="save-status" role="status" aria-live="polite" aria-busy=move || pending.get()>
                 {move || notice.get()}

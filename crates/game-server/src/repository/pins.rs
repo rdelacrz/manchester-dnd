@@ -1,11 +1,14 @@
-use manchester_dnd_core::{
-    CAMPAIGN_PINS_SCHEMA_VERSION, CampaignContentPins, CampaignPinSealReason, SealedCampaignPins,
-    hero::HeroPins, is_valid_opaque_id,
+use manchester_dnd_core::{CampaignPinSealReason, SealedCampaignPins, is_valid_opaque_id};
+use mongodb::{
+    ClientSession, Collection,
+    bson::{Bson, DateTime, doc},
 };
-use sqlx::{Postgres, Row, Transaction};
 
-use super::{PostgresRepository, serialize};
-use crate::error::RepositoryError;
+use super::{
+    CampaignDocument, MongoRepository, active_campaign_filter, date_string, mongo_error,
+    validate_account_id,
+};
+use crate::error::{PersistenceError, RepositoryError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCampaignPins {
@@ -14,107 +17,163 @@ pub struct StoredCampaignPins {
     pub created_at: String,
 }
 
-impl PostgresRepository {
+impl MongoRepository {
     pub async fn load_campaign_pins(
         &self,
+        actor_account_id: &str,
         campaign_session_id: &str,
     ) -> Result<Option<StoredCampaignPins>, RepositoryError> {
-        validate_campaign_id(campaign_session_id)?;
-        let row = sqlx::query(
-            "SELECT campaign_session_id, schema_version, seal_reason,
-                    payload_json::text AS payload_json,
-                    legacy_source_json::text AS legacy_source_json,
-                    created_at::text AS created_at
-             FROM campaign_content_pins
-             WHERE campaign_session_id = $1",
-        )
-        .bind(campaign_session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_pins_from_row).transpose()
-    }
-
-    pub(crate) async fn campaign_pin_legacy_eligible(
-        &self,
-        campaign_session_id: &str,
-    ) -> Result<bool, RepositoryError> {
-        validate_campaign_id(campaign_session_id)?;
-        sqlx::query_scalar(
-            "SELECT content_pin_legacy_eligible
-             FROM campaign_sessions WHERE id = $1",
-        )
-        .bind(campaign_session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?
-        .ok_or_else(|| RepositoryError::NotFound {
-            entity: "campaign session",
-            id: campaign_session_id.to_owned(),
-        })
-    }
-
-    pub(crate) async fn seal_legacy_campaign_pins(
-        &self,
-        campaign_session_id: &str,
-        evidence: &SealedCampaignPins,
-    ) -> Result<StoredCampaignPins, RepositoryError> {
-        if matches!(evidence.seal_reason, CampaignPinSealReason::SelectedTheme) {
-            return invalid(
+        validate_pin_scope(actor_account_id, campaign_session_id)?;
+        let stored = self
+            .campaigns()
+            .find_one(active_campaign_filter(
+                actor_account_id,
                 campaign_session_id,
-                "legacy migration must record an explicit legacy seal reason",
-            );
-        }
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let stored = seal_campaign_pins_in_transaction(
-            &mut transaction,
-            campaign_session_id,
-            evidence,
-            SealAuthority::LegacyMigration,
-        )
-        .await?;
-        transaction
-            .commit()
+            ))
             .await
-            .map_err(RepositoryError::Database)?;
-        Ok(stored)
+            .map_err(|error| mongo_error("load campaign pins", error))?;
+        stored
+            .and_then(|campaign| {
+                campaign
+                    .rules_snapshot
+                    .get("campaign_pins")
+                    .cloned()
+                    .map(|pins| (campaign, pins))
+            })
+            .map(|(campaign, pins)| stored_pins_from_bson(&campaign, pins))
+            .transpose()
     }
 
     #[cfg(test)]
     pub(crate) async fn seal_campaign_pins_for_test(
         &self,
+        actor_account_id: &str,
         campaign_session_id: &str,
         evidence: &SealedCampaignPins,
     ) -> Result<StoredCampaignPins, RepositoryError> {
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let stored = seal_campaign_pins_in_transaction(
-            &mut transaction,
-            campaign_session_id,
-            evidence,
-            SealAuthority::ThemeSelection,
-        )
-        .await?;
-        transaction
-            .commit()
+        validate_seal(actor_account_id, campaign_session_id, evidence)?;
+        if let Some(stored) = self
+            .load_campaign_pins(actor_account_id, campaign_session_id)
+            .await?
+        {
+            if stored.evidence.pins != evidence.pins {
+                return invalid(campaign_session_id, "sealed campaign pins are immutable");
+            }
+            return Ok(stored);
+        }
+        let campaigns = self.campaigns();
+        let actor = actor_account_id.to_owned();
+        let campaign_id = campaign_session_id.to_owned();
+        let evidence_for_write = evidence.clone();
+        let sealed_at = DateTime::now();
+        let result = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let actor = actor.clone();
+                let campaign_id = campaign_id.clone();
+                let evidence = evidence_for_write.clone();
+                Box::pin(async move {
+                    seal_campaign_pins_in_transaction(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        &campaign_id,
+                        &evidence,
+                        sealed_at,
+                    )
+                    .await
+                })
+            })
             .await
-            .map_err(RepositoryError::Database)?;
-        Ok(stored)
+            .map_err(super::map_persistence)?;
+        Ok(StoredCampaignPins {
+            campaign_session_id: campaign_session_id.to_owned(),
+            evidence: evidence.clone(),
+            created_at: date_string(result),
+        })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SealAuthority {
-    ThemeSelection,
-    LegacyMigration,
-}
-
 pub(super) async fn seal_campaign_pins_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
+    campaigns: &Collection<CampaignDocument>,
+    client_session: &mut ClientSession,
+    actor_account_id: &str,
     campaign_session_id: &str,
     evidence: &SealedCampaignPins,
-    authority: SealAuthority,
-) -> Result<StoredCampaignPins, RepositoryError> {
-    validate_campaign_id(campaign_session_id)?;
+    sealed_at: DateTime,
+) -> Result<DateTime, PersistenceError> {
+    let campaign = campaigns
+        .find_one(active_campaign_filter(
+            actor_account_id,
+            campaign_session_id,
+        ))
+        .session(&mut *client_session)
+        .await
+        .map_err(|error| PersistenceError::mongo("authorize campaign pin seal", error))?
+        .ok_or_else(|| PersistenceError::NotFound {
+            entity: "campaign",
+            id: campaign_session_id.to_owned(),
+        })?;
+    if let Some(stored) = campaign.rules_snapshot.get("campaign_pins").cloned() {
+        let stored: SealedCampaignPins =
+            mongodb::bson::from_bson(stored).map_err(|error| PersistenceError::SchemaDrift {
+                collection: "campaigns".to_owned(),
+                detail: format!("stored campaign pins are invalid: {error}"),
+            })?;
+        if stored == *evidence {
+            return campaign
+                .rules_snapshot
+                .get_datetime("sealed_at")
+                .copied()
+                .map_err(|_| PersistenceError::SchemaDrift {
+                    collection: "campaigns".to_owned(),
+                    detail: "sealed campaign pins are missing their BSON date".to_owned(),
+                });
+        }
+        return Err(PersistenceError::RevisionConflict {
+            entity: "campaign content pins",
+            id: campaign_session_id.to_owned(),
+            expected: u64::try_from(campaign.revision).unwrap_or_default(),
+            actual: u64::try_from(campaign.revision).unwrap_or_default(),
+        });
+    }
+    let pins = mongodb::bson::to_bson(evidence).map_err(PersistenceError::BsonEncoding)?;
+    let mut filter = active_campaign_filter(actor_account_id, campaign_session_id);
+    filter.insert("rules_snapshot.campaign_pins", doc! { "$exists": false });
+    let result = campaigns
+        .update_one(
+            filter,
+            doc! {
+                "$set": {
+                    "rules_snapshot.state": "sealed",
+                    "rules_snapshot.campaign_pins": pins,
+                    "rules_snapshot.sealed_at": sealed_at,
+                    "updated_at": sealed_at,
+                },
+                "$inc": { "revision": 1_i64 },
+            },
+        )
+        .session(&mut *client_session)
+        .await
+        .map_err(|error| PersistenceError::mongo("seal campaign pins", error))?;
+    if result.modified_count != 1 {
+        return Err(PersistenceError::RevisionConflict {
+            entity: "campaign content pins",
+            id: campaign_session_id.to_owned(),
+            expected: 0,
+            actual: 1,
+        });
+    }
+    Ok(sealed_at)
+}
+
+pub(super) fn validate_seal(
+    actor_account_id: &str,
+    campaign_session_id: &str,
+    evidence: &SealedCampaignPins,
+) -> Result<(), RepositoryError> {
+    validate_pin_scope(actor_account_id, campaign_session_id)?;
     evidence
         .validate()
         .map_err(|_| RepositoryError::InvalidDomainState {
@@ -122,193 +181,63 @@ pub(super) async fn seal_campaign_pins_in_transaction(
             id: campaign_session_id.to_owned(),
             reason: "campaign pins failed domain validation",
         })?;
-    match authority {
-        SealAuthority::ThemeSelection
-            if !matches!(evidence.seal_reason, CampaignPinSealReason::SelectedTheme) =>
-        {
-            return invalid(
-                campaign_session_id,
-                "theme selection must use the selected-theme seal reason",
-            );
-        }
-        SealAuthority::LegacyMigration
-            if matches!(evidence.seal_reason, CampaignPinSealReason::SelectedTheme) =>
-        {
-            return invalid(
-                campaign_session_id,
-                "legacy migration must use a legacy seal reason",
-            );
-        }
-        SealAuthority::ThemeSelection | SealAuthority::LegacyMigration => {}
-    }
-
-    let legacy_eligible: bool = sqlx::query_scalar(
-        "SELECT content_pin_legacy_eligible
-         FROM campaign_sessions WHERE id = $1 FOR UPDATE",
-    )
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?
-    .ok_or_else(|| RepositoryError::NotFound {
-        entity: "campaign session",
-        id: campaign_session_id.to_owned(),
-    })?;
-    if authority == SealAuthority::LegacyMigration && !legacy_eligible {
+    if !matches!(evidence.seal_reason, CampaignPinSealReason::SelectedTheme)
+        || evidence.legacy_source.is_some()
+    {
         return invalid(
             campaign_session_id,
-            "new campaign scaffolds cannot use the legacy default migration",
+            "greenfield campaigns accept selected-theme evidence only",
         );
     }
-
-    if let Some(row) = sqlx::query(
-        "SELECT campaign_session_id, schema_version, seal_reason,
-                payload_json::text AS payload_json,
-                legacy_source_json::text AS legacy_source_json,
-                created_at::text AS created_at
-         FROM campaign_content_pins
-         WHERE campaign_session_id = $1",
-    )
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?
-    {
-        let stored = stored_pins_from_row(row)?;
-        if stored.evidence.pins != evidence.pins {
-            return invalid(
-                campaign_session_id,
-                "sealed campaign pins are immutable and cannot change theme or content",
-            );
-        }
-        return Ok(stored);
-    }
-
-    let payload = serialize("campaign content pins", &evidence.pins)?;
-    let legacy_source_payload = evidence
-        .legacy_source
-        .as_ref()
-        .map(|source| serialize("legacy campaign content pins", source))
-        .transpose()?;
-    let row = sqlx::query(
-        "INSERT INTO campaign_content_pins
-         (campaign_session_id, schema_version, seal_reason, payload_json, legacy_source_json)
-         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
-         RETURNING created_at::text AS created_at",
-    )
-    .bind(campaign_session_id)
-    .bind(i64::from(CAMPAIGN_PINS_SCHEMA_VERSION))
-    .bind(seal_reason_as_str(evidence.seal_reason))
-    .bind(payload)
-    .bind(legacy_source_payload)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?;
-    sqlx::query(
-        "UPDATE campaign_sessions
-         SET content_pin_legacy_eligible = FALSE
-         WHERE id = $1",
-    )
-    .bind(campaign_session_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?;
-
-    Ok(StoredCampaignPins {
-        campaign_session_id: campaign_session_id.to_owned(),
-        evidence: evidence.clone(),
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
+    Ok(())
 }
 
-fn stored_pins_from_row(row: sqlx::postgres::PgRow) -> Result<StoredCampaignPins, RepositoryError> {
-    let campaign_session_id: String = row
-        .try_get("campaign_session_id")
-        .map_err(RepositoryError::Database)?;
-    let schema_version: i64 = row
-        .try_get("schema_version")
-        .map_err(RepositoryError::Database)?;
-    if schema_version != i64::from(CAMPAIGN_PINS_SCHEMA_VERSION) {
-        return Err(RepositoryError::UnsupportedSchemaVersion {
+fn stored_pins_from_bson(
+    campaign: &CampaignDocument,
+    pins: Bson,
+) -> Result<StoredCampaignPins, RepositoryError> {
+    let evidence: SealedCampaignPins =
+        mongodb::bson::from_bson(pins).map_err(|_| RepositoryError::InvalidDomainState {
             entity: "campaign content pins",
-            found: u32::try_from(schema_version).unwrap_or(u32::MAX),
-            supported: u32::from(CAMPAIGN_PINS_SCHEMA_VERSION),
-        });
-    }
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let pins: CampaignContentPins = serde_json::from_str(&payload_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity: "campaign content pins",
-            id: campaign_session_id.clone(),
-            source,
-        }
-    })?;
-    let seal_reason = parse_seal_reason(
-        row.try_get::<String, _>("seal_reason")
-            .map_err(RepositoryError::Database)?
-            .as_str(),
-        &campaign_session_id,
-    )?;
-    let legacy_source_json: Option<String> = row
-        .try_get("legacy_source_json")
-        .map_err(RepositoryError::Database)?;
-    let legacy_source: Option<HeroPins> = legacy_source_json
-        .map(|json| {
-            serde_json::from_str(&json).map_err(|source| RepositoryError::InvalidStoredData {
-                entity: "legacy campaign content pins",
-                id: campaign_session_id.clone(),
-                source,
-            })
-        })
-        .transpose()?;
-    let evidence = SealedCampaignPins {
-        seal_reason,
-        pins,
-        legacy_source,
-    };
+            id: campaign.id.clone(),
+            reason: "stored campaign pins have an invalid BSON shape",
+        })?;
     evidence
         .validate()
         .map_err(|_| RepositoryError::InvalidDomainState {
             entity: "campaign content pins",
-            id: campaign_session_id.clone(),
+            id: campaign.id.clone(),
             reason: "stored campaign pins failed domain validation",
         })?;
+    if !matches!(evidence.seal_reason, CampaignPinSealReason::SelectedTheme)
+        || evidence.legacy_source.is_some()
+    {
+        return invalid(
+            &campaign.id,
+            "stored campaign pins contain retired compatibility evidence",
+        );
+    }
+    let sealed_at = campaign
+        .rules_snapshot
+        .get_datetime("sealed_at")
+        .copied()
+        .map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "campaign content pins",
+            id: campaign.id.clone(),
+            reason: "stored campaign pins are missing their BSON seal date",
+        })?;
     Ok(StoredCampaignPins {
-        campaign_session_id,
+        campaign_session_id: campaign.id.clone(),
         evidence,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
+        created_at: date_string(sealed_at),
     })
 }
 
-const fn seal_reason_as_str(reason: CampaignPinSealReason) -> &'static str {
-    match reason {
-        CampaignPinSealReason::SelectedTheme => "selected_theme",
-        CampaignPinSealReason::LegacySelectedTheme => "legacy_selected_theme",
-        CampaignPinSealReason::LegacyDigestAlias => "legacy_digest_alias",
-        CampaignPinSealReason::LegacyDefaultRainbound => "legacy_default_rainbound",
-    }
-}
-
-fn parse_seal_reason(
-    value: &str,
+fn validate_pin_scope(
+    actor_account_id: &str,
     campaign_session_id: &str,
-) -> Result<CampaignPinSealReason, RepositoryError> {
-    match value {
-        "selected_theme" => Ok(CampaignPinSealReason::SelectedTheme),
-        "legacy_selected_theme" => Ok(CampaignPinSealReason::LegacySelectedTheme),
-        "legacy_digest_alias" => Ok(CampaignPinSealReason::LegacyDigestAlias),
-        "legacy_default_rainbound" => Ok(CampaignPinSealReason::LegacyDefaultRainbound),
-        _ => invalid(campaign_session_id, "stored seal reason is unsupported"),
-    }
-}
-
-fn validate_campaign_id(campaign_session_id: &str) -> Result<(), RepositoryError> {
+) -> Result<(), RepositoryError> {
+    validate_account_id(actor_account_id)?;
     if !is_valid_opaque_id(campaign_session_id) {
         return invalid(
             campaign_session_id,

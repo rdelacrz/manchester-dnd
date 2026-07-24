@@ -2,7 +2,7 @@
   "pack_schema": "content-pack/v1",
   "id": "dev.manchester-arcana.core-mvp",
   "version": "1.0.0",
-  "digest": "sha256:c62468355cc42f51b433fc19b8b32869b35cd308e9a937a6b8bea6df7dcfb7ca",
+  "digest": "sha256:ec42825e68316f286c027dbbc1a08d0dfa9f4f97c304d5685b178c933a5ca924",
   "display_name": "Manchester Arcana private MVP core",
   "categories": ["rules_compendium", "adventure", "character_content", "creature_content"],
   "compatible_rulesets": ["srd-5.1-cc"],

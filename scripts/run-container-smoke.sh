@@ -7,8 +7,9 @@ cd "$ROOT_DIR"
 IMAGE=${1:?usage: run-container-smoke.sh IMAGE [OUTPUT_DIR]}
 OUTPUT_DIR=${2:-target/release-evidence/container-smoke}
 PORT=${CONTAINER_SMOKE_PORT:-6798}
-DATABASE_URL=${CONTAINER_SMOKE_DATABASE_URL:-postgresql://manchester_arcana:manchester_arcana@127.0.0.1:5432/manchester_arcana}
-HELPER_IMAGE=postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+MONGODB_URI=${CONTAINER_SMOKE_MONGODB_URI:-mongodb://manchester_app:dev-app-password@127.0.0.1:27017/?authSource=admin&replicaSet=rs0&directConnection=true}
+MONGODB_DATABASE=${CONTAINER_SMOKE_MONGODB_DATABASE:-manchester_dnd}
+HELPER_IMAGE=mongo:8.0.26-noble@sha256:ffa440e8d62533e24a67696ae1bbb46e610ebb3167d65abd122b496ae06d28e6
 suffix="${BASHPID:-$$}"
 container_name="manchester-arcana-smoke-${suffix}"
 volume_name="manchester-arcana-smoke-data-${suffix}"
@@ -47,7 +48,8 @@ docker run --detach \
   --name "$container_name" \
   --network host \
   --volume "$volume_name:/app/data" \
-  --env "DATABASE_URL=$DATABASE_URL" \
+  --env "MONGODB_URI=$MONGODB_URI" \
+  --env "MONGODB_DATABASE=$MONGODB_DATABASE" \
   --env "LEPTOS_SITE_ADDR=127.0.0.1:${PORT}" \
   --env RNG_MASTER_KEY_FILE=/app/data/rng-master.key \
   --env "TEXT_LLM_API_KEY=$text_canary" \
@@ -59,8 +61,8 @@ network_request() {
   local request_host=${2:-127.0.0.1:${PORT}}
   docker run --rm \
     --network "container:$container_name" \
-    "$HELPER_IMAGE" sh -eu -c \
-    '{ printf "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" "$1" "$2"; sleep 0.1; } | nc -w 10 127.0.0.1 "$3"' \
+    "$HELPER_IMAGE" bash -eu -c \
+    'exec 3<>"/dev/tcp/127.0.0.1/$3"; printf "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" "$1" "$2" >&3; cat <&3' \
     sh "$path" "$request_host" "$PORT"
 }
 

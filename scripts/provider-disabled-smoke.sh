@@ -9,7 +9,8 @@ binary="${SMOKE_BINARY:-target/release/manchester-dnd-web}"
 site_root="${SMOKE_SITE_ROOT:-target/site}"
 address="${SMOKE_ADDRESS:-127.0.0.1:6791}"
 base_url="${SMOKE_BASE_URL:-http://$address}"
-database_url="${DATABASE_URL:-postgresql://manchester_arcana:manchester_arcana@127.0.0.1:5432/manchester_arcana}"
+mongodb_uri="${MONGODB_URI:-mongodb://manchester_app:dev-app-password@127.0.0.1:27017/?authSource=admin&replicaSet=rs0&directConnection=true}"
+mongodb_database="${MONGODB_DATABASE:-manchester_dnd}"
 
 if [[ "$base_url" != http://* ]]; then
     echo "provider-disabled smoke: local boundary requires an http:// URL" >&2
@@ -38,8 +39,8 @@ for command in curl grep timeout; do
 done
 
 rehearse_database_outage="${SMOKE_DATABASE_OUTAGE:-0}"
-if [[ "$rehearse_database_outage" == "1" ]] && ! command -v psql >/dev/null 2>&1; then
-    echo "provider-disabled smoke: psql is required when SMOKE_DATABASE_OUTAGE=1" >&2
+if [[ "$rehearse_database_outage" == "1" ]] && ! command -v docker >/dev/null 2>&1; then
+    echo "provider-disabled smoke: Docker Compose is required when SMOKE_DATABASE_OUTAGE=1" >&2
     exit 1
 fi
 
@@ -53,32 +54,16 @@ else
 fi
 
 server_pid=""
-database_connections_disabled=false
-database_name="${database_url##*/}"
-database_name="${database_name%%\?*}"
-database_admin_url="${SMOKE_ADMIN_DATABASE_URL:-${database_url%/*}/postgres}"
-if [[ ! "$database_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo "provider-disabled smoke: database name must be a simple PostgreSQL identifier" >&2
+mongodb_service_stopped=false
+mongodb_service="${SMOKE_MONGODB_SERVICE:-mongodb}"
+if [[ ! "$mongodb_database" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "provider-disabled smoke: MongoDB database name must be allowlisted" >&2
     exit 1
 fi
 
-set_database_connections() {
-    local allowed="$1"
-    PGAPPNAME=manchester-arcana-smoke psql "$database_admin_url" \
-        --no-psqlrc --set=ON_ERROR_STOP=1 --set=db_name="$database_name" \
-        --set=allowed="$allowed" \
-        --quiet >/dev/null <<'SQL'
-SELECT format(
-    'ALTER DATABASE %I WITH ALLOW_CONNECTIONS %s',
-    :'db_name',
-    :'allowed'
-) \gexec
-SQL
-}
-
 cleanup() {
-    if [[ "$database_connections_disabled" == true ]]; then
-        set_database_connections true >/dev/null 2>&1 || true
+    if [[ "$mongodb_service_stopped" == true ]]; then
+        docker compose start "$mongodb_service" >/dev/null 2>&1 || true
     fi
     if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
         kill -TERM "$server_pid" 2>/dev/null || true
@@ -101,7 +86,8 @@ env \
     APP_ACCESS_MODE=local \
     LEPTOS_SITE_ADDR="$address" \
     LEPTOS_SITE_ROOT="$site_root" \
-    DATABASE_URL="$database_url" \
+    MONGODB_URI="$mongodb_uri" \
+    MONGODB_DATABASE="$mongodb_database" \
     EVENT_PROMPT_DIR="${EVENT_PROMPT_DIR:-prompts/events/private}" \
     TEXT_LLM_BACKEND=disabled \
     IMAGE_LLM_BACKEND=disabled \
@@ -227,7 +213,8 @@ timeout 10 env \
     APP_ACCESS_MODE=hosted \
     LEPTOS_SITE_ADDR="$address" \
     LEPTOS_SITE_ROOT="$site_root" \
-    DATABASE_URL="$database_url" \
+    MONGODB_URI="$mongodb_uri" \
+    MONGODB_DATABASE="$mongodb_database" \
     TEXT_LLM_BACKEND=disabled \
     IMAGE_LLM_BACKEND=disabled \
     "$binary" >"$evidence_dir/hosted-startup.log" 2>&1
@@ -245,7 +232,8 @@ timeout 10 env \
     APP_ACCESS_MODE=local \
     LEPTOS_SITE_ADDR="$address" \
     LEPTOS_SITE_ROOT="$site_root" \
-    DATABASE_URL="$database_url" \
+    MONGODB_URI="$mongodb_uri" \
+    MONGODB_DATABASE="$mongodb_database" \
     TEXT_LLM_BACKEND=not-a-provider \
     IMAGE_LLM_BACKEND=disabled \
     "$binary" >"$evidence_dir/invalid-config.log" 2>&1
@@ -258,16 +246,8 @@ grep --fixed-strings --quiet 'TEXT_LLM_BACKEND' "$evidence_dir/invalid-config.lo
     || fail "invalid configuration failure was not field-specific"
 
 if [[ "$rehearse_database_outage" == "1" ]]; then
-    set_database_connections false
-    database_connections_disabled=true
-    PGAPPNAME=manchester-arcana-smoke psql "$database_admin_url" \
-        --no-psqlrc --set=ON_ERROR_STOP=1 --set=db_name="$database_name" \
-        --quiet >/dev/null <<'SQL'
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE datname = :'db_name'
-  AND pid <> pg_backend_pid();
-SQL
+    docker compose stop "$mongodb_service" >/dev/null
+    mongodb_service_stopped=true
 
     status="$(request database-outage-live "$base_url/health/live")" \
         || fail "liveness failed during database outage"
@@ -286,8 +266,8 @@ SQL
     [[ "$database_unready" == true ]] \
         || fail "readiness did not become 503 during the controlled database outage"
 
-    set_database_connections true
-    database_connections_disabled=false
+    docker compose start "$mongodb_service" >/dev/null
+    mongodb_service_stopped=false
 
     database_recovered=false
     for _ in $(seq 1 30); do

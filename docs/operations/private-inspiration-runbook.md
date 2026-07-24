@@ -17,7 +17,7 @@ contact details, filesystem paths, report prose, or consent prose.
   records only evidence digests.
 - Only the offline `inspiration-admin` process receives a decrypted source
   directory. It minimizes approved input to bounded neutral facts and writes an
-  integrity-bound runtime projection to PostgreSQL.
+  integrity-bound runtime projection to MongoDB.
 - The web/game/image process reconstructs selectable prompts from that minimized
   projection on demand. It does not open `EVENT_PROMPT_DIR`, receive the source
   vault key, or retain raw Markdown in memory. Ordinary database backup and
@@ -172,7 +172,7 @@ only to replay an uncertain command result.
    web process's deployment gate `INSPIRATION_ENABLED=true` without configuring
    or mounting a source root; then confirm `status` and play using the
    deterministic fake text provider. The server reloads only the minimized
-   PostgreSQL projection. An
+   MongoDB projection. An
    approved source is still ineligible if any participant grant, safety scope,
    theme, media, expiry, cooldown, feature gate, pause, veto, or global control
    fails.

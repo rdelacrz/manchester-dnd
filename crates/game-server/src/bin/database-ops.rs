@@ -1,9 +1,9 @@
-//! Emits bounded PostgreSQL/queue/recovery health for an operator collector.
+//! Emits bounded MongoDB/queue/recovery health for an operator collector.
 
-use std::{env, process::ExitCode};
+use std::process::ExitCode;
 
 use manchester_dnd_server::{
-    DatabaseOperationsSnapshot, DatabaseRuntimeConfig, repository::PostgresRepository,
+    AppConfig, DatabaseOperationsSnapshot, MongoStore, repository::MongoRepository,
 };
 use serde_json::json;
 
@@ -22,19 +22,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<DatabaseOperationsSnapshot, String> {
-    let database_url = env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL is required for database operations".to_owned())?;
-    if database_url.trim().is_empty() {
-        return Err("DATABASE_URL is required for database operations".to_owned());
-    }
-    let runtime = DatabaseRuntimeConfig {
-        max_connections: 1,
-        migrate_on_start: false,
-        ..DatabaseRuntimeConfig::default()
-    };
-    let repository = PostgresRepository::connect(&database_url, runtime)
+    let config = AppConfig::load().map_err(safe_error)?;
+    let store = MongoStore::connect(&config.persistence.mongodb)
         .await
         .map_err(safe_error)?;
+    let repository = MongoRepository::new(store);
     repository
         .database_operations_snapshot()
         .await

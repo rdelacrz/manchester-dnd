@@ -9,7 +9,7 @@ This register prevents unresolved choices from leaking into code as accidental p
 | ADR-P01 | The implemented Leptos 0.8/Axum modular workspace remains the MVP baseline; its original embedded-database choice is superseded by ADR-P15. | Preserve `app`/`frontend`/`server` and `game-core`/`game-server` boundaries. |
 | ADR-P02 | Initial mechanics/content profile ID is `srd-5.1-cc`; SRD 5.2.1 is a future separate profile. | Campaigns pin a ruleset; no silent mixing/conversion. |
 | ADR-P03 | The deterministic Rust engine is authoritative; AI emits typed proposals/presentation only. | Model/provider failure cannot change or block mechanical truth. |
-| ADR-P04 | MVP persists revisioned campaign/character JSON documents plus append-only turn/asset audits in PostgreSQL. | Expected-revision saves and correction audits are required; a complete event stream/snapshots are later work and cannot be claimed yet. |
+| ADR-P04 | MVP persists revisioned campaign/character BSON documents plus append-only turn/asset audits in MongoDB. | Expected-revision saves and correction audits are required; a complete event stream/snapshots are later work and cannot be claimed yet. |
 | ADR-P05 | Text/image providers use independent `TEXT_LLM_*` and `IMAGE_LLM_*` typed profiles loaded with `dotenvy`; MVP applies changes on restart. | Disabled is the safe default; no credentials in client/config fingerprints and no MVP hot reload. |
 | ADR-P06 | Domain/boundary errors use dedicated `thiserror` types mapped to stable safe client codes. | Internal causes remain observable without leaking details. |
 | ADR-P07 | Real-life inspiration is feature-flagged off by default, requires all-party scoped consent, and uses deterministic eligibility before generation. | Surprise cannot override privacy/safety. |
@@ -20,7 +20,7 @@ This register prevents unresolved choices from leaking into code as accidental p
 | ADR-P12 | MVP is turn-based and has one campaign owner controlling one hero. | Invited multi-player character ownership/concurrency is post-MVP. |
 | ADR-P13 | MVP advancement uses the implemented SRD 5.1 XP thresholds and validated XP awards. | Milestone advancement would be a separately versioned campaign policy later. |
 | ADR-P14 | On 2026-07-14, the first implemented deployment was fixed as explicit local single-user mode. | Bind only to loopback HTTP, enforce matching loopback browser Host/Origin, and fail hosted startup until authenticated sessions and campaign authorization exist; this does not protect against another local process. |
-| ADR-P15 | On 2026-07-14, PostgreSQL became the only supported application database, replacing the initial embedded-database assumption because concurrent web/worker access is a first-order requirement. | Use SQLx/PostgreSQL migrations, JSONB, bounded pools, row locks plus expected revisions, isolated real-database tests, least-privilege roles, and PostgreSQL-native backup/recovery. Do not maintain a dual-backend abstraction. |
+| ADR-P15 | On 2026-07-24, MongoDB became the only authoritative application database and DragonflyDB an optional disposable cache/pub-sub layer. | Use replica-set transactions, managed validators/indexes, revision/idempotency checks, isolated live-database tests, separate app/schema credentials, encrypted Mongo recovery archives, and no dual-backend/import abstraction. |
 
 ## Resolved private-MVP product and policy questions
 

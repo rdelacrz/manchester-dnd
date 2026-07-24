@@ -1,38 +1,35 @@
-//! Owner-scoped campaign lifecycle, history, and private export storage.
-//!
-//! The current product has one explicit local owner. Every query still takes
-//! an owner key so hosted identity can replace the local key without adding an
-//! unscoped data path. Nothing in this module enables hosted access.
+//! MongoDB owner-scoped campaign lifecycle, history, export, restore, and deletion.
 
-use std::collections::BTreeSet;
+#![allow(dead_code)]
 
-use manchester_dnd_core::{
-    CAMPAIGN_PINS_SCHEMA_VERSION, CampaignContentPins, CampaignPinSealReason, Character,
-    SESSION_SCHEMA_VERSION, SealedCampaignPins, SessionDto, SessionEventDto, Sha256Digest,
-    encounter::{EncounterCommand, EncounterIntent},
-    hero::HeroPins,
-    hero::{
-        HERO_CHARACTER_SCHEMA_VERSION, HERO_DRAFT_SCHEMA_VERSION, HeroCharacter, HeroCreationDraft,
-    },
-    is_valid_opaque_id,
+use std::collections::{BTreeMap, BTreeSet};
+
+use manchester_dnd_core::{SessionEventDto, Sha256Digest, is_valid_opaque_id};
+use mongodb::{
+    ClientSession, Collection,
+    bson::{Bson, DateTime, Document, doc},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+use uuid::Uuid;
 
-use super::{
-    CHARACTER_SCHEMA_VERSION, GeneratedAssetMetadata, PostgresRepository, from_i64, from_i64_u32,
-    recaps::{CampaignPrivateRecap, private_recap_from_row},
-    serialize, to_i64,
+use super::memberships::CampaignCharacterInstanceDocument;
+use super::{CampaignDocument, MongoRepository};
+use crate::{
+    error::{MongoFailureKind, PersistenceError, RepositoryError},
+    persistence::CollectionName,
 };
-use crate::{error::RepositoryError, repository::HeroAuditPayload};
 
 pub const CAMPAIGN_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
 pub const CAMPAIGN_EXPORT_SCHEMA_VERSION: u16 = 1;
 pub const CAMPAIGN_HISTORY_DEFAULT_LIMIT: u16 = 25;
 pub const CAMPAIGN_HISTORY_MAX_LIMIT: u16 = 100;
+
 const MAX_PLAYER_EXPORT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EXPORTED_DOCUMENTS: usize = 5_000;
+const DELETION_PREPARATION_SECONDS: i64 = 60 * 60;
+const DELETION_TOMBSTONE_SECONDS: i64 = 35 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,22 +39,18 @@ pub enum CampaignLifecycleState {
 }
 
 impl CampaignLifecycleState {
-    const fn as_str(self) -> &'static str {
+    const fn storage_value(self) -> &'static str {
         match self {
-            Self::Active => "active",
+            Self::Active => "open",
             Self::Archived => "archived",
         }
     }
-}
 
-impl TryFrom<&str> for CampaignLifecycleState {
-    type Error = RepositoryError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn from_storage(value: &str, campaign_id: &str) -> Result<Self, RepositoryError> {
         match value {
-            "active" => Ok(Self::Active),
+            "open" => Ok(Self::Active),
             "archived" => Ok(Self::Archived),
-            _ => invalid("campaign lifecycle", value, "unknown lifecycle state"),
+            _ => invalid("campaign lifecycle", campaign_id, "unknown lifecycle state"),
         }
     }
 }
@@ -223,239 +216,35 @@ impl LifecycleAuditPayload {
             Self::RestoreImported { .. } => "restore_imported",
         }
     }
-
-    fn validate(&self) -> bool {
-        match self {
-            Self::PlayStarted { play_session_id } | Self::PlayEnded { play_session_id } => {
-                is_valid_opaque_id(play_session_id)
-            }
-            Self::Archived | Self::Restored => true,
-            Self::RestoreImported {
-                closed_play_session_ids,
-            } => {
-                closed_play_session_ids.len() <= 64
-                    && closed_play_session_ids
-                        .iter()
-                        .all(|id| is_valid_opaque_id(id))
-            }
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedDocument<T> {
-    pub id: String,
-    pub schema_version: u32,
-    pub revision: u64,
-    pub value: T,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedCampaignDocument {
-    pub document: ExportedDocument<SessionDto>,
-    pub owner_key: String,
-    pub lifecycle_revision: u64,
-    pub lifecycle_state: CampaignLifecycleState,
-    pub archived_at: Option<String>,
-    pub safety_policy_id: String,
-    pub progression_policy_id: String,
-    pub retention_class: String,
-    pub retention_delete_after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedCampaignPins {
-    pub evidence: SealedCampaignPins,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedTurnAudit {
-    pub id: String,
-    pub turn_number: u64,
-    pub actor_id: Option<String>,
-    pub correlation_id: Option<String>,
-    pub schema_version: u32,
-    pub event: SessionEventDto,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedCommandReceipt {
-    pub idempotency_key: String,
-    pub command_kind: String,
-    pub request_fingerprint: Sha256Digest,
-    pub expected_revision: u64,
-    pub result_revision: u64,
-    pub audit_id: String,
-    pub response: Value,
-    pub created_at: String,
-}
-
-/// Body-free, campaign-lifetime alias for a generated narration response.
-/// Presentation bodies and operational attempts can expire independently.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedTextPresentationReceipt {
-    pub schema_version: u16,
-    pub origin_turn_id: String,
-    pub client_idempotency_key: String,
-    pub presentation_id: String,
-    pub generation_job_id: String,
-    pub generation_attempt_id: String,
-    pub version: u8,
-    pub source: String,
-    pub config_digest: Sha256Digest,
-    pub prompt_digest: Sha256Digest,
-    pub policy_digest: Sha256Digest,
-    pub output_digest: Sha256Digest,
-    pub created_at: String,
-}
-
-/// Mechanics-resumption receipt for a validated free-form command. The raw
-/// player text is represented only by its digest and is never exported.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedTypedIntentReceipt {
-    pub schema_version: u16,
-    pub client_idempotency_key: String,
-    pub player_intent_digest: Sha256Digest,
-    pub expected_campaign_revision: u64,
-    pub expected_encounter_revision: u64,
-    pub resolved_intent: EncounterIntent,
-    pub interpretation_label: String,
-    pub interpretation_evidence: Value,
-    pub state: String,
-    pub origin_turn_id: Option<String>,
-    pub event_sequence: Option<u64>,
-    pub result_campaign_revision: Option<u64>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedHeroDraft {
-    pub document: ExportedDocument<HeroCreationDraft>,
-    pub expires_at_epoch_seconds: u64,
-    pub retention_delete_after_epoch_seconds: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedHeroAudit {
-    pub id: String,
-    pub subject_kind: String,
-    pub subject_id: String,
-    pub audit_kind: String,
-    pub schema_version: u32,
-    pub subject_revision: u64,
-    pub occurred_at_epoch_seconds: u64,
-    pub payload: HeroAuditPayload,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedHeroReceipt {
-    pub scope_kind: String,
-    pub scope_id: String,
-    pub idempotency_key: String,
-    pub command_kind: String,
-    pub request_fingerprint: Sha256Digest,
-    pub expected_revision: u64,
-    pub result_revision: u64,
-    pub audit_id: String,
-    pub response: Value,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedEncounterRewardClaim {
-    pub encounter_id: String,
-    pub character_id: String,
-    pub encounter_revision: u64,
-    pub victory_event_sequence: u64,
-    pub reward_tier: String,
-    pub experience_awarded: u32,
-    pub hero_audit_id: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedLifecycleAudit {
-    pub id: String,
-    pub lifecycle_revision: u64,
-    pub payload: LifecycleAuditPayload,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedTextPresentation {
-    pub id: String,
-    pub origin_turn_id: String,
-    pub generation_job_id: String,
-    pub generation_attempt_id: String,
-    pub client_idempotency_key: String,
-    pub version: u8,
-    pub source: String,
-    pub body: String,
-    pub config_digest: Sha256Digest,
-    pub prompt_digest: Sha256Digest,
-    pub policy_digest: Sha256Digest,
-    pub output_digest: Sha256Digest,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportedGeneratedAsset {
-    pub id: String,
-    pub turn_id: Option<String>,
-    pub asset_kind: String,
-    pub provider: String,
-    pub model: String,
-    pub location: String,
-    pub prompt_fingerprint: Option<Sha256Digest>,
-    pub metadata: GeneratedAssetMetadata,
-    pub created_at: String,
-}
-
+/// Explicit bounded export. Every vector maps to one allowlisted campaign
+/// collection. Authentication, invitations, throttles, jobs, quarantines, and
+/// deletion-control documents are deliberately absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignPrivateExportV1 {
     pub schema_version: u16,
     pub owner_key: String,
     pub exported_at: String,
-    pub campaign: ExportedCampaignDocument,
-    pub characters: Vec<ExportedDocument<Character>>,
-    pub hero_drafts: Vec<ExportedHeroDraft>,
-    pub hero_character: Option<ExportedDocument<HeroCharacter>>,
-    pub turns: Vec<ExportedTurnAudit>,
-    pub command_receipts: Vec<ExportedCommandReceipt>,
-    pub text_presentation_receipts: Vec<ExportedTextPresentationReceipt>,
-    pub typed_intent_receipts: Vec<ExportedTypedIntentReceipt>,
-    pub hero_audits: Vec<ExportedHeroAudit>,
-    pub hero_receipts: Vec<ExportedHeroReceipt>,
-    pub encounter_reward_claims: Vec<ExportedEncounterRewardClaim>,
-    pub content_pins: Option<ExportedCampaignPins>,
-    pub play_sessions: Vec<CampaignPlaySession>,
-    pub lifecycle_audits: Vec<ExportedLifecycleAudit>,
-    #[serde(default)]
-    pub private_recaps: Vec<CampaignPrivateRecap>,
-    pub selected_text_presentations: Vec<ExportedTextPresentation>,
-    pub selected_generated_assets: Vec<ExportedGeneratedAsset>,
+    pub campaign: Document,
+    pub character_instances: Vec<Document>,
+    pub play_sessions: Vec<Document>,
+    pub turn_events: Vec<Document>,
+    pub command_receipts: Vec<Document>,
+    pub audit_events: Vec<Document>,
+    pub campaign_enemy_instances: Vec<Document>,
+    pub campaign_events: Vec<Document>,
+    pub encounters: Vec<Document>,
+    pub bde_ledger: Vec<Document>,
+    pub private_inspiration_participants: Vec<Document>,
+    pub private_inspiration_sources: Vec<Document>,
+    pub private_inspiration_consents: Vec<Document>,
+    pub private_inspiration_vetoes: Vec<Document>,
+    pub private_inspiration_selections: Vec<Document>,
+    pub private_inspiration_work: Vec<Document>,
+    pub selected_generated_presentations: Vec<Document>,
+    pub selected_generated_assets: Vec<Document>,
 }
 
 impl CampaignPrivateExportV1 {
@@ -481,31 +270,132 @@ pub struct RestoreCampaignExportCommand {
     pub canonical_export_json: String,
 }
 
-impl PostgresRepository {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlaySessionDocument {
+    #[serde(rename = "_id")]
+    pub(crate) id: String,
+    pub(crate) schema_version: i64,
+    pub(crate) revision: i64,
+    pub(crate) campaign_id: String,
+    pub(crate) gm_account_id: String,
+    pub(crate) state: String,
+    pub(crate) participants: Vec<Document>,
+    pub(crate) mode: String,
+    pub(crate) turn_state: Document,
+    pub(crate) membership_snapshot: Document,
+    pub(crate) start_policy: String,
+    pub(crate) opened_at: DateTime,
+    pub(crate) updated_at: DateTime,
+    pub(crate) closed_at: Option<DateTime>,
+    pub(crate) close_reason: Option<String>,
+    pub(crate) started_campaign_revision: i64,
+    pub(crate) ended_campaign_revision: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TurnEventDocument {
+    #[serde(rename = "_id")]
+    pub(crate) id: String,
+    pub(crate) schema_version: i64,
+    pub(crate) campaign_id: String,
+    pub(crate) play_session_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) correlation_id: Option<String>,
+    pub(crate) actor_account_id: Option<String>,
+    pub(crate) event: SessionEventDto,
+    pub(crate) created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleReceiptDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    scope_kind: String,
+    scope_id: String,
+    campaign_id: String,
+    actor_account_id: String,
+    command_kind: String,
+    idempotency_key: String,
+    request_fingerprint: Sha256Digest,
+    expected_revision: i64,
+    result_revision: i64,
+    response: Document,
+    state: String,
+    retain_after_delete: bool,
+    created_at: DateTime,
+    purge_at: Option<DateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeletionPreparationDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    deletion_id: String,
+    owner_account_id: String,
+    scope_kind: String,
+    scope_id: String,
+    campaign_revision: i64,
+    lifecycle_revision: i64,
+    digest: Sha256Digest,
+    canonical_export_json: String,
+    expires_at: DateTime,
+    purge_at: DateTime,
+    created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeletionTombstoneDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    entity_kind: String,
+    entity_id: String,
+    deletion_id: String,
+    digest: Sha256Digest,
+    owner_account_id: String,
+    deleted_lifecycle_revision: i64,
+    deleted_at: DateTime,
+    purge_at: DateTime,
+}
+
+#[derive(Debug)]
+struct ExportSnapshot {
+    campaign: CampaignDocument,
+    documents: BTreeMap<&'static str, Vec<Document>>,
+}
+
+impl MongoRepository {
     pub async fn list_owned_campaigns(
         &self,
         owner_key: &str,
     ) -> Result<Vec<CampaignSummary>, RepositoryError> {
-        validate_owner_key(owner_key)?;
-        let rows = sqlx::query(
-            "SELECT c.id, c.owner_key, c.revision, c.lifecycle_revision, c.lifecycle_state,
-                    c.archived_at::text AS archived_at, c.safety_policy_id,
-                    c.progression_policy_id, c.retention_class,
-                    c.retention_delete_after::text AS retention_delete_after,
-                    c.payload_json->>'title' AS title,
-                    c.created_at::text AS created_at, c.updated_at::text AS updated_at,
-                    p.id AS open_play_session_id
-             FROM campaign_sessions c
-             LEFT JOIN campaign_play_sessions p
-               ON p.campaign_session_id = c.id AND p.state IN ('waiting', 'active')
-             WHERE c.owner_key = $1
-             ORDER BY c.updated_at DESC, c.id",
-        )
-        .bind(owner_key)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        rows.into_iter().map(summary_from_row).collect()
+        validate_owner(owner_key)?;
+        let mut cursor = self
+            .campaigns()
+            .find(doc! { "owner_account_id": owner_key })
+            .sort(doc! { "updated_at": -1, "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("list owned campaigns", error))?;
+        let mut summaries = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|error| mongo_error("read owned campaigns", error))?
+        {
+            summaries.push(campaign_summary_from_document(
+                cursor
+                    .deserialize_current()
+                    .map_err(|error| mongo_error("decode owned campaign", error))?,
+            )?);
+        }
+        Ok(summaries)
     }
 
     pub async fn load_owned_campaign_summary(
@@ -514,25 +404,15 @@ impl PostgresRepository {
         campaign_session_id: &str,
     ) -> Result<Option<CampaignSummary>, RepositoryError> {
         validate_owner_campaign(owner_key, campaign_session_id)?;
-        let row = sqlx::query(
-            "SELECT c.id, c.owner_key, c.revision, c.lifecycle_revision, c.lifecycle_state,
-                    c.archived_at::text AS archived_at, c.safety_policy_id,
-                    c.progression_policy_id, c.retention_class,
-                    c.retention_delete_after::text AS retention_delete_after,
-                    c.payload_json->>'title' AS title,
-                    c.created_at::text AS created_at, c.updated_at::text AS updated_at,
-                    p.id AS open_play_session_id
-             FROM campaign_sessions c
-             LEFT JOIN campaign_play_sessions p
-               ON p.campaign_session_id = c.id AND p.state IN ('waiting', 'active')
-             WHERE c.owner_key = $1 AND c.id = $2",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(summary_from_row).transpose()
+        self.campaigns()
+            .find_one(doc! {
+                "_id": campaign_session_id,
+                "owner_account_id": owner_key,
+            })
+            .await
+            .map_err(|error| mongo_error("load owned campaign", error))?
+            .map(campaign_summary_from_document)
+            .transpose()
     }
 
     pub async fn has_campaign_deletion_tombstone(
@@ -541,67 +421,64 @@ impl PostgresRepository {
         campaign_session_id: &str,
     ) -> Result<bool, RepositoryError> {
         validate_owner_campaign(owner_key, campaign_session_id)?;
-        sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM campaign_deletion_tombstones
-                 WHERE owner_key = $1 AND campaign_session_id = $2
-                   AND retention_delete_after > CURRENT_TIMESTAMP
-             )",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)
+        Ok(self
+            .store()
+            .document_collection(CollectionName::DeletionTombstones)
+            .find_one(doc! {
+                "entity_kind": "campaign",
+                "entity_id": campaign_session_id,
+                "owner_account_id": owner_key,
+                "purge_at": { "$gt": DateTime::now() },
+            })
+            .projection(doc! { "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("load campaign deletion tombstone", error))?
+            .is_some())
     }
 
     pub(crate) async fn retire_deleted_campaign_receipts_for_recreate(
         &self,
         owner_key: &str,
         campaign_session_id: &str,
-    ) -> Result<u64, RepositoryError> {
+    ) -> Result<(), RepositoryError> {
         validate_owner_campaign(owner_key, campaign_session_id)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let campaign_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM campaign_sessions WHERE id = $1)")
-                .bind(campaign_session_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(RepositoryError::Database)?;
-        let retained_delete: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM campaign_deletion_tombstones
-                 WHERE owner_key = $1 AND campaign_session_id = $2
-                   AND retention_delete_after > CURRENT_TIMESTAMP
-             )",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if campaign_exists || !retained_delete {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(0);
-        }
-        let deleted = sqlx::query(
-            "DELETE FROM campaign_lifecycle_receipts
-             WHERE owner_key = $1 AND campaign_session_id = $2",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .rows_affected();
-        transaction
-            .commit()
+        if self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_session_id,
+                "owner_account_id": owner_key,
+            })
+            .projection(doc! { "_id": 1 })
             .await
-            .map_err(RepositoryError::Database)?;
-        Ok(deleted)
+            .map_err(|error| mongo_error("check campaign before receipt retirement", error))?
+            .is_some()
+        {
+            return invalid(
+                "campaign receipt retirement",
+                campaign_session_id,
+                "campaign still exists",
+            );
+        }
+        self.store()
+            .document_collection(CollectionName::CommandReceipts)
+            .update_many(
+                doc! {
+                    "scope_kind": "campaign",
+                    "scope_id": campaign_session_id,
+                    "actor_account_id": owner_key,
+                    "retain_after_delete": true,
+                    "state": "committed",
+                },
+                doc! {
+                    "$set": {
+                        "state": "retired",
+                        "purge_at": DateTime::now(),
+                    }
+                },
+            )
+            .await
+            .map_err(|error| mongo_error("retire deleted campaign receipts", error))?;
+        Ok(())
     }
 
     pub async fn list_campaign_turn_history(
@@ -614,54 +491,45 @@ impl PostgresRepository {
         validate_owner_campaign(owner_key, campaign_session_id)?;
         if limit == 0 || limit > CAMPAIGN_HISTORY_MAX_LIMIT {
             return invalid(
-                "campaign history request",
+                "campaign turn history",
                 campaign_session_id,
-                "page limit must be between one and one hundred",
+                "limit is outside the supported range",
             );
         }
-        require_owned_campaign(&self.pool, owner_key, campaign_session_id).await?;
-        let cursor = after_turn_number
-            .map(|value| to_i64(value, "turn history cursor"))
-            .transpose()?;
-        let rows = sqlx::query(
-            "SELECT id, campaign_session_id, turn_number, actor_id, correlation_id,
-                    schema_version, payload_json::text AS payload_json,
-                    created_at::text AS created_at
-             FROM turn_audits
-             WHERE campaign_session_id = $1
-               AND ($2::bigint IS NULL OR turn_number > $2)
-             ORDER BY turn_number, id
-             LIMIT $3",
-        )
-        .bind(campaign_session_id)
-        .bind(cursor)
-        .bind(i64::from(limit) + 1)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let has_more = rows.len() > usize::from(limit);
-        let mut items = rows
-            .into_iter()
-            .take(usize::from(limit))
-            .map(turn_history_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        let next_after_turn_number = has_more
-            .then(|| items.last().map(|item| item.turn_number))
-            .flatten();
-        if items
-            .iter()
-            .any(|item| item.campaign_session_id != campaign_session_id)
+        require_owned_campaign(self, owner_key, campaign_session_id).await?;
+        let after = to_i64(after_turn_number.unwrap_or(0), "turn history cursor")?;
+        let mut cursor = self
+            .store()
+            .collection::<TurnEventDocument>(CollectionName::TurnEvents)
+            .find(doc! {
+                "campaign_id": campaign_session_id,
+                "sequence": { "$gt": after },
+            })
+            .sort(doc! { "sequence": 1, "_id": 1 })
+            .limit(i64::from(limit) + 1)
+            .await
+            .map_err(|error| mongo_error("list campaign turn history", error))?;
+        let mut items = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|error| mongo_error("read campaign turn history", error))?
         {
-            return invalid(
-                "campaign history",
-                campaign_session_id,
-                "stored turn belongs to another campaign",
-            );
+            let document = cursor
+                .deserialize_current()
+                .map_err(|error| mongo_error("decode campaign turn history", error))?;
+            items.push(turn_history_from_document(document)?);
         }
+        let next_after_turn_number = if items.len() > usize::from(limit) {
+            items.truncate(usize::from(limit));
+            items.last().map(|item| item.turn_number)
+        } else {
+            None
+        };
         Ok(CampaignTurnHistoryPage {
             schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
             campaign_session_id: campaign_session_id.to_owned(),
-            items: std::mem::take(&mut items),
+            items,
             next_after_turn_number,
         })
     }
@@ -672,3112 +540,212 @@ impl PostgresRepository {
         campaign_session_id: &str,
     ) -> Result<Vec<CampaignPlaySession>, RepositoryError> {
         validate_owner_campaign(owner_key, campaign_session_id)?;
-        require_owned_campaign(&self.pool, owner_key, campaign_session_id).await?;
-        let rows = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key, schema_version, state,
-                    started_campaign_revision, ended_campaign_revision,
-                    opened_at::text AS opened_at, closed_at::text AS closed_at,
-                    close_reason
-             FROM campaign_play_sessions
-             WHERE campaign_session_id = $1 AND owner_key = $2
-             ORDER BY opened_at, id",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        rows.into_iter().map(play_session_from_row).collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use manchester_dnd_core::{
-        AbilityScores, CampaignPinSealReason, CharacterDraft, D20Roll, EventActor, RULESET,
-        RollMode, SESSION_SCHEMA_VERSION, SealedCampaignPins, SessionEventDto, SessionEventPayload,
-        SessionStatus, hero::ThemeId,
-    };
-    use sqlx::PgPool;
-
-    use super::*;
-    use crate::{campaign_pins::CampaignPinRuntime, repository::MIGRATOR};
-
-    const OWNER: &str = "local-owner";
-    const CAMPAIGN: &str = "local-campaign";
-    const CHARACTER: &str = "local-hero";
-
-    fn repository(pool: PgPool) -> PostgresRepository {
-        PostgresRepository::from_pool(pool)
-    }
-
-    fn session() -> SessionDto {
-        SessionDto {
-            schema_version: SESSION_SCHEMA_VERSION,
-            id: CAMPAIGN.to_owned(),
-            ruleset: RULESET,
-            title: "The Runes Beneath the Viaduct".to_owned(),
-            status: SessionStatus::Active,
-            character_ids: vec![CHARACTER.to_owned()],
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-            last_event_sequence: 0,
-        }
-    }
-
-    fn character() -> Character {
-        CharacterDraft {
-            id: CHARACTER.to_owned(),
-            name: "Mara".to_owned(),
-            theme: "Canal Warden".to_owned(),
-            ability_scores: AbilityScores::new(12, 14, 10, 16, 13, 8).unwrap(),
-            experience_points: 0,
-            current_hit_points: 8,
-            maximum_hit_points: 8,
-        }
-        .build()
-        .unwrap()
-    }
-
-    async fn create_campaign(repository: &PostgresRepository) {
-        repository
-            .create_campaign(&session(), &[character()])
-            .await
-            .expect("campaign fixture should save");
-    }
-
-    fn lifecycle_command(expected: u64, key: &str) -> CampaignLifecycleCommand {
-        CampaignLifecycleCommand {
-            schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
-            campaign_session_id: CAMPAIGN.to_owned(),
-            expected_lifecycle_revision: expected,
-            idempotency_key: key.to_owned(),
-        }
-    }
-
-    async fn seal_pins(repository: &PostgresRepository) {
-        let runtime = CampaignPinRuntime::bundled_for_tests();
-        let evidence = SealedCampaignPins {
-            seal_reason: CampaignPinSealReason::SelectedTheme,
-            pins: runtime.pins_for_theme(ThemeId::RainboundBorough).unwrap(),
-            legacy_source: None,
-        };
-        repository
-            .seal_campaign_pins_for_test(CAMPAIGN, &evidence)
-            .await
-            .expect("pin fixture should seal");
-    }
-
-    async fn append_event(
-        repository: &PostgresRepository,
-        current: &mut SessionDto,
-        payload: SessionEventPayload,
-        actor: EventActor,
-    ) {
-        let expected_revision = current.last_event_sequence + 1;
-        let sequence = current.last_event_sequence + 1;
-        current.last_event_sequence = sequence;
-        current.updated_at_unix_ms = sequence + 10;
-        let event = SessionEventDto {
-            schema_version: SESSION_SCHEMA_VERSION,
-            session_id: CAMPAIGN.to_owned(),
-            sequence,
-            occurred_at_unix_ms: current.updated_at_unix_ms,
-            actor,
-            payload,
-        };
-        repository
-            .commit_session_event(
-                &format!("turn-{sequence}"),
-                current,
-                expected_revision,
-                &event,
-                &[],
-            )
-            .await
-            .expect("turn fixture should commit");
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn owner_scoped_lifecycle_has_exact_replay_and_play_boundaries(pool: PgPool) {
-        let repository = repository(pool.clone());
-        create_campaign(&repository).await;
-
-        assert_eq!(
-            repository.list_owned_campaigns(OWNER).await.unwrap().len(),
-            1
-        );
-        assert!(
-            repository
-                .load_owned_campaign_summary("another-owner", CAMPAIGN)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let start = StartPlaySessionCommand {
-            lifecycle: lifecycle_command(1, "start-1"),
-            play_session_id: "play-1".to_owned(),
-        };
-        let started = repository
-            .start_campaign_play_session(OWNER, &start)
-            .await
-            .unwrap();
-        assert_eq!(started.lifecycle_revision, 2);
-        assert_eq!(
-            repository
-                .start_campaign_play_session(OWNER, &start)
-                .await
-                .unwrap(),
-            started
-        );
-        assert!(matches!(
-            repository
-                .start_campaign_play_session(
-                    OWNER,
-                    &StartPlaySessionCommand {
-                        lifecycle: lifecycle_command(1, "stale-start"),
-                        play_session_id: "play-2".to_owned(),
-                    },
-                )
-                .await,
-            Err(RepositoryError::RevisionConflict { .. })
-        ));
-        assert!(
-            repository
-                .archive_campaign(OWNER, &lifecycle_command(2, "archive-open"))
-                .await
-                .is_err(),
-            "archive must require an explicit play-session end"
-        );
-
-        let ended = repository
-            .end_campaign_play_session(
-                OWNER,
-                &EndPlaySessionCommand {
-                    lifecycle: lifecycle_command(2, "end-1"),
-                    play_session_id: "play-1".to_owned(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(ended.lifecycle_revision, 3);
-        let archived = repository
-            .archive_campaign(OWNER, &lifecycle_command(3, "archive-1"))
-            .await
-            .unwrap();
-        assert_eq!(
-            archived.lifecycle_state,
-            Some(CampaignLifecycleState::Archived)
-        );
-        let restored = repository
-            .restore_archived_campaign(OWNER, &lifecycle_command(4, "restore-1"))
-            .await
-            .unwrap();
-        assert_eq!(restored.lifecycle_revision, 5);
-        assert_eq!(
-            restored.lifecycle_state,
-            Some(CampaignLifecycleState::Active)
-        );
-
-        let cascade_rule: String = sqlx::query_scalar(
-            "SELECT confdeltype::text FROM pg_constraint
-             WHERE conname = 'characters_campaign_session_id_fkey'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(cascade_rule, "c", "0010 must replace the exact 0001 FK");
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn delete_requires_server_preparation_cascades_and_keeps_35_day_tombstone(pool: PgPool) {
-        let repository = repository(pool.clone());
-        create_campaign(&repository).await;
-        repository
-            .archive_campaign(OWNER, &lifecycle_command(1, "archive-delete"))
-            .await
-            .unwrap();
-        let prepared = repository
-            .prepare_campaign_deletion(OWNER, CAMPAIGN, 2, "delete-preparation")
-            .await
-            .unwrap();
-        assert_eq!(
-            prepared.canonical_export_digest,
-            digest(prepared.canonical_export_json.as_bytes())
-        );
-
-        let forged = DeleteCampaignCommand {
-            lifecycle: lifecycle_command(2, "forged-delete"),
-            deletion_id: "forged-preparation".to_owned(),
-            confirm_permanent_delete: true,
-        };
-        assert!(matches!(
-            repository.delete_archived_campaign(OWNER, &forged).await,
-            Err(RepositoryError::NotFound { .. })
-        ));
-        assert!(
-            repository
-                .load_campaign_session(CAMPAIGN)
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        let delete = DeleteCampaignCommand {
-            lifecycle: lifecycle_command(2, "delete-command"),
-            deletion_id: prepared.deletion_id,
-            confirm_permanent_delete: true,
-        };
-        let deleted = repository
-            .delete_archived_campaign(OWNER, &delete)
-            .await
-            .unwrap();
-        assert!(deleted.deleted);
-        assert_eq!(deleted.lifecycle_revision, 3);
-        assert_eq!(
-            repository
-                .delete_archived_campaign(OWNER, &delete)
-                .await
-                .unwrap(),
-            deleted,
-            "delete replay must resolve from the retained receipt"
-        );
-        assert!(
-            repository
-                .load_campaign_session(CAMPAIGN)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            repository
-                .load_character(CHARACTER)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let tombstone_json: Value = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM campaign_deletion_tombstones t
-             WHERE owner_key = $1 AND campaign_session_id = $2",
-        )
-        .bind(OWNER)
-        .bind(CAMPAIGN)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let keys = tombstone_json.as_object().unwrap();
-        assert!(!keys.contains_key("canonical_export_json"));
-        assert!(!keys.contains_key("title"));
-        let retention_seconds: i64 = sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM (retention_delete_after - deleted_at))::bigint
-             FROM campaign_deletion_tombstones
-             WHERE owner_key = $1 AND campaign_session_id = $2",
-        )
-        .bind(OWNER)
-        .bind(CAMPAIGN)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(retention_seconds, 35 * 24 * 60 * 60);
-
-        sqlx::query(
-            "UPDATE campaign_deletion_tombstones
-             SET retention_delete_after = CURRENT_TIMESTAMP + INTERVAL '1 hour'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            repository
-                .delete_expired_campaign_lifecycle_metadata(10)
-                .await
-                .unwrap()
-                .2,
-            0
-        );
-        sqlx::query(
-            "UPDATE campaign_deletion_tombstones
-             SET retention_delete_after = CURRENT_TIMESTAMP - INTERVAL '1 second'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            repository
-                .delete_expired_campaign_lifecycle_metadata(10)
-                .await
-                .unwrap()
-                .2,
-            1
-        );
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn canonical_export_over_64k_restores_rolls_pins_provenance_and_closes_open_play(
-        pool: PgPool,
-    ) {
-        let repository = repository(pool.clone());
-        create_campaign(&repository).await;
-        seal_pins(&repository).await;
-        let mut current = session();
-        append_event(
-            &repository,
-            &mut current,
-            SessionEventPayload::DiceResolved {
-                purpose: "Read the viaduct runes".to_owned(),
-                roll: D20Roll {
-                    mode: RollMode::Normal,
-                    first: 14,
-                    second: None,
-                    selected: 14,
-                },
-                modifier: 2,
-                total: 16,
-            },
-            EventActor::System,
-        )
-        .await;
-        for index in 2..=8 {
-            append_event(
-                &repository,
-                &mut current,
-                SessionEventPayload::GmNarration {
-                    text: format!("Scene {index}: {}", "rain over old brick. ".repeat(520)),
-                    image_prompt: None,
-                    source_prompt_id: None,
-                },
-                EventActor::AiGameMaster,
-            )
-            .await;
-        }
-        repository
-            .start_campaign_play_session(
-                OWNER,
-                &StartPlaySessionCommand {
-                    lifecycle: lifecycle_command(1, "open-before-export"),
-                    play_session_id: "play-before-export".to_owned(),
-                },
-            )
-            .await
-            .unwrap();
-        let d = format!("sha256:{}", "a".repeat(64));
-        sqlx::query(
-            "INSERT INTO generated_text_presentations
-             (id, campaign_session_id, origin_turn_id, generation_job_id,
-              generation_attempt_id, client_idempotency_key, version, source, body,
-              config_digest, prompt_digest, policy_digest, output_digest,
-              selected, retention_delete_after)
-             VALUES ('presentation-1', $1, 'turn-1', 'job-selected', 'attempt-selected',
-                     'client-selected', 1, 'engine_authored', 'The brass rune answers the rain.',
-                     $2, $2, $2, $2, TRUE, NULL)",
-        )
-        .bind(CAMPAIGN)
-        .bind(&d)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "INSERT INTO generated_text_presentation_receipts
-             (campaign_session_id, origin_turn_id, schema_version,
-              client_idempotency_key, presentation_id, generation_job_id,
-              generation_attempt_id, version, source, config_digest,
-              prompt_digest, policy_digest, output_digest, created_at)
-             VALUES ($1, 'turn-1', 1, 'client-selected', 'presentation-1',
-                     'job-selected', 'attempt-selected', 1, 'engine_authored',
-                     $2, $2, $2, $2,
-                     (SELECT created_at FROM generated_text_presentations
-                      WHERE id = 'presentation-1'))",
-        )
-        .bind(CAMPAIGN)
-        .bind(&d)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO generated_text_presentation_receipts
-             (campaign_session_id, origin_turn_id, schema_version,
-              client_idempotency_key, presentation_id, generation_job_id,
-              generation_attempt_id, version, source, config_digest,
-              prompt_digest, policy_digest, output_digest)
-             VALUES ($1, 'turn-1', 1, 'client-expired', 'presentation-expired',
-                     'job-expired', 'attempt-expired', 2, 'provider',
-                     $2, $2, $2, $2)",
-        )
-        .bind(CAMPAIGN)
-        .bind(&d)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO typed_intent_command_receipts
-             (campaign_session_id, client_idempotency_key, schema_version,
-              player_intent_digest, expected_campaign_revision,
-              expected_encounter_revision, resolved_intent_json,
-              interpretation_label, interpretation_evidence_json, state,
-              origin_turn_id, event_sequence, result_campaign_revision)
-             VALUES ($1, 'typed-client-1', 1, $2, 1, 1,
-                     '{\"type\":\"end_turn\"}'::jsonb, 'End the turn',
-                     '{\"source\":\"authored_fallback\"}'::jsonb, 'committed',
-                     'turn-1', 1, 2)",
-        )
-        .bind(CAMPAIGN)
-        .bind(&d)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let first_page = repository
-            .list_campaign_turn_history(OWNER, CAMPAIGN, None, 3)
-            .await
-            .unwrap();
-        assert_eq!(first_page.items.len(), 3);
-        assert_eq!(first_page.next_after_turn_number, Some(3));
-        let second_page = repository
-            .list_campaign_turn_history(OWNER, CAMPAIGN, first_page.next_after_turn_number, 100)
-            .await
-            .unwrap();
-        assert_eq!(second_page.items.len(), 5);
-
-        let recap = repository
-            .generate_private_recap(
-                OWNER,
-                &crate::repository::GeneratePrivateRecapCommand {
-                    schema_version: crate::repository::PRIVATE_RECAP_SCHEMA_VERSION,
-                    campaign_session_id: CAMPAIGN.to_owned(),
-                    expected_campaign_revision: current.last_event_sequence + 1,
-                    idempotency_key: "large-export-private-recap".to_owned(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(recap.source_audit_count, 8);
-
-        let canonical = repository
-            .export_campaign_canonical_json(OWNER, CAMPAIGN)
-            .await
-            .unwrap();
-        assert!(canonical.len() > 64 * 1024);
-        assert!(!canonical.contains("raw_private_source"));
-        assert!(!canonical.contains("provider_response"));
-        assert!(!canonical.contains("kick the secret red door"));
-        assert!(!canonical.contains("expired superseded prose"));
-        let canonical_value: Value = serde_json::from_str(&canonical).unwrap();
-        let alias_values = canonical_value["text_presentation_receipts"]
-            .as_array()
-            .unwrap();
-        assert_eq!(alias_values.len(), 2);
-        assert!(alias_values.iter().all(|value| value.get("body").is_none()));
-        assert!(canonical.contains("presentation-expired"));
-        assert!(canonical.contains("private-recap-v1"));
-        assert!(
-            canonical_value["typed_intent_receipts"][0]
-                .get("player_intent")
-                .is_none()
-        );
-        let mut invalid_receipt_schema: CampaignPrivateExportV1 =
-            serde_json::from_str(&canonical).unwrap();
-        invalid_receipt_schema.text_presentation_receipts[0].schema_version = 2;
-        assert!(invalid_receipt_schema.validate().is_err());
-        let readable = repository
-            .export_campaign_player_readable(OWNER, CAMPAIGN)
-            .await
-            .unwrap();
-        assert!(readable.contains("Stored dice and rule facts"));
-        assert!(readable.contains("Durable private recap"));
-        assert!(!readable.contains("client-selected"));
-        assert!(readable.contains("CC BY 4.0"));
-
-        sqlx::query("DELETE FROM campaign_sessions WHERE id = $1")
-            .bind(CAMPAIGN)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let restored = repository
-            .restore_campaign_export(
-                OWNER,
-                &RestoreCampaignExportCommand {
-                    schema_version: CAMPAIGN_EXPORT_SCHEMA_VERSION,
-                    idempotency_key: "restore-large-export".to_owned(),
-                    canonical_export_json: canonical,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(restored.lifecycle_revision, 3);
-        assert!(restored.play_session_id.is_none());
-        let plays = repository
-            .list_campaign_play_sessions(OWNER, CAMPAIGN)
-            .await
-            .unwrap();
-        assert_eq!(plays.len(), 1);
-        assert_eq!(plays[0].state, "closed");
-        assert_eq!(plays[0].close_reason.as_deref(), Some("restore_import"));
-        let import_audit_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM campaign_lifecycle_audits
-             WHERE campaign_session_id = $1 AND event_kind = 'restore_imported'",
-        )
-        .bind(CAMPAIGN)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(import_audit_count, 1);
-        let client_key: String = sqlx::query_scalar(
-            "SELECT client_idempotency_key FROM generated_text_presentations
-             WHERE campaign_session_id = $1 AND selected",
-        )
-        .bind(CAMPAIGN)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(client_key, "client-selected");
-        let restored_alias_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM generated_text_presentation_receipts
-             WHERE campaign_session_id = $1 AND client_idempotency_key = 'client-selected'",
-        )
-        .bind(CAMPAIGN)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(restored_alias_count, 1);
-        let restored_typed_state: String = sqlx::query_scalar(
-            "SELECT state FROM typed_intent_command_receipts
-             WHERE campaign_session_id = $1 AND client_idempotency_key = 'typed-client-1'",
-        )
-        .bind(CAMPAIGN)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(restored_typed_state, "committed");
-        assert_eq!(
-            repository
-                .load_latest_private_recap(OWNER, CAMPAIGN)
-                .await
-                .unwrap()
-                .unwrap()
-                .body_digest,
-            recap.body_digest
-        );
-        let retained_replay = repository
-            .load_generated_text_presentation_replay(CAMPAIGN, "turn-1", "client-selected")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            retained_replay,
-            crate::repository::GeneratedTextPresentationReplay::Available(snapshot)
-                if snapshot.requested.id == "presentation-1"
-        ));
-        let expired_replay = repository
-            .load_generated_text_presentation_replay(CAMPAIGN, "turn-1", "client-expired")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            expired_replay,
-            crate::repository::GeneratedTextPresentationReplay::Expired { receipt, .. }
-                if receipt.presentation_id == "presentation-expired"
-        ));
-        let typed_replay = repository
-            .load_typed_intent_command_receipt(CAMPAIGN, "typed-client-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            typed_replay.state,
-            crate::repository::TypedIntentReceiptState::Committed
-        );
-        assert_eq!(typed_replay.resolved_intent, EncounterIntent::EndTurn);
-        assert_eq!(typed_replay.player_intent_digest.as_str(), d);
-        assert_eq!(
-            repository
-                .list_campaign_turn_history(OWNER, CAMPAIGN, None, 100)
-                .await
-                .unwrap()
-                .items
-                .len(),
-            8
-        );
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn restore_rejects_unknown_schema_and_unsealed_playable_export(pool: PgPool) {
-        let repository = repository(pool.clone());
-        create_campaign(&repository).await;
-        seal_pins(&repository).await;
-        let canonical = repository
-            .export_campaign_canonical_json(OWNER, CAMPAIGN)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM campaign_sessions WHERE id = $1")
-            .bind(CAMPAIGN)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let mut unknown: Value = serde_json::from_str(&canonical).unwrap();
-        unknown["schema_version"] = Value::from(99);
-        let unknown = canonical_json(&unknown).unwrap();
-        assert!(matches!(
-            repository
-                .restore_campaign_export(
-                    OWNER,
-                    &RestoreCampaignExportCommand {
-                        schema_version: CAMPAIGN_EXPORT_SCHEMA_VERSION,
-                        idempotency_key: "unknown-schema".to_owned(),
-                        canonical_export_json: unknown,
-                    },
-                )
-                .await,
-            Err(RepositoryError::UnsupportedSchemaVersion { .. })
-        ));
-
-        let mut unsealed: CampaignPrivateExportV1 = serde_json::from_str(&canonical).unwrap();
-        unsealed.content_pins = None;
-        unsealed.turns.push(ExportedTurnAudit {
-            id: "invalid-playable-turn".to_owned(),
-            turn_number: 1,
-            actor_id: None,
-            correlation_id: None,
-            schema_version: u32::from(SESSION_SCHEMA_VERSION),
-            event: SessionEventDto {
-                schema_version: SESSION_SCHEMA_VERSION,
-                session_id: CAMPAIGN.to_owned(),
-                sequence: 1,
-                occurred_at_unix_ms: 2,
-                actor: EventActor::System,
-                payload: SessionEventPayload::SessionStarted,
-            },
-            created_at: unsealed.exported_at.clone(),
-        });
-        unsealed.campaign.document.value.last_event_sequence = 1;
-        unsealed.campaign.document.revision = 2;
-        assert!(unsealed.validate().is_err());
-    }
-}
-
-impl PostgresRepository {
-    pub async fn restore_campaign_export(
-        &self,
-        owner_key: &str,
-        command: &RestoreCampaignExportCommand,
-    ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
-        validate_owner_key(owner_key)?;
-        if command.schema_version != CAMPAIGN_EXPORT_SCHEMA_VERSION {
-            return Err(RepositoryError::UnsupportedSchemaVersion {
-                entity: "campaign restore command",
-                found: u32::from(command.schema_version),
-                supported: u32::from(CAMPAIGN_EXPORT_SCHEMA_VERSION),
-            });
-        }
-        if !is_valid_opaque_id(&command.idempotency_key)
-            || command.canonical_export_json.is_empty()
-            || command.canonical_export_json.len() > MAX_PLAYER_EXPORT_BYTES
-        {
-            return invalid(
-                "campaign restore command",
-                &command.idempotency_key,
-                "idempotency key or export size is invalid",
-            );
-        }
-        let exported: CampaignPrivateExportV1 =
-            serde_json::from_str(&command.canonical_export_json).map_err(|source| {
-                RepositoryError::InvalidStoredData {
-                    entity: "campaign private export",
-                    id: command.idempotency_key.clone(),
-                    source,
-                }
-            })?;
-        exported.validate()?;
-        if exported.owner_key != owner_key {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign private export",
-                id: "owner-scoped-export".to_owned(),
-            });
-        }
-        let canonical = exported.canonical_json()?;
-        if canonical != command.canonical_export_json {
-            return invalid(
-                "campaign private export",
-                &exported.campaign.document.id,
-                "restore input must use the canonical JSON serialization",
-            );
-        }
-        let export_digest = digest(canonical.as_bytes());
-        let campaign_session_id = exported.campaign.document.id.clone();
-        let expected_revision = exported.campaign.lifecycle_revision;
-        let result_revision =
-            expected_revision
-                .checked_add(1)
-                .ok_or(RepositoryError::NumericRange {
-                    field: "restored lifecycle revision",
-                })?;
-        let lifecycle = CampaignLifecycleCommand {
-            schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
-            campaign_session_id: campaign_session_id.clone(),
-            expected_lifecycle_revision: expected_revision,
-            idempotency_key: command.idempotency_key.clone(),
-        };
-        let request_fingerprint =
-            digest(format!("restore_export\n{}", export_digest.as_str()).as_bytes());
-        let outcome = CampaignLifecycleOutcome {
-            schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
-            campaign_session_id: campaign_session_id.clone(),
-            lifecycle_revision: result_revision,
-            lifecycle_state: Some(exported.campaign.lifecycle_state),
-            play_session_id: None,
-            deleted: false,
-        };
-
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        if let Some(replayed) = replay_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &lifecycle,
-            "restore_export",
-            &request_fingerprint,
-        )
-        .await?
-        {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(replayed);
-        }
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT id FROM campaign_sessions WHERE id = $1")
-                .bind(&campaign_session_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(RepositoryError::Database)?;
-        if existing.is_some() {
-            return Err(RepositoryError::AlreadyExists {
-                entity: "campaign session",
-                id: campaign_session_id,
-            });
-        }
-
-        insert_restored_campaign(&mut transaction, &exported, result_revision).await?;
-        insert_restore_import_audit(&mut transaction, &exported, result_revision).await?;
-        insert_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &lifecycle,
-            "restore_export",
-            &request_fingerprint,
-            &outcome,
-        )
-        .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(outcome)
-    }
-}
-
-async fn insert_restored_campaign(
-    transaction: &mut Transaction<'_, Postgres>,
-    exported: &CampaignPrivateExportV1,
-    restored_lifecycle_revision: u64,
-) -> Result<(), RepositoryError> {
-    let campaign = &exported.campaign;
-    let document = &campaign.document;
-    sqlx::query(
-        "INSERT INTO campaign_sessions
-         (id, schema_version, revision, payload_json, created_at, updated_at,
-          content_pin_legacy_eligible, owner_key, lifecycle_revision,
-          lifecycle_state, archived_at, safety_policy_id, progression_policy_id,
-          retention_class, retention_delete_after)
-         VALUES ($1, $2, $3, $4::jsonb, $5::timestamptz, $6::timestamptz,
-                 FALSE, $7, $8, $9, $10::timestamptz, $11, $12, $13,
-                 $14::timestamptz)",
-    )
-    .bind(&document.id)
-    .bind(i64::from(document.schema_version))
-    .bind(to_i64(document.revision, "campaign revision")?)
-    .bind(serialize("campaign session", &document.value)?)
-    .bind(&document.created_at)
-    .bind(&document.updated_at)
-    .bind(&campaign.owner_key)
-    .bind(to_i64(
-        restored_lifecycle_revision,
-        "restored lifecycle revision",
-    )?)
-    .bind(campaign.lifecycle_state.as_str())
-    .bind(campaign.archived_at.as_deref())
-    .bind(&campaign.safety_policy_id)
-    .bind(&campaign.progression_policy_id)
-    .bind(&campaign.retention_class)
-    .bind(campaign.retention_delete_after.as_deref())
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| map_lifecycle_insert(error, "campaign session", &document.id))?;
-
-    for character in &exported.characters {
-        sqlx::query(
-            "INSERT INTO characters
-             (id, campaign_session_id, schema_version, revision, payload_json,
-              created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7::timestamptz)",
-        )
-        .bind(&character.id)
-        .bind(&document.id)
-        .bind(i64::from(character.schema_version))
-        .bind(to_i64(character.revision, "character revision")?)
-        .bind(serialize("character", &character.value)?)
-        .bind(&character.created_at)
-        .bind(&character.updated_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "character", &character.id))?;
-    }
-    for turn in &exported.turns {
-        sqlx::query(
-            "INSERT INTO turn_audits
-             (id, campaign_session_id, turn_number, actor_id, schema_version,
-              payload_json, created_at, correlation_id)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::timestamptz, $8)",
-        )
-        .bind(&turn.id)
-        .bind(&document.id)
-        .bind(to_i64(turn.turn_number, "turn number")?)
-        .bind(turn.actor_id.as_deref())
-        .bind(i64::from(turn.schema_version))
-        .bind(serialize("turn audit", &turn.event)?)
-        .bind(&turn.created_at)
-        .bind(turn.correlation_id.as_deref())
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "turn audit", &turn.id))?;
-    }
-    for recap in &exported.private_recaps {
-        sqlx::query(
-            "INSERT INTO campaign_private_recaps
-             (id, campaign_session_id, owner_key, schema_version,
-              campaign_revision, idempotency_key, request_fingerprint,
-              first_turn_number, last_turn_number, source_audit_count,
-              source_audit_digest, template_id, body, body_digest, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14, $15::timestamptz)",
-        )
-        .bind(&recap.id)
-        .bind(&document.id)
-        .bind(&exported.owner_key)
-        .bind(i64::from(recap.schema_version))
-        .bind(to_i64(
-            recap.campaign_revision,
-            "private recap campaign revision",
-        )?)
-        .bind(&recap.idempotency_key)
-        .bind(recap.request_fingerprint.as_str())
-        .bind(
-            recap
-                .first_turn_number
-                .map(|value| to_i64(value, "private recap first turn"))
-                .transpose()?,
-        )
-        .bind(
-            recap
-                .last_turn_number
-                .map(|value| to_i64(value, "private recap last turn"))
-                .transpose()?,
-        )
-        .bind(to_i64(
-            recap.source_audit_count,
-            "private recap source audit count",
-        )?)
-        .bind(recap.source_audit_digest.as_str())
-        .bind(&recap.template_id)
-        .bind(&recap.body)
-        .bind(recap.body_digest.as_str())
-        .bind(&recap.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "private campaign recap", &recap.id))?;
-    }
-    for receipt in &exported.command_receipts {
-        sqlx::query(
-            "INSERT INTO command_receipts
-             (campaign_session_id, idempotency_key, command_kind,
-              request_fingerprint, expected_revision, result_revision,
-              audit_id, response_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz)",
-        )
-        .bind(&document.id)
-        .bind(&receipt.idempotency_key)
-        .bind(&receipt.command_kind)
-        .bind(receipt.request_fingerprint.as_str())
-        .bind(to_i64(receipt.expected_revision, "expected revision")?)
-        .bind(to_i64(receipt.result_revision, "result revision")?)
-        .bind(&receipt.audit_id)
-        .bind(serialize("command receipt response", &receipt.response)?)
-        .bind(&receipt.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(error, "command receipt", &receipt.idempotency_key)
-        })?;
-    }
-    for receipt in &exported.text_presentation_receipts {
-        sqlx::query(
-            "INSERT INTO generated_text_presentation_receipts
-             (campaign_session_id, origin_turn_id, schema_version,
-              client_idempotency_key, presentation_id, generation_job_id,
-              generation_attempt_id, version, source, config_digest,
-              prompt_digest, policy_digest, output_digest, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14::timestamptz)",
-        )
-        .bind(&document.id)
-        .bind(&receipt.origin_turn_id)
-        .bind(i64::from(receipt.schema_version))
-        .bind(&receipt.client_idempotency_key)
-        .bind(&receipt.presentation_id)
-        .bind(&receipt.generation_job_id)
-        .bind(&receipt.generation_attempt_id)
-        .bind(i16::from(receipt.version))
-        .bind(&receipt.source)
-        .bind(receipt.config_digest.as_str())
-        .bind(receipt.prompt_digest.as_str())
-        .bind(receipt.policy_digest.as_str())
-        .bind(receipt.output_digest.as_str())
-        .bind(&receipt.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(
-                error,
-                "generated text presentation receipt",
-                &receipt.presentation_id,
-            )
-        })?;
-    }
-    for receipt in &exported.typed_intent_receipts {
-        sqlx::query(
-            "INSERT INTO typed_intent_command_receipts
-             (campaign_session_id, client_idempotency_key, schema_version,
-              player_intent_digest, expected_campaign_revision,
-              expected_encounter_revision, resolved_intent_json,
-              interpretation_label, interpretation_evidence_json, state,
-              origin_turn_id, event_sequence, result_campaign_revision,
-              created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb,
-                     $10, $11, $12, $13, $14::timestamptz, $15::timestamptz)",
-        )
-        .bind(&document.id)
-        .bind(&receipt.client_idempotency_key)
-        .bind(i64::from(receipt.schema_version))
-        .bind(receipt.player_intent_digest.as_str())
-        .bind(to_i64(
-            receipt.expected_campaign_revision,
-            "typed intent expected campaign revision",
-        )?)
-        .bind(to_i64(
-            receipt.expected_encounter_revision,
-            "typed intent expected encounter revision",
-        )?)
-        .bind(serialize(
-            "typed intent receipt resolved intent",
-            &receipt.resolved_intent,
-        )?)
-        .bind(&receipt.interpretation_label)
-        .bind(serialize(
-            "typed intent receipt interpretation evidence",
-            &receipt.interpretation_evidence,
-        )?)
-        .bind(&receipt.state)
-        .bind(receipt.origin_turn_id.as_deref())
-        .bind(
-            receipt
-                .event_sequence
-                .map(|value| to_i64(value, "typed intent event sequence"))
-                .transpose()?,
-        )
-        .bind(
-            receipt
-                .result_campaign_revision
-                .map(|value| to_i64(value, "typed intent result campaign revision"))
-                .transpose()?,
-        )
-        .bind(&receipt.created_at)
-        .bind(&receipt.updated_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(
-                error,
-                "typed intent command receipt",
-                &receipt.client_idempotency_key,
-            )
-        })?;
-    }
-    if let Some(pins) = &exported.content_pins {
-        let seal_reason = match pins.evidence.seal_reason {
-            CampaignPinSealReason::SelectedTheme => "selected_theme",
-            CampaignPinSealReason::LegacySelectedTheme => "legacy_selected_theme",
-            CampaignPinSealReason::LegacyDigestAlias => "legacy_digest_alias",
-            CampaignPinSealReason::LegacyDefaultRainbound => "legacy_default_rainbound",
-        };
-        let legacy_json = pins
-            .evidence
-            .legacy_source
-            .as_ref()
-            .map(|legacy| serialize("legacy hero pins", legacy))
-            .transpose()?;
-        sqlx::query(
-            "INSERT INTO campaign_content_pins
-             (campaign_session_id, schema_version, seal_reason, payload_json,
-              legacy_source_json, created_at)
-             VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::timestamptz)",
-        )
-        .bind(&document.id)
-        .bind(i64::from(CAMPAIGN_PINS_SCHEMA_VERSION))
-        .bind(seal_reason)
-        .bind(serialize("campaign content pins", &pins.evidence.pins)?)
-        .bind(legacy_json)
-        .bind(&pins.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "campaign content pins", &document.id))?;
-    }
-    for draft in &exported.hero_drafts {
-        sqlx::query(
-            "INSERT INTO hero_creation_drafts
-             (id, campaign_session_id, owner_key, schema_version, revision,
-              expires_at_epoch_seconds, retention_delete_after_epoch_seconds,
-              payload_json, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
-                     $9::timestamptz, $10::timestamptz)",
-        )
-        .bind(&draft.document.id)
-        .bind(&document.id)
-        .bind(&exported.owner_key)
-        .bind(i64::from(draft.document.schema_version))
-        .bind(to_i64(draft.document.revision, "hero draft revision")?)
-        .bind(to_i64(draft.expires_at_epoch_seconds, "hero draft expiry")?)
-        .bind(to_i64(
-            draft.retention_delete_after_epoch_seconds,
-            "hero draft retention",
-        )?)
-        .bind(serialize("hero draft", &draft.document.value)?)
-        .bind(&draft.document.created_at)
-        .bind(&draft.document.updated_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "hero draft", &draft.document.id))?;
-    }
-    if let Some(hero) = &exported.hero_character {
-        sqlx::query(
-            "INSERT INTO hero_characters
-             (id, campaign_session_id, owner_key, schema_version, revision,
-              payload_json, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb,
-                     $7::timestamptz, $8::timestamptz)",
-        )
-        .bind(&hero.id)
-        .bind(&document.id)
-        .bind(&exported.owner_key)
-        .bind(i64::from(hero.schema_version))
-        .bind(to_i64(hero.revision, "hero revision")?)
-        .bind(serialize("hero character", &hero.value)?)
-        .bind(&hero.created_at)
-        .bind(&hero.updated_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "hero character", &hero.id))?;
-    }
-    for audit in &exported.hero_audits {
-        sqlx::query(
-            "INSERT INTO hero_audits
-             (id, campaign_session_id, subject_kind, subject_id, audit_kind,
-              schema_version, subject_revision, occurred_at_epoch_seconds,
-              payload_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb,
-                     $10::timestamptz)",
-        )
-        .bind(&audit.id)
-        .bind(&document.id)
-        .bind(&audit.subject_kind)
-        .bind(&audit.subject_id)
-        .bind(&audit.audit_kind)
-        .bind(i64::from(audit.schema_version))
-        .bind(to_i64(audit.subject_revision, "hero audit revision")?)
-        .bind(to_i64(
-            audit.occurred_at_epoch_seconds,
-            "hero audit timestamp",
-        )?)
-        .bind(serialize("hero audit", &audit.payload)?)
-        .bind(&audit.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "hero audit", &audit.id))?;
-    }
-    for receipt in &exported.hero_receipts {
-        sqlx::query(
-            "INSERT INTO hero_command_receipts
-             (scope_kind, scope_id, campaign_session_id, idempotency_key,
-              command_kind, request_fingerprint, expected_revision,
-              result_revision, audit_id, response_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                     $11::timestamptz)",
-        )
-        .bind(&receipt.scope_kind)
-        .bind(&receipt.scope_id)
-        .bind(&document.id)
-        .bind(&receipt.idempotency_key)
-        .bind(&receipt.command_kind)
-        .bind(receipt.request_fingerprint.as_str())
-        .bind(to_i64(receipt.expected_revision, "hero expected revision")?)
-        .bind(to_i64(receipt.result_revision, "hero result revision")?)
-        .bind(&receipt.audit_id)
-        .bind(serialize("hero receipt response", &receipt.response)?)
-        .bind(&receipt.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(error, "hero command receipt", &receipt.idempotency_key)
-        })?;
-    }
-    for claim in &exported.encounter_reward_claims {
-        sqlx::query(
-            "INSERT INTO encounter_reward_claims
-             (campaign_session_id, encounter_id, character_id,
-              encounter_revision, victory_event_sequence, reward_tier,
-              experience_awarded, hero_audit_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz)",
-        )
-        .bind(&document.id)
-        .bind(&claim.encounter_id)
-        .bind(&claim.character_id)
-        .bind(to_i64(claim.encounter_revision, "encounter revision")?)
-        .bind(to_i64(
-            claim.victory_event_sequence,
-            "victory event sequence",
-        )?)
-        .bind(&claim.reward_tier)
-        .bind(i64::from(claim.experience_awarded))
-        .bind(&claim.hero_audit_id)
-        .bind(&claim.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(error, "encounter reward claim", &claim.encounter_id)
-        })?;
-    }
-    insert_restored_lifecycle_rows(transaction, exported).await?;
-    insert_restored_presentations_and_assets(transaction, exported).await?;
-    Ok(())
-}
-
-async fn insert_restored_lifecycle_rows(
-    transaction: &mut Transaction<'_, Postgres>,
-    exported: &CampaignPrivateExportV1,
-) -> Result<(), RepositoryError> {
-    let campaign_session_id = &exported.campaign.document.id;
-    for play in &exported.play_sessions {
-        let restored_open = play.state == "waiting" || play.state == "active";
-        let state = if restored_open {
-            "closed"
-        } else {
-            play.state.as_str()
-        };
-        let ended_campaign_revision = if restored_open {
-            Some(exported.campaign.document.revision)
-        } else {
-            play.ended_campaign_revision
-        };
-        let closed_at = if restored_open {
-            Some(exported.exported_at.as_str())
-        } else {
-            play.closed_at.as_deref()
-        };
-        let close_reason = if restored_open {
-            Some("restore_import")
-        } else {
-            play.close_reason.as_deref()
-        };
-        sqlx::query(
-            "INSERT INTO campaign_play_sessions
-             (id, campaign_session_id, owner_key, schema_version, state,
-              started_campaign_revision, ended_campaign_revision,
-              opened_at, closed_at, close_reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7,
-                     $8::timestamptz, $9::timestamptz, $10)",
-        )
-        .bind(&play.id)
-        .bind(campaign_session_id)
-        .bind(&play.owner_key)
-        .bind(i64::from(play.schema_version))
-        .bind(state)
-        .bind(to_i64(
-            play.started_campaign_revision,
-            "play session start revision",
-        )?)
-        .bind(
-            ended_campaign_revision
-                .map(|revision| to_i64(revision, "play session end revision"))
-                .transpose()?,
-        )
-        .bind(&play.opened_at)
-        .bind(closed_at)
-        .bind(close_reason)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "play session", &play.id))?;
-    }
-    for audit in &exported.lifecycle_audits {
-        sqlx::query(
-            "INSERT INTO campaign_lifecycle_audits
-             (id, campaign_session_id, owner_key, schema_version,
-              lifecycle_revision, event_kind, payload_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::timestamptz)",
-        )
-        .bind(&audit.id)
-        .bind(campaign_session_id)
-        .bind(&exported.owner_key)
-        .bind(i64::from(CAMPAIGN_LIFECYCLE_SCHEMA_VERSION))
-        .bind(to_i64(
-            audit.lifecycle_revision,
-            "lifecycle audit revision",
-        )?)
-        .bind(audit.payload.event_kind())
-        .bind(serialize("campaign lifecycle audit", &audit.payload)?)
-        .bind(&audit.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "campaign lifecycle audit", &audit.id))?;
-    }
-    Ok(())
-}
-
-async fn insert_restore_import_audit(
-    transaction: &mut Transaction<'_, Postgres>,
-    exported: &CampaignPrivateExportV1,
-    lifecycle_revision: u64,
-) -> Result<(), RepositoryError> {
-    let closed_play_session_ids = exported
-        .play_sessions
-        .iter()
-        .filter(|session| session.state == "open")
-        .map(|session| session.id.clone())
-        .collect::<Vec<_>>();
-    let payload = LifecycleAuditPayload::RestoreImported {
-        closed_play_session_ids,
-    };
-    let id = format!("lifecycle-{}", uuid::Uuid::new_v4());
-    sqlx::query(
-        "INSERT INTO campaign_lifecycle_audits
-         (id, campaign_session_id, owner_key, schema_version,
-          lifecycle_revision, event_kind, payload_json)
-         VALUES ($1, $2, $3, $4, $5, 'restore_imported', $6::jsonb)",
-    )
-    .bind(&id)
-    .bind(&exported.campaign.document.id)
-    .bind(&exported.owner_key)
-    .bind(i64::from(CAMPAIGN_LIFECYCLE_SCHEMA_VERSION))
-    .bind(to_i64(lifecycle_revision, "restore lifecycle revision")?)
-    .bind(serialize("restore import audit", &payload)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| map_lifecycle_insert(error, "campaign lifecycle audit", &id))?;
-    Ok(())
-}
-
-async fn insert_restored_presentations_and_assets(
-    transaction: &mut Transaction<'_, Postgres>,
-    exported: &CampaignPrivateExportV1,
-) -> Result<(), RepositoryError> {
-    let campaign_session_id = &exported.campaign.document.id;
-    for asset in &exported.selected_generated_assets {
-        sqlx::query(
-            "INSERT INTO generated_assets
-             (id, campaign_session_id, turn_id, asset_kind, provider, model,
-              location, prompt_fingerprint, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb,
-                     $10::timestamptz)",
-        )
-        .bind(&asset.id)
-        .bind(campaign_session_id)
-        .bind(asset.turn_id.as_deref())
-        .bind(&asset.asset_kind)
-        .bind(&asset.provider)
-        .bind(&asset.model)
-        .bind(&asset.location)
-        .bind(asset.prompt_fingerprint.as_ref().map(Sha256Digest::as_str))
-        .bind(serialize("generated asset metadata", &asset.metadata)?)
-        .bind(&asset.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "generated asset", &asset.id))?;
-    }
-    for presentation in &exported.selected_text_presentations {
-        sqlx::query(
-            "INSERT INTO generated_text_presentations
-             (id, campaign_session_id, origin_turn_id, generation_job_id,
-              generation_attempt_id, client_idempotency_key, version, source, body, config_digest,
-              prompt_digest, policy_digest, output_digest, selected,
-              retention_delete_after, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                     TRUE, NULL, $14::timestamptz, $15::timestamptz)",
-        )
-        .bind(&presentation.id)
-        .bind(campaign_session_id)
-        .bind(&presentation.origin_turn_id)
-        .bind(&presentation.generation_job_id)
-        .bind(&presentation.generation_attempt_id)
-        .bind(&presentation.client_idempotency_key)
-        .bind(i16::from(presentation.version))
-        .bind(&presentation.source)
-        .bind(&presentation.body)
-        .bind(presentation.config_digest.as_str())
-        .bind(presentation.prompt_digest.as_str())
-        .bind(presentation.policy_digest.as_str())
-        .bind(presentation.output_digest.as_str())
-        .bind(&presentation.created_at)
-        .bind(&presentation.updated_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(error, "generated text presentation", &presentation.id)
-        })?;
-    }
-    Ok(())
-}
-
-pub(crate) fn summary_from_row(row: PgRow) -> Result<CampaignSummary, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let state: String = row
-        .try_get("lifecycle_state")
-        .map_err(RepositoryError::Database)?;
-    let summary = CampaignSummary {
-        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
-        campaign_session_id: id.clone(),
-        owner_key: row
-            .try_get("owner_key")
-            .map_err(RepositoryError::Database)?,
-        title: row.try_get("title").map_err(RepositoryError::Database)?,
-        campaign_revision: from_i64(
-            row.try_get("revision").map_err(RepositoryError::Database)?,
-            "campaign revision",
-        )?,
-        lifecycle_revision: from_i64(
-            row.try_get("lifecycle_revision")
-                .map_err(RepositoryError::Database)?,
-            "lifecycle revision",
-        )?,
-        lifecycle_state: CampaignLifecycleState::try_from(state.as_str())?,
-        archived_at: row
-            .try_get("archived_at")
-            .map_err(RepositoryError::Database)?,
-        safety_policy_id: row
-            .try_get("safety_policy_id")
-            .map_err(RepositoryError::Database)?,
-        progression_policy_id: row
-            .try_get("progression_policy_id")
-            .map_err(RepositoryError::Database)?,
-        retention_class: row
-            .try_get("retention_class")
-            .map_err(RepositoryError::Database)?,
-        retention_delete_after: row
-            .try_get("retention_delete_after")
-            .map_err(RepositoryError::Database)?,
-        open_play_session_id: row
-            .try_get("open_play_session_id")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
-    };
-    validate_summary(&summary)?;
-    Ok(summary)
-}
-
-fn validate_summary(summary: &CampaignSummary) -> Result<(), RepositoryError> {
-    if !is_valid_opaque_id(&summary.campaign_session_id)
-        || !is_valid_opaque_id(&summary.owner_key)
-        || summary.title.trim().is_empty()
-        || summary.campaign_revision == 0
-        || summary.lifecycle_revision == 0
-        || !is_valid_opaque_id(&summary.safety_policy_id)
-        || !is_valid_opaque_id(&summary.progression_policy_id)
-        || summary
-            .open_play_session_id
-            .as_deref()
-            .is_some_and(|id| !is_valid_opaque_id(id))
-        || summary.created_at.is_empty()
-        || summary.updated_at.is_empty()
-        || !matches!(
-            (
-                summary.lifecycle_state,
-                summary.archived_at.is_some(),
-                summary.retention_class.as_str(),
-                summary.retention_delete_after.is_some(),
-            ),
-            (
-                CampaignLifecycleState::Active,
-                false,
-                "campaign_lifetime",
-                false
-            ) | (
-                CampaignLifecycleState::Archived,
-                true,
-                "archived_owner_managed",
-                false
-            )
-        )
-    {
-        return invalid(
-            "campaign summary",
-            &summary.campaign_session_id,
-            "stored lifecycle metadata is inconsistent",
-        );
-    }
-    Ok(())
-}
-
-fn turn_history_from_row(row: PgRow) -> Result<CampaignTurnHistoryItem, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let event: SessionEventDto = serde_json::from_str(&payload_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity: "turn audit",
-            id: id.clone(),
-            source,
-        }
-    })?;
-    event
-        .validate()
-        .map_err(|source| RepositoryError::CoreValidation {
-            entity: "turn audit",
-            id: id.clone(),
-            source,
-        })?;
-    let turn_number = from_i64(
-        row.try_get("turn_number")
-            .map_err(RepositoryError::Database)?,
-        "turn number",
-    )?;
-    let campaign_session_id: String = row
-        .try_get("campaign_session_id")
-        .map_err(RepositoryError::Database)?;
-    if event.session_id != campaign_session_id || event.sequence != turn_number {
-        return invalid(
-            "turn audit",
-            &id,
-            "row identity and validated event envelope do not match",
-        );
-    }
-    Ok(CampaignTurnHistoryItem {
-        schema_version: from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "turn schema version",
-        )?,
-        id,
-        campaign_session_id,
-        turn_number,
-        actor_id: row.try_get("actor_id").map_err(RepositoryError::Database)?,
-        correlation_id: row
-            .try_get("correlation_id")
-            .map_err(RepositoryError::Database)?,
-        event,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn play_session_from_row(row: PgRow) -> Result<CampaignPlaySession, RepositoryError> {
-    let play = CampaignPlaySession {
-        schema_version: u16::try_from(from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "play session schema version",
-        )?)
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "play session schema version",
-        })?,
-        id: row.try_get("id").map_err(RepositoryError::Database)?,
-        campaign_session_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        owner_key: row
-            .try_get("owner_key")
-            .map_err(RepositoryError::Database)?,
-        state: row.try_get("state").map_err(RepositoryError::Database)?,
-        started_campaign_revision: from_i64(
-            row.try_get("started_campaign_revision")
-                .map_err(RepositoryError::Database)?,
-            "play session start revision",
-        )?,
-        ended_campaign_revision: row
-            .try_get::<Option<i64>, _>("ended_campaign_revision")
-            .map_err(RepositoryError::Database)?
-            .map(|value| from_i64(value, "play session end revision"))
-            .transpose()?,
-        opened_at: row
-            .try_get("opened_at")
-            .map_err(RepositoryError::Database)?,
-        closed_at: row
-            .try_get("closed_at")
-            .map_err(RepositoryError::Database)?,
-        close_reason: row
-            .try_get("close_reason")
-            .map_err(RepositoryError::Database)?,
-    };
-    validate_play_session(&play)?;
-    Ok(play)
-}
-
-fn validate_play_session(play: &CampaignPlaySession) -> Result<(), RepositoryError> {
-    let shape_valid = match play.state.as_str() {
-        "open" | "waiting" => {
-            play.ended_campaign_revision.is_none()
-                && play.closed_at.is_none()
-                && play.close_reason.is_none()
-        }
-        "active" => play.ended_campaign_revision.is_none() && play.closed_at.is_none(),
-        "closed" => {
-            play.ended_campaign_revision
-                .is_some_and(|end| end >= play.started_campaign_revision)
-                && play.closed_at.is_some()
-                && matches!(
-                    play.close_reason.as_deref(),
-                    Some("owner_ended" | "archive" | "restore_import")
-                )
-        }
-        _ => false,
-    };
-    if play.schema_version != CAMPAIGN_LIFECYCLE_SCHEMA_VERSION
-        || !is_valid_opaque_id(&play.id)
-        || !is_valid_opaque_id(&play.campaign_session_id)
-        || !is_valid_opaque_id(&play.owner_key)
-        || play.started_campaign_revision == 0
-        || play.opened_at.is_empty()
-        || !shape_valid
-    {
-        return invalid(
-            "campaign play session",
-            &play.id,
-            "stored play session is invalid",
-        );
-    }
-    Ok(())
-}
-
-fn exported_campaign_from_row(row: PgRow) -> Result<ExportedCampaignDocument, RepositoryError> {
-    let owner_key: String = row
-        .try_get("owner_key")
-        .map_err(RepositoryError::Database)?;
-    let state: String = row
-        .try_get("lifecycle_state")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedCampaignDocument {
-        document: exported_document_from_row(&row, "campaign session")?,
-        owner_key,
-        lifecycle_revision: from_i64(
-            row.try_get("lifecycle_revision")
-                .map_err(RepositoryError::Database)?,
-            "lifecycle revision",
-        )?,
-        lifecycle_state: CampaignLifecycleState::try_from(state.as_str())?,
-        archived_at: row
-            .try_get("archived_at")
-            .map_err(RepositoryError::Database)?,
-        safety_policy_id: row
-            .try_get("safety_policy_id")
-            .map_err(RepositoryError::Database)?,
-        progression_policy_id: row
-            .try_get("progression_policy_id")
-            .map_err(RepositoryError::Database)?,
-        retention_class: row
-            .try_get("retention_class")
-            .map_err(RepositoryError::Database)?,
-        retention_delete_after: row
-            .try_get("retention_delete_after")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_document_from_row<T>(
-    row: &PgRow,
-    entity: &'static str,
-) -> Result<ExportedDocument<T>, RepositoryError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let value = serde_json::from_str(&payload_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity,
-            id: id.clone(),
-            source,
-        }
-    })?;
-    Ok(ExportedDocument {
-        id,
-        schema_version: from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "document schema version",
-        )?,
-        revision: from_i64(
-            row.try_get("revision").map_err(RepositoryError::Database)?,
-            "document revision",
-        )?,
-        value,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_hero_draft_from_row(row: PgRow) -> Result<ExportedHeroDraft, RepositoryError> {
-    Ok(ExportedHeroDraft {
-        document: exported_document_from_row(&row, "hero draft")?,
-        expires_at_epoch_seconds: from_i64(
-            row.try_get("expires_at_epoch_seconds")
-                .map_err(RepositoryError::Database)?,
-            "hero draft expiry",
-        )?,
-        retention_delete_after_epoch_seconds: from_i64(
-            row.try_get("retention_delete_after_epoch_seconds")
-                .map_err(RepositoryError::Database)?,
-            "hero draft retention",
-        )?,
-    })
-}
-
-fn exported_turn_from_row(row: PgRow) -> Result<ExportedTurnAudit, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let event = serde_json::from_str(&payload_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity: "turn audit",
-            id: id.clone(),
-            source,
-        }
-    })?;
-    Ok(ExportedTurnAudit {
-        id,
-        turn_number: from_i64(
-            row.try_get("turn_number")
-                .map_err(RepositoryError::Database)?,
-            "turn number",
-        )?,
-        actor_id: row.try_get("actor_id").map_err(RepositoryError::Database)?,
-        correlation_id: row
-            .try_get("correlation_id")
-            .map_err(RepositoryError::Database)?,
-        schema_version: from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "turn schema version",
-        )?,
-        event,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_command_receipt_from_row(
-    row: PgRow,
-) -> Result<ExportedCommandReceipt, RepositoryError> {
-    let idempotency_key: String = row
-        .try_get("idempotency_key")
-        .map_err(RepositoryError::Database)?;
-    let response_json: String = row
-        .try_get("response_json")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedCommandReceipt {
-        idempotency_key: idempotency_key.clone(),
-        command_kind: row
-            .try_get("command_kind")
-            .map_err(RepositoryError::Database)?,
-        request_fingerprint: parse_digest_row(
-            &row,
-            "request_fingerprint",
-            "command receipt",
-            &idempotency_key,
-        )?,
-        expected_revision: from_i64(
-            row.try_get("expected_revision")
-                .map_err(RepositoryError::Database)?,
-            "expected revision",
-        )?,
-        result_revision: from_i64(
-            row.try_get("result_revision")
-                .map_err(RepositoryError::Database)?,
-            "result revision",
-        )?,
-        audit_id: row.try_get("audit_id").map_err(RepositoryError::Database)?,
-        response: serde_json::from_str(&response_json).map_err(|source| {
-            RepositoryError::InvalidStoredData {
-                entity: "command receipt response",
-                id: idempotency_key,
-                source,
-            }
-        })?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_text_presentation_receipt_from_row(
-    row: PgRow,
-) -> Result<ExportedTextPresentationReceipt, RepositoryError> {
-    let presentation_id: String = row
-        .try_get("presentation_id")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedTextPresentationReceipt {
-        schema_version: u16::try_from(from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "text presentation receipt schema version",
-        )?)
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "text presentation receipt schema version",
-        })?,
-        origin_turn_id: row
-            .try_get("origin_turn_id")
-            .map_err(RepositoryError::Database)?,
-        client_idempotency_key: row
-            .try_get("client_idempotency_key")
-            .map_err(RepositoryError::Database)?,
-        presentation_id: presentation_id.clone(),
-        generation_job_id: row
-            .try_get("generation_job_id")
-            .map_err(RepositoryError::Database)?,
-        generation_attempt_id: row
-            .try_get("generation_attempt_id")
-            .map_err(RepositoryError::Database)?,
-        version: u8::try_from(
-            row.try_get::<i16, _>("version")
-                .map_err(RepositoryError::Database)?,
-        )
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "text presentation receipt version",
-        })?,
-        source: row.try_get("source").map_err(RepositoryError::Database)?,
-        config_digest: parse_digest_row(
-            &row,
-            "config_digest",
-            "text presentation receipt",
-            &presentation_id,
-        )?,
-        prompt_digest: parse_digest_row(
-            &row,
-            "prompt_digest",
-            "text presentation receipt",
-            &presentation_id,
-        )?,
-        policy_digest: parse_digest_row(
-            &row,
-            "policy_digest",
-            "text presentation receipt",
-            &presentation_id,
-        )?,
-        output_digest: parse_digest_row(
-            &row,
-            "output_digest",
-            "text presentation receipt",
-            &presentation_id,
-        )?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_typed_intent_receipt_from_row(
-    row: PgRow,
-) -> Result<ExportedTypedIntentReceipt, RepositoryError> {
-    let idempotency_key: String = row
-        .try_get("client_idempotency_key")
-        .map_err(RepositoryError::Database)?;
-    let resolved_intent_json: String = row
-        .try_get("resolved_intent_json")
-        .map_err(RepositoryError::Database)?;
-    let interpretation_evidence_json: String = row
-        .try_get("interpretation_evidence_json")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedTypedIntentReceipt {
-        schema_version: u16::try_from(from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "typed intent receipt schema version",
-        )?)
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "typed intent receipt schema version",
-        })?,
-        client_idempotency_key: idempotency_key.clone(),
-        player_intent_digest: parse_digest_row(
-            &row,
-            "player_intent_digest",
-            "typed intent receipt",
-            &idempotency_key,
-        )?,
-        expected_campaign_revision: from_i64(
-            row.try_get("expected_campaign_revision")
-                .map_err(RepositoryError::Database)?,
-            "typed intent expected campaign revision",
-        )?,
-        expected_encounter_revision: from_i64(
-            row.try_get("expected_encounter_revision")
-                .map_err(RepositoryError::Database)?,
-            "typed intent expected encounter revision",
-        )?,
-        resolved_intent: serde_json::from_str(&resolved_intent_json).map_err(|source| {
-            RepositoryError::InvalidStoredData {
-                entity: "typed intent receipt resolved intent",
-                id: idempotency_key.clone(),
-                source,
-            }
-        })?,
-        interpretation_label: row
-            .try_get("interpretation_label")
-            .map_err(RepositoryError::Database)?,
-        interpretation_evidence: serde_json::from_str(&interpretation_evidence_json).map_err(
-            |source| RepositoryError::InvalidStoredData {
-                entity: "typed intent receipt interpretation evidence",
-                id: idempotency_key.clone(),
-                source,
-            },
-        )?,
-        state: row.try_get("state").map_err(RepositoryError::Database)?,
-        origin_turn_id: row
-            .try_get("origin_turn_id")
-            .map_err(RepositoryError::Database)?,
-        event_sequence: row
-            .try_get::<Option<i64>, _>("event_sequence")
-            .map_err(RepositoryError::Database)?
-            .map(|value| from_i64(value, "typed intent event sequence"))
-            .transpose()?,
-        result_campaign_revision: row
-            .try_get::<Option<i64>, _>("result_campaign_revision")
-            .map_err(RepositoryError::Database)?
-            .map(|value| from_i64(value, "typed intent result campaign revision"))
-            .transpose()?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_hero_audit_from_row(row: PgRow) -> Result<ExportedHeroAudit, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedHeroAudit {
-        id: id.clone(),
-        subject_kind: row
-            .try_get("subject_kind")
-            .map_err(RepositoryError::Database)?,
-        subject_id: row
-            .try_get("subject_id")
-            .map_err(RepositoryError::Database)?,
-        audit_kind: row
-            .try_get("audit_kind")
-            .map_err(RepositoryError::Database)?,
-        schema_version: from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "hero audit schema version",
-        )?,
-        subject_revision: from_i64(
-            row.try_get("subject_revision")
-                .map_err(RepositoryError::Database)?,
-            "hero audit revision",
-        )?,
-        occurred_at_epoch_seconds: from_i64(
-            row.try_get("occurred_at_epoch_seconds")
-                .map_err(RepositoryError::Database)?,
-            "hero audit timestamp",
-        )?,
-        payload: serde_json::from_str(&payload_json).map_err(|source| {
-            RepositoryError::InvalidStoredData {
-                entity: "hero audit",
-                id,
-                source,
-            }
-        })?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_hero_receipt_from_row(row: PgRow) -> Result<ExportedHeroReceipt, RepositoryError> {
-    let idempotency_key: String = row
-        .try_get("idempotency_key")
-        .map_err(RepositoryError::Database)?;
-    let response_json: String = row
-        .try_get("response_json")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedHeroReceipt {
-        scope_kind: row
-            .try_get("scope_kind")
-            .map_err(RepositoryError::Database)?,
-        scope_id: row.try_get("scope_id").map_err(RepositoryError::Database)?,
-        idempotency_key: idempotency_key.clone(),
-        command_kind: row
-            .try_get("command_kind")
-            .map_err(RepositoryError::Database)?,
-        request_fingerprint: parse_digest_row(
-            &row,
-            "request_fingerprint",
-            "hero receipt",
-            &idempotency_key,
-        )?,
-        expected_revision: from_i64(
-            row.try_get("expected_revision")
-                .map_err(RepositoryError::Database)?,
-            "hero expected revision",
-        )?,
-        result_revision: from_i64(
-            row.try_get("result_revision")
-                .map_err(RepositoryError::Database)?,
-            "hero result revision",
-        )?,
-        audit_id: row.try_get("audit_id").map_err(RepositoryError::Database)?,
-        response: serde_json::from_str(&response_json).map_err(|source| {
-            RepositoryError::InvalidStoredData {
-                entity: "hero receipt response",
-                id: idempotency_key,
-                source,
-            }
-        })?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_reward_claim_from_row(
-    row: PgRow,
-) -> Result<ExportedEncounterRewardClaim, RepositoryError> {
-    Ok(ExportedEncounterRewardClaim {
-        encounter_id: row
-            .try_get("encounter_id")
-            .map_err(RepositoryError::Database)?,
-        character_id: row
-            .try_get("character_id")
-            .map_err(RepositoryError::Database)?,
-        encounter_revision: from_i64(
-            row.try_get("encounter_revision")
-                .map_err(RepositoryError::Database)?,
-            "encounter revision",
-        )?,
-        victory_event_sequence: from_i64(
-            row.try_get("victory_event_sequence")
-                .map_err(RepositoryError::Database)?,
-            "victory event sequence",
-        )?,
-        reward_tier: row
-            .try_get("reward_tier")
-            .map_err(RepositoryError::Database)?,
-        experience_awarded: u32::try_from(from_i64(
-            row.try_get("experience_awarded")
-                .map_err(RepositoryError::Database)?,
-            "experience awarded",
-        )?)
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "experience awarded",
-        })?,
-        hero_audit_id: row
-            .try_get("hero_audit_id")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_pins_from_row(row: PgRow) -> Result<ExportedCampaignPins, RepositoryError> {
-    let seal_reason: String = row
-        .try_get("seal_reason")
-        .map_err(RepositoryError::Database)?;
-    let seal_reason = match seal_reason.as_str() {
-        "selected_theme" => CampaignPinSealReason::SelectedTheme,
-        "legacy_selected_theme" => CampaignPinSealReason::LegacySelectedTheme,
-        "legacy_digest_alias" => CampaignPinSealReason::LegacyDigestAlias,
-        "legacy_default_rainbound" => CampaignPinSealReason::LegacyDefaultRainbound,
-        _ => {
-            return invalid(
-                "campaign content pins",
-                "seal-reason",
-                "stored seal reason is unsupported",
-            );
-        }
-    };
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let legacy_json: Option<String> = row
-        .try_get("legacy_source_json")
-        .map_err(RepositoryError::Database)?;
-    let evidence = SealedCampaignPins {
-        seal_reason,
-        pins: serde_json::from_str::<CampaignContentPins>(&payload_json).map_err(|source| {
-            RepositoryError::InvalidStoredData {
-                entity: "campaign content pins",
-                id: "payload".to_owned(),
-                source,
-            }
-        })?,
-        legacy_source: legacy_json
-            .map(|value| {
-                serde_json::from_str::<HeroPins>(&value).map_err(|source| {
-                    RepositoryError::InvalidStoredData {
-                        entity: "legacy hero pins",
-                        id: "payload".to_owned(),
-                        source,
-                    }
-                })
+        require_owned_campaign(self, owner_key, campaign_session_id).await?;
+        let mut cursor = self
+            .store()
+            .collection::<PlaySessionDocument>(CollectionName::PlaySessions)
+            .find(doc! {
+                "campaign_id": campaign_session_id,
+                "gm_account_id": owner_key,
             })
-            .transpose()?,
-    };
-    evidence
-        .validate()
-        .map_err(|source| RepositoryError::CoreValidation {
-            entity: "campaign content pins",
-            id: "payload".to_owned(),
-            source,
-        })?;
-    Ok(ExportedCampaignPins {
-        evidence,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_lifecycle_audit_from_row(
-    row: PgRow,
-) -> Result<ExportedLifecycleAudit, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let event_kind: String = row
-        .try_get("event_kind")
-        .map_err(RepositoryError::Database)?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let payload: LifecycleAuditPayload = serde_json::from_str(&payload_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity: "campaign lifecycle audit",
-            id: id.clone(),
-            source,
-        }
-    })?;
-    if payload.event_kind() != event_kind || !payload.validate() {
-        return invalid(
-            "campaign lifecycle audit",
-            &id,
-            "event kind and payload do not match",
-        );
-    }
-    Ok(ExportedLifecycleAudit {
-        id,
-        lifecycle_revision: from_i64(
-            row.try_get("lifecycle_revision")
-                .map_err(RepositoryError::Database)?,
-            "lifecycle audit revision",
-        )?,
-        payload,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_presentation_from_row(row: PgRow) -> Result<ExportedTextPresentation, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    Ok(ExportedTextPresentation {
-        id: id.clone(),
-        origin_turn_id: row
-            .try_get("origin_turn_id")
-            .map_err(RepositoryError::Database)?,
-        generation_job_id: row
-            .try_get("generation_job_id")
-            .map_err(RepositoryError::Database)?,
-        generation_attempt_id: row
-            .try_get("generation_attempt_id")
-            .map_err(RepositoryError::Database)?,
-        client_idempotency_key: row
-            .try_get("client_idempotency_key")
-            .map_err(RepositoryError::Database)?,
-        version: u8::try_from(
-            row.try_get::<i16, _>("version")
-                .map_err(RepositoryError::Database)?,
-        )
-        .map_err(|_| RepositoryError::NumericRange {
-            field: "text presentation version",
-        })?,
-        source: row.try_get("source").map_err(RepositoryError::Database)?,
-        body: row.try_get("body").map_err(RepositoryError::Database)?,
-        config_digest: parse_digest_row(&row, "config_digest", "text presentation", &id)?,
-        prompt_digest: parse_digest_row(&row, "prompt_digest", "text presentation", &id)?,
-        policy_digest: parse_digest_row(&row, "policy_digest", "text presentation", &id)?,
-        output_digest: parse_digest_row(&row, "output_digest", "text presentation", &id)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn exported_asset_from_row(row: PgRow) -> Result<ExportedGeneratedAsset, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let prompt: Option<String> = row
-        .try_get("prompt_fingerprint")
-        .map_err(RepositoryError::Database)?;
-    let metadata_json: String = row
-        .try_get("metadata_json")
-        .map_err(RepositoryError::Database)?;
-    Ok(ExportedGeneratedAsset {
-        id: id.clone(),
-        turn_id: row.try_get("turn_id").map_err(RepositoryError::Database)?,
-        asset_kind: row
-            .try_get("asset_kind")
-            .map_err(RepositoryError::Database)?,
-        provider: row.try_get("provider").map_err(RepositoryError::Database)?,
-        model: row.try_get("model").map_err(RepositoryError::Database)?,
-        location: row.try_get("location").map_err(RepositoryError::Database)?,
-        prompt_fingerprint: prompt
-            .map(|value| parse_digest(&value, "generated asset", &id))
-            .transpose()?,
-        metadata: serde_json::from_str(&metadata_json).map_err(|source| {
-            RepositoryError::InvalidStoredData {
-                entity: "generated asset metadata",
-                id: id.clone(),
-                source,
-            }
-        })?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn parse_digest_row(
-    row: &PgRow,
-    column: &str,
-    entity: &'static str,
-    id: &str,
-) -> Result<Sha256Digest, RepositoryError> {
-    let value: String = row.try_get(column).map_err(RepositoryError::Database)?;
-    parse_digest(&value, entity, id)
-}
-
-fn parse_digest(
-    value: &str,
-    entity: &'static str,
-    id: &str,
-) -> Result<Sha256Digest, RepositoryError> {
-    Sha256Digest::new(value.to_owned()).map_err(|_| RepositoryError::InvalidDomainState {
-        entity,
-        id: id.to_owned(),
-        reason: "stored digest is invalid",
-    })
-}
-
-fn validate_export(exported: &CampaignPrivateExportV1) -> Result<(), RepositoryError> {
-    if exported.schema_version != CAMPAIGN_EXPORT_SCHEMA_VERSION {
-        return Err(RepositoryError::UnsupportedSchemaVersion {
-            entity: "campaign private export",
-            found: u32::from(exported.schema_version),
-            supported: u32::from(CAMPAIGN_EXPORT_SCHEMA_VERSION),
-        });
-    }
-    validate_owner_key(&exported.owner_key)?;
-    if exported.exported_at.is_empty() {
-        return invalid(
-            "campaign private export",
-            "exported-at",
-            "export timestamp is absent",
-        );
-    }
-    let campaign = &exported.campaign;
-    let document = &campaign.document;
-    if document.schema_version != u32::from(SESSION_SCHEMA_VERSION)
-        || document.id != document.value.id
-        || document.revision == 0
-        || document.created_at.is_empty()
-        || document.updated_at.is_empty()
-        || campaign.owner_key != exported.owner_key
-        || campaign.lifecycle_revision == 0
-        || !is_valid_opaque_id(&campaign.safety_policy_id)
-        || !is_valid_opaque_id(&campaign.progression_policy_id)
-        || !matches!(
-            (
-                campaign.lifecycle_state,
-                campaign.archived_at.is_some(),
-                campaign.retention_class.as_str(),
-                campaign.retention_delete_after.is_some(),
-            ),
-            (
-                CampaignLifecycleState::Active,
-                false,
-                "campaign_lifetime",
-                false
-            ) | (
-                CampaignLifecycleState::Archived,
-                true,
-                "archived_owner_managed",
-                false
-            )
-        )
-    {
-        return invalid(
-            "campaign private export",
-            &document.id,
-            "campaign document or lifecycle metadata is inconsistent",
-        );
-    }
-    document
-        .value
-        .validate()
-        .map_err(|source| RepositoryError::CoreValidation {
-            entity: "campaign private export",
-            id: document.id.clone(),
-            source,
-        })?;
-    if document.revision != document.value.last_event_sequence.saturating_add(1) {
-        return invalid(
-            "campaign private export",
-            &document.id,
-            "campaign revision does not match its immutable event sequence",
-        );
-    }
-
-    let mut character_ids = BTreeSet::new();
-    for character in &exported.characters {
-        if character.schema_version != CHARACTER_SCHEMA_VERSION
-            || character.id != character.value.id()
-            || character.revision == 0
-            || !character_ids.insert(character.id.as_str())
+            .sort(doc! { "opened_at": 1, "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("list campaign play sessions", error))?;
+        let mut output = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|error| mongo_error("read campaign play sessions", error))?
         {
-            return invalid(
-                "campaign private export",
-                &character.id,
-                "character identity, schema, or revision is invalid",
-            );
+            output.push(play_session_from_document(
+                cursor
+                    .deserialize_current()
+                    .map_err(|error| mongo_error("decode campaign play session", error))?,
+            )?);
         }
-        character
-            .value
-            .validate()
-            .map_err(|source| RepositoryError::CoreValidation {
-                entity: "campaign private export character",
-                id: character.id.clone(),
-                source,
-            })?;
-    }
-    let declared = document
-        .value
-        .character_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    if declared != character_ids {
-        return invalid(
-            "campaign private export",
-            &document.id,
-            "campaign roster does not match exported character documents",
-        );
+        Ok(output)
     }
 
-    let mut turn_ids = BTreeSet::new();
-    let mut previous_turn: u64 = 0;
-    for turn in &exported.turns {
-        if turn.schema_version != u32::from(SESSION_SCHEMA_VERSION)
-            || !is_valid_opaque_id(&turn.id)
-            || !turn_ids.insert(turn.id.as_str())
-            || turn.turn_number != previous_turn.saturating_add(1)
-            || turn.event.session_id != document.id
-            || turn.event.sequence != turn.turn_number
-        {
-            return invalid(
-                "campaign private export turn",
-                &turn.id,
-                "turn identity, ordering, schema, or envelope is invalid",
-            );
-        }
-        turn.event
-            .validate()
-            .map_err(|source| RepositoryError::CoreValidation {
-                entity: "campaign private export turn",
-                id: turn.id.clone(),
-                source,
-            })?;
-        previous_turn = turn.turn_number;
-    }
-    if previous_turn != document.value.last_event_sequence {
-        return invalid(
-            "campaign private export",
-            &document.id,
-            "turn history is incomplete",
-        );
-    }
-
-    for receipt in &exported.command_receipts {
-        if !is_valid_opaque_id(&receipt.idempotency_key)
-            || !is_valid_opaque_id(&receipt.command_kind)
-            || !turn_ids.contains(receipt.audit_id.as_str())
-            || receipt.result_revision != receipt.expected_revision.saturating_add(1)
-        {
-            return invalid(
-                "campaign private export receipt",
-                &receipt.idempotency_key,
-                "command receipt is inconsistent",
-            );
-        }
-    }
-
-    let mut text_receipt_ids = BTreeSet::new();
-    let mut text_receipt_jobs = BTreeSet::new();
-    let mut text_receipt_attempts = BTreeSet::new();
-    let mut text_receipt_versions = BTreeSet::new();
-    let mut text_receipt_keys = BTreeSet::new();
-    for receipt in &exported.text_presentation_receipts {
-        if receipt.schema_version != 1
-            || !turn_ids.contains(receipt.origin_turn_id.as_str())
-            || !is_valid_opaque_id(&receipt.client_idempotency_key)
-            || !is_valid_opaque_id(&receipt.presentation_id)
-            || !is_valid_opaque_id(&receipt.generation_job_id)
-            || !is_valid_opaque_id(&receipt.generation_attempt_id)
-            || !(1..=3).contains(&receipt.version)
-            || !matches!(
-                receipt.source.as_str(),
-                "provider" | "authored_fallback" | "engine_authored"
-            )
-            || receipt.created_at.is_empty()
-            || !text_receipt_ids.insert(receipt.presentation_id.as_str())
-            || !text_receipt_jobs.insert(receipt.generation_job_id.as_str())
-            || !text_receipt_attempts.insert(receipt.generation_attempt_id.as_str())
-            || !text_receipt_versions.insert((receipt.origin_turn_id.as_str(), receipt.version))
-            || !text_receipt_keys.insert((
-                receipt.origin_turn_id.as_str(),
-                receipt.client_idempotency_key.as_str(),
-            ))
-        {
-            return invalid(
-                "campaign private export text presentation receipt",
-                &receipt.presentation_id,
-                "body-free presentation receipt is inconsistent",
-            );
-        }
-    }
-
-    let mut typed_receipt_keys = BTreeSet::new();
-    for receipt in &exported.typed_intent_receipts {
-        let evidence_size = serde_json::to_vec(&receipt.interpretation_evidence)
-            .map_err(|source| RepositoryError::Serialize {
-                entity: "typed intent interpretation evidence",
-                source,
-            })?
-            .len();
-        let intent_is_valid = EncounterCommand::new(
-            receipt.expected_encounter_revision,
-            receipt.client_idempotency_key.clone(),
-            receipt.resolved_intent.clone(),
-        )
-        .validate()
-        .is_ok();
-        let state_is_valid = match (
-            receipt.state.as_str(),
-            receipt.origin_turn_id.as_deref(),
-            receipt.event_sequence,
-            receipt.result_campaign_revision,
-        ) {
-            ("pending", None, None, None) => true,
-            ("committed", Some(turn_id), Some(sequence), Some(result_revision)) => {
-                turn_ids.contains(turn_id)
-                    && exported
-                        .turns
-                        .iter()
-                        .any(|turn| turn.id == turn_id && turn.turn_number == sequence)
-                    && result_revision == receipt.expected_campaign_revision.saturating_add(1)
-                    && result_revision <= document.revision
-            }
-            _ => false,
-        };
-        if receipt.schema_version != 1
-            || !is_valid_opaque_id(&receipt.client_idempotency_key)
-            || !typed_receipt_keys.insert(receipt.client_idempotency_key.as_str())
-            || receipt.expected_campaign_revision == 0
-            || receipt.expected_campaign_revision > document.revision
-            || receipt.expected_encounter_revision == 0
-            || !intent_is_valid
-            || receipt.interpretation_label.trim() != receipt.interpretation_label
-            || receipt.interpretation_label.is_empty()
-            || receipt.interpretation_label.chars().count() > 512
-            || receipt.interpretation_label.len() > 2_048
-            || receipt.interpretation_label.chars().any(char::is_control)
-            || !receipt.interpretation_evidence.is_object()
-            || evidence_size > 32_768
-            || !state_is_valid
-            || receipt.created_at.is_empty()
-            || receipt.updated_at.is_empty()
-        {
-            return invalid(
-                "campaign private export typed intent receipt",
-                &receipt.client_idempotency_key,
-                "typed intent recovery receipt is inconsistent",
-            );
-        }
-    }
-
-    let mut draft_ids = BTreeSet::new();
-    for draft in &exported.hero_drafts {
-        if draft.document.schema_version != u32::from(HERO_DRAFT_SCHEMA_VERSION)
-            || draft.document.id != draft.document.value.draft_id
-            || draft.document.value.campaign_id != document.id
-            || draft.document.value.owner_id != exported.owner_key
-            || draft.document.revision != draft.document.value.revision.saturating_add(1)
-            || draft.expires_at_epoch_seconds != draft.document.value.expires_at_epoch_seconds
-            || draft.retention_delete_after_epoch_seconds < draft.expires_at_epoch_seconds
-            || !draft_ids.insert(draft.document.id.as_str())
-        {
-            return invalid(
-                "campaign private export hero draft",
-                &draft.document.id,
-                "hero draft metadata is inconsistent",
-            );
-        }
-        draft
-            .document
-            .value
-            .validate()
-            .map_err(|source| RepositoryError::HeroValidation {
-                entity: "campaign private export hero draft",
-                id: draft.document.id.clone(),
-                source,
-            })?;
-    }
-    if let Some(hero) = &exported.hero_character {
-        if hero.schema_version != u32::from(HERO_CHARACTER_SCHEMA_VERSION)
-            || hero.id != hero.value.character_id
-            || hero.value.campaign_id != document.id
-            || hero.value.owner_id != exported.owner_key
-            || hero.revision != hero.value.revision.saturating_add(1)
-        {
-            return invalid(
-                "campaign private export hero",
-                &hero.id,
-                "hero metadata is inconsistent",
-            );
-        }
-        hero.value
-            .validate()
-            .map_err(|source| RepositoryError::HeroValidation {
-                entity: "campaign private export hero",
-                id: hero.id.clone(),
-                source,
-            })?;
-    }
-    match &exported.content_pins {
-        Some(pins) => {
-            pins.evidence
-                .validate()
-                .map_err(|source| RepositoryError::CoreValidation {
-                    entity: "campaign private export pins",
-                    id: document.id.clone(),
-                    source,
-                })?
-        }
-        None if exported.turns.is_empty() && exported.hero_character.is_none() => {}
-        None => {
-            return invalid(
-                "campaign private export pins",
-                &document.id,
-                "a playable restored campaign requires sealed validated pins",
-            );
-        }
-    }
-
-    let mut hero_audit_ids = BTreeSet::new();
-    for audit in &exported.hero_audits {
-        let (expected_subject_kind, expected_audit_kind) = match &audit.payload {
-            HeroAuditPayload::CreationTransition { .. } => ("draft", "creation_transition"),
-            HeroAuditPayload::RewardAwarded { .. } => ("character", "reward_awarded"),
-            HeroAuditPayload::LevelUp { .. } => ("character", "level_up"),
-        };
-        audit.payload.validate()?;
-        if audit.id != audit.payload.audit_id()
-            || audit.subject_id != audit.payload.subject_id()
-            || audit.subject_kind != expected_subject_kind
-            || audit.audit_kind != expected_audit_kind
-            || audit.subject_revision == 0
-            || !hero_audit_ids.insert(audit.id.as_str())
-        {
-            return invalid(
-                "campaign private export hero audit",
-                &audit.id,
-                "hero audit envelope is inconsistent",
-            );
-        }
-    }
-    for receipt in &exported.hero_receipts {
-        if !matches!(receipt.scope_kind.as_str(), "draft" | "character")
-            || !is_valid_opaque_id(&receipt.scope_id)
-            || !is_valid_opaque_id(&receipt.idempotency_key)
-            || !hero_audit_ids.contains(receipt.audit_id.as_str())
-            || receipt.result_revision != receipt.expected_revision.saturating_add(1)
-        {
-            return invalid(
-                "campaign private export hero receipt",
-                &receipt.idempotency_key,
-                "hero receipt is inconsistent",
-            );
-        }
-    }
-    for claim in &exported.encounter_reward_claims {
-        if !is_valid_opaque_id(&claim.encounter_id)
-            || !is_valid_opaque_id(&claim.character_id)
-            || claim.encounter_revision == 0
-            || claim.victory_event_sequence == 0
-            || !matches!(claim.reward_tier.as_str(), "minor" | "major")
-            || claim.experience_awarded == 0
-            || !hero_audit_ids.contains(claim.hero_audit_id.as_str())
-        {
-            return invalid(
-                "campaign private export reward claim",
-                &claim.encounter_id,
-                "encounter reward claim is inconsistent",
-            );
-        }
-    }
-
-    let mut open_count = 0;
-    let mut play_ids = BTreeSet::new();
-    for play in &exported.play_sessions {
-        validate_play_session(play)?;
-        if play.campaign_session_id != document.id
-            || play.owner_key != exported.owner_key
-            || !play_ids.insert(play.id.as_str())
-        {
-            return invalid(
-                "campaign private export play session",
-                &play.id,
-                "play session owner or campaign is inconsistent",
-            );
-        }
-        open_count += usize::from(play.state == "waiting");
-    }
-    if open_count > 1 {
-        return invalid(
-            "campaign private export",
-            &document.id,
-            "more than one play session is open",
-        );
-    }
-    let mut recap_ids = BTreeSet::new();
-    let mut recap_revisions = BTreeSet::new();
-    for recap in &exported.private_recaps {
-        recap.validate_for_campaign(&document.id, document.revision)?;
-        if !recap_ids.insert(recap.id.as_str())
-            || !recap_revisions.insert(recap.campaign_revision)
-            || recap
-                .last_turn_number
-                .is_some_and(|turn| turn > document.value.last_event_sequence)
-        {
-            return invalid(
-                "campaign private export recap",
-                &recap.id,
-                "private recap identity, revision, or audit range is inconsistent",
-            );
-        }
-    }
-    let mut lifecycle_revisions = BTreeSet::new();
-    for audit in &exported.lifecycle_audits {
-        if !is_valid_opaque_id(&audit.id)
-            || !audit.payload.validate()
-            || audit.lifecycle_revision <= 1
-            || audit.lifecycle_revision > campaign.lifecycle_revision
-            || !lifecycle_revisions.insert(audit.lifecycle_revision)
-        {
-            return invalid(
-                "campaign private export lifecycle audit",
-                &audit.id,
-                "lifecycle audit is inconsistent",
-            );
-        }
-    }
-
-    let mut presentation_turns = BTreeSet::new();
-    for presentation in &exported.selected_text_presentations {
-        if !is_valid_opaque_id(&presentation.id)
-            || !turn_ids.contains(presentation.origin_turn_id.as_str())
-            || !is_valid_opaque_id(&presentation.generation_job_id)
-            || !is_valid_opaque_id(&presentation.generation_attempt_id)
-            || !is_valid_opaque_id(&presentation.client_idempotency_key)
-            || !(1..=3).contains(&presentation.version)
-            || !matches!(
-                presentation.source.as_str(),
-                "provider" | "authored_fallback" | "engine_authored"
-            )
-            || presentation.body.trim() != presentation.body
-            || presentation.body.is_empty()
-            || presentation.body.chars().count() > 12_000
-            || !presentation_turns.insert(presentation.origin_turn_id.as_str())
-        {
-            return invalid(
-                "campaign private export presentation",
-                &presentation.id,
-                "selected presentation is invalid",
-            );
-        }
-        if !exported.text_presentation_receipts.iter().any(|receipt| {
-            receipt.presentation_id == presentation.id
-                && receipt.origin_turn_id == presentation.origin_turn_id
-                && receipt.client_idempotency_key == presentation.client_idempotency_key
-                && receipt.generation_job_id == presentation.generation_job_id
-                && receipt.generation_attempt_id == presentation.generation_attempt_id
-                && receipt.version == presentation.version
-                && receipt.source == presentation.source
-                && receipt.config_digest == presentation.config_digest
-                && receipt.prompt_digest == presentation.prompt_digest
-                && receipt.policy_digest == presentation.policy_digest
-                && receipt.output_digest == presentation.output_digest
-        }) {
-            return invalid(
-                "campaign private export presentation",
-                &presentation.id,
-                "selected presentation is missing its body-free receipt",
-            );
-        }
-    }
-    for asset in &exported.selected_generated_assets {
-        super::validate_generated_asset_fields(
-            &asset.id,
-            &document.id,
-            asset.turn_id.as_deref(),
-            &asset.asset_kind,
-            &asset.provider,
-            &asset.model,
-            &asset.location,
-            &asset.metadata,
-        )?;
-        if asset
-            .turn_id
-            .as_deref()
-            .is_some_and(|id| !turn_ids.contains(id))
-        {
-            return invalid(
-                "campaign private export generated asset",
-                &asset.id,
-                "selected asset references an unknown turn",
-            );
-        }
-    }
-    Ok(())
-}
-
-fn canonical_json<T: Serialize>(value: &T) -> Result<String, RepositoryError> {
-    let value = serde_json::to_value(value).map_err(|source| RepositoryError::Serialize {
-        entity: "canonical JSON",
-        source,
-    })?;
-    serde_json::to_string(&canonicalize_value(value)).map_err(|source| RepositoryError::Serialize {
-        entity: "canonical JSON",
-        source,
-    })
-}
-
-fn canonicalize_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let sorted = map
-                .into_iter()
-                .map(|(key, value)| (key, canonicalize_value(value)))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),
-        scalar => scalar,
-    }
-}
-
-fn command_fingerprint<T: Serialize>(
-    command_kind: &str,
-    command: &T,
-) -> Result<Sha256Digest, RepositoryError> {
-    let payload = canonical_json(command)?;
-    Ok(digest(format!("{command_kind}\n{payload}").as_bytes()))
-}
-
-fn digest(bytes: &[u8]) -> Sha256Digest {
-    let bytes: [u8; 32] = Sha256::digest(bytes).into();
-    Sha256Digest::from_bytes(bytes)
-}
-
-fn render_player_export(exported: &CampaignPrivateExportV1) -> Result<String, RepositoryError> {
-    exported.validate()?;
-    let mut output = String::new();
-    let campaign = &exported.campaign;
-    let state = match campaign.lifecycle_state {
-        CampaignLifecycleState::Active => "active",
-        CampaignLifecycleState::Archived => "archived",
-    };
-    output.push_str("# Manchester Arcana private campaign record\n\n");
-    output.push_str(&format!(
-        "Campaign: {}\n\nStatus: {state}\n\nCampaign revision: {}\n\nExported: {}\n\n",
-        campaign.document.value.title, campaign.document.revision, exported.exported_at
-    ));
-    output.push_str("## Character sheet\n\n");
-    if let Some(hero) = &exported.hero_character {
-        let sheet = serde_json::to_string_pretty(&hero.value).map_err(|source| {
-            RepositoryError::Serialize {
-                entity: "player-readable hero sheet",
-                source,
-            }
-        })?;
-        output.push_str("```json\n");
-        output.push_str(&sheet);
-        output.push_str("\n```\n\n");
-    } else {
-        for character in &exported.characters {
-            output.push_str(&format!(
-                "- {} — {}, level {}, {} XP, {}/{} HP\n",
-                character.value.name(),
-                character.value.theme(),
-                character.value.level().value(),
-                character.value.experience_points(),
-                character.value.current_hit_points(),
-                character.value.maximum_hit_points(),
-            ));
-        }
-        output.push('\n');
-    }
-    output.push_str("## Committed history\n\n");
-    if exported.turns.is_empty() {
-        output.push_str("No committed turns yet.\n\n");
-    }
-    for turn in &exported.turns {
-        let payload = serde_json::to_value(&turn.event.payload).map_err(|source| {
-            RepositoryError::Serialize {
-                entity: "player-readable turn",
-                source,
-            }
-        })?;
-        let kind = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("committed_event");
-        output.push_str(&format!(
-            "### Turn {} — {}\n\nRecorded: {}\n\n",
-            turn.turn_number,
-            kind.replace('_', " "),
-            turn.created_at
-        ));
-        let mut rolls = Vec::new();
-        collect_roll_facts(&payload, "event", &mut rolls);
-        if !rolls.is_empty() {
-            output.push_str("Stored dice and rule facts:\n\n");
-            for roll in rolls {
-                output.push_str("- ");
-                output.push_str(&roll);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-        let pretty = serde_json::to_string_pretty(&payload).map_err(|source| {
-            RepositoryError::Serialize {
-                entity: "player-readable turn",
-                source,
-            }
-        })?;
-        output.push_str("Stored audit facts:\n\n```json\n");
-        output.push_str(&pretty);
-        output.push_str("\n```\n\n");
-        if let Some(presentation) = exported
-            .selected_text_presentations
-            .iter()
-            .find(|presentation| presentation.origin_turn_id == turn.id)
-        {
-            output.push_str("Selected narration:\n\n");
-            output.push_str(&presentation.body);
-            output.push_str("\n\nProvenance: ");
-            output.push_str(&format!(
-                "{}; output {}; prompt {}; policy {}; config {}.\n\n",
-                presentation.source,
-                presentation.output_digest,
-                presentation.prompt_digest,
-                presentation.policy_digest,
-                presentation.config_digest,
-            ));
-        }
-    }
-    output.push_str("## Selected generated artifacts\n\n");
-    if exported.selected_generated_assets.is_empty() {
-        output.push_str("No selected generated media.\n\n");
-    } else {
-        for asset in &exported.selected_generated_assets {
-            output.push_str(&format!(
-                "- {} — {} via {}/{}; protected key `{}`",
-                asset.id, asset.asset_kind, asset.provider, asset.model, asset.location
-            ));
-            if let Some(fingerprint) = &asset.prompt_fingerprint {
-                output.push_str(&format!("; prompt {fingerprint}"));
-            }
-            output.push_str(".\n");
-        }
-        output.push('\n');
-    }
-    output.push_str("## Durable private recap\n\n");
-    if let Some(recap) = exported.private_recaps.last() {
-        output.push_str(&recap.body);
-        output.push_str("\n\nRecap provenance: ");
-        output.push_str(&format!(
-            "{}; source {}; body {}.\n\n",
-            recap.template_id, recap.source_audit_digest, recap.body_digest
-        ));
-    } else {
-        output.push_str("No durable private recap has been created.\n\n");
-    }
-    output.push_str("## Rules, content, and provenance pins\n\n");
-    if let Some(pins) = &exported.content_pins {
-        let pretty = serde_json::to_string_pretty(&pins.evidence).map_err(|source| {
-            RepositoryError::Serialize {
-                entity: "player-readable campaign pins",
-                source,
-            }
-        })?;
-        output.push_str("```json\n");
-        output.push_str(&pretty);
-        output.push_str("\n```\n\n");
-    } else {
-        output.push_str("Campaign setup is not sealed yet.\n\n");
-    }
-    output.push_str("## Attribution\n\n");
-    output.push_str(
-        "Rules-derived material uses the Dungeons & Dragons 5.1 SRD under CC BY 4.0. Manchester Arcana campaign content and its exact source identities are recorded in the pins above. This is a private owner export, not a public share artifact.\n",
-    );
-    if output.len() > MAX_PLAYER_EXPORT_BYTES {
-        return invalid(
-            "player-readable campaign export",
-            &campaign.document.id,
-            "rendered export exceeds the private export limit",
-        );
-    }
-    Ok(output)
-}
-
-fn collect_roll_facts(value: &Value, path: &str, facts: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let child_path = format!("{path}.{key}");
-                if (key.contains("roll") || key == "total" || key == "modifier" || key == "dc")
-                    && !matches!(child, Value::Object(_) | Value::Array(_))
-                {
-                    facts.push(format!("{child_path} = {child}"));
-                }
-                collect_roll_facts(child, &child_path, facts);
-            }
-        }
-        Value::Array(values) => {
-            for (index, child) in values.iter().enumerate() {
-                collect_roll_facts(child, &format!("{path}[{index}]"), facts);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-}
-
-fn validate_owner_key(owner_key: &str) -> Result<(), RepositoryError> {
-    if !is_valid_opaque_id(owner_key) {
-        return invalid(
-            "campaign owner",
-            "owner-scoped",
-            "owner key must be a valid opaque identifier",
-        );
-    }
-    Ok(())
-}
-
-fn validate_owner_campaign(
-    owner_key: &str,
-    campaign_session_id: &str,
-) -> Result<(), RepositoryError> {
-    validate_owner_key(owner_key)?;
-    if !is_valid_opaque_id(campaign_session_id) {
-        return invalid(
-            "campaign session",
-            "owner-scoped",
-            "campaign id must be a valid opaque identifier",
-        );
-    }
-    Ok(())
-}
-
-async fn require_owned_campaign(
-    pool: &sqlx::PgPool,
-    owner_key: &str,
-    campaign_session_id: &str,
-) -> Result<(), RepositoryError> {
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM campaign_sessions WHERE id = $1 AND owner_key = $2
-         )",
-    )
-    .bind(campaign_session_id)
-    .bind(owner_key)
-    .fetch_one(pool)
-    .await
-    .map_err(RepositoryError::Database)?;
-    if !exists {
-        return Err(RepositoryError::NotFound {
-            entity: "campaign session",
-            id: campaign_session_id.to_owned(),
-        });
-    }
-    Ok(())
-}
-
-fn map_lifecycle_insert(error: sqlx::Error, entity: &'static str, id: &str) -> RepositoryError {
-    if error
-        .as_database_error()
-        .is_some_and(|database_error| database_error.is_unique_violation())
-    {
-        RepositoryError::AlreadyExists {
-            entity,
-            id: id.to_owned(),
-        }
-    } else {
-        RepositoryError::Database(error)
-    }
-}
-
-fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T, RepositoryError> {
-    Err(RepositoryError::InvalidDomainState {
-        entity,
-        id: id.to_owned(),
-        reason,
-    })
-}
-
-impl PostgresRepository {
     pub async fn start_campaign_play_session(
         &self,
         owner_key: &str,
         command: &StartPlaySessionCommand,
     ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
+        validate_owner(owner_key)?;
         command.lifecycle.validate()?;
-        validate_owner_key(owner_key)?;
         if !is_valid_opaque_id(&command.play_session_id) {
             return invalid(
-                "play session command",
+                "campaign play session",
                 &command.play_session_id,
-                "play session id must be a valid opaque identifier",
+                "play session id is invalid",
             );
         }
-        let request_fingerprint = command_fingerprint("play_start", command)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        if let Some(outcome) = replay_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            "play_start",
-            &request_fingerprint,
-        )
-        .await?
-        {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(outcome);
-        }
-        let locked = lock_owned_campaign(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle.campaign_session_id,
-        )
-        .await?;
-        locked.require_revision(command.lifecycle.expected_lifecycle_revision)?;
-        locked.require_state(CampaignLifecycleState::Active)?;
-        let existing_open: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM campaign_play_sessions
-             WHERE campaign_session_id = $1 AND state IN ('waiting', 'active') FOR UPDATE",
-        )
-        .bind(&command.lifecycle.campaign_session_id)
-        .fetch_optional(&mut *transaction)
+        let fingerprint = command_fingerprint("campaign_play_start", command)?;
+        let campaigns = self.campaigns();
+        let play_sessions = self
+            .store()
+            .collection::<PlaySessionDocument>(CollectionName::PlaySessions);
+        let receipts = self
+            .store()
+            .collection::<LifecycleReceiptDocument>(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let command_owned = command.clone();
+        let owner_owned = owner_key.to_owned();
+        let play_id = command.play_session_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let play_sessions = play_sessions.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let command = command_owned.clone();
+            let owner = owner_owned.clone();
+            let fingerprint = fingerprint.clone();
+            Box::pin(async move {
+                if let Some(replay) = load_lifecycle_replay(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.lifecycle.campaign_session_id,
+                    &command.lifecycle.idempotency_key,
+                    "campaign_play_start",
+                    &fingerprint,
+                )
+                .await?
+                {
+                    return Ok(replay);
+                }
+                let campaign = load_owned_gm_campaign(
+                    &campaigns,
+                    session,
+                    &owner,
+                    &command.lifecycle.campaign_session_id,
+                )
+                .await?;
+                require_lifecycle_revision(
+                    &campaign,
+                    command.lifecycle.expected_lifecycle_revision,
+                )?;
+                if campaign.lifecycle.state != "open" || campaign.current_play_session_id.is_some()
+                {
+                    return Err(PersistenceError::AlreadyExists {
+                        entity: "campaign_play_session",
+                        id: command.play_session_id.clone(),
+                    });
+                }
+                let new_revision =
+                    next_revision(campaign.lifecycle_revision, "lifecycle revision")?;
+                let now = DateTime::now();
+                let participant_count = i64::try_from(campaign.members.len()).map_err(|_| {
+                    PersistenceError::SchemaDrift {
+                        collection: "campaigns".to_owned(),
+                        detail: "embedded membership count is outside the supported range"
+                            .to_owned(),
+                    }
+                })?;
+                let play = PlaySessionDocument {
+                    id: command.play_session_id.clone(),
+                    schema_version: 1,
+                    revision: 1,
+                    campaign_id: campaign.id.clone(),
+                    gm_account_id: owner.clone(),
+                    state: "active".to_owned(),
+                    participants: campaign
+                        .members
+                        .iter()
+                        .filter(|member| member.state == "active")
+                        .map(|member| {
+                            doc! {
+                                "account_id": &member.account_id,
+                                "role": &member.role,
+                                "state": "ready",
+                            }
+                        })
+                        .collect(),
+                    mode: "exploration".to_owned(),
+                    turn_state: doc! { "phase": "open", "active_account_id": Bson::Null },
+                    membership_snapshot: doc! {
+                        "campaign_revision": campaign.revision,
+                        "member_count": participant_count,
+                    },
+                    start_policy: "game_master".to_owned(),
+                    opened_at: now,
+                    updated_at: now,
+                    closed_at: None,
+                    close_reason: None,
+                    started_campaign_revision: campaign.revision,
+                    ended_campaign_revision: None,
+                };
+                play_sessions
+                    .insert_one(play)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("start play session", error))?;
+                let updated = campaigns
+                    .update_one(
+                        doc! {
+                            "_id": &campaign.id,
+                            "owner_account_id": &owner,
+                            "lifecycle_revision": campaign.lifecycle_revision,
+                            "current_play_session_id": Bson::Null,
+                            "lifecycle.state": "open",
+                        },
+                        doc! {
+                            "$set": {
+                                "current_play_session_id": &command.play_session_id,
+                                "updated_at": now,
+                            },
+                            "$inc": { "lifecycle_revision": 1_i64 },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("advance campaign play state", error)
+                    })?;
+                if updated.modified_count != 1 {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_lifecycle",
+                        id: campaign.id,
+                        expected: command.lifecycle.expected_lifecycle_revision,
+                        actual: nonnegative_u64(campaign.lifecycle_revision),
+                    });
+                }
+                let outcome = CampaignLifecycleOutcome {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: command.lifecycle.campaign_session_id.clone(),
+                    lifecycle_revision: nonnegative_u64(new_revision),
+                    lifecycle_state: Some(CampaignLifecycleState::Active),
+                    play_session_id: Some(command.play_session_id.clone()),
+                    deleted: false,
+                };
+                insert_lifecycle_audit(
+                    &audits,
+                    session,
+                    &owner,
+                    &outcome,
+                    LifecycleAuditPayload::PlayStarted {
+                        play_session_id: command.play_session_id.clone(),
+                    },
+                )
+                .await?;
+                insert_lifecycle_receipt(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.lifecycle,
+                    "campaign_play_start",
+                    fingerprint,
+                    &outcome,
+                    false,
+                )
+                .await?;
+                Ok(outcome)
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?;
-        if existing_open.is_some() {
-            return invalid(
-                "play session",
-                &command.lifecycle.campaign_session_id,
-                "campaign already has an open play session",
-            );
-        }
-        sqlx::query(
-            "INSERT INTO campaign_play_sessions
-             (id, campaign_session_id, owner_key, schema_version, state,
-              started_campaign_revision)
-             VALUES ($1, $2, $3, $4, 'waiting', $5)",
-        )
-        .bind(&command.play_session_id)
-        .bind(&command.lifecycle.campaign_session_id)
-        .bind(owner_key)
-        .bind(i64::from(CAMPAIGN_LIFECYCLE_SCHEMA_VERSION))
-        .bind(to_i64(locked.campaign_revision, "campaign revision")?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| map_lifecycle_insert(error, "play session", &command.play_session_id))?;
-        let outcome = advance_lifecycle(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            locked,
-            CampaignLifecycleState::Active,
-            LifecycleAuditPayload::PlayStarted {
-                play_session_id: command.play_session_id.clone(),
-            },
-            Some(command.play_session_id.clone()),
-            false,
-        )
-        .await?;
-        insert_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            "play_start",
-            &request_fingerprint,
-            &outcome,
-        )
-        .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(outcome)
+        .map_err(|error| map_transaction_error(error, "campaign play session", &play_id))
     }
 
     pub async fn end_campaign_play_session(
@@ -3785,88 +753,162 @@ impl PostgresRepository {
         owner_key: &str,
         command: &EndPlaySessionCommand,
     ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
+        validate_owner(owner_key)?;
         command.lifecycle.validate()?;
-        validate_owner_key(owner_key)?;
         if !is_valid_opaque_id(&command.play_session_id) {
             return invalid(
-                "play session command",
+                "campaign play session",
                 &command.play_session_id,
-                "play session id must be a valid opaque identifier",
+                "play session id is invalid",
             );
         }
-        let request_fingerprint = command_fingerprint("play_end", command)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        if let Some(outcome) = replay_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            "play_end",
-            &request_fingerprint,
-        )
-        .await?
-        {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(outcome);
-        }
-        let locked = lock_owned_campaign(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle.campaign_session_id,
-        )
-        .await?;
-        locked.require_revision(command.lifecycle.expected_lifecycle_revision)?;
-        locked.require_state(CampaignLifecycleState::Active)?;
-        let updated = sqlx::query(
-            "UPDATE campaign_play_sessions
-             SET state = 'closed', ended_campaign_revision = $4,
-                 closed_at = CURRENT_TIMESTAMP, close_reason = 'owner_ended'
-             WHERE id = $1 AND campaign_session_id = $2 AND owner_key = $3
-               AND state IN ('waiting', 'active')",
-        )
-        .bind(&command.play_session_id)
-        .bind(&command.lifecycle.campaign_session_id)
-        .bind(owner_key)
-        .bind(to_i64(locked.campaign_revision, "campaign revision")?)
-        .execute(&mut *transaction)
+        let fingerprint = command_fingerprint("campaign_play_end", command)?;
+        let campaigns = self.campaigns();
+        let play_sessions = self
+            .store()
+            .collection::<PlaySessionDocument>(CollectionName::PlaySessions);
+        let receipts = self
+            .store()
+            .collection::<LifecycleReceiptDocument>(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let command_owned = command.clone();
+        let owner_owned = owner_key.to_owned();
+        let play_id = command.play_session_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let play_sessions = play_sessions.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let command = command_owned.clone();
+            let owner = owner_owned.clone();
+            let fingerprint = fingerprint.clone();
+            Box::pin(async move {
+                if let Some(replay) = load_lifecycle_replay(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.lifecycle.campaign_session_id,
+                    &command.lifecycle.idempotency_key,
+                    "campaign_play_end",
+                    &fingerprint,
+                )
+                .await?
+                {
+                    return Ok(replay);
+                }
+                let campaign = load_owned_gm_campaign(
+                    &campaigns,
+                    session,
+                    &owner,
+                    &command.lifecycle.campaign_session_id,
+                )
+                .await?;
+                require_lifecycle_revision(
+                    &campaign,
+                    command.lifecycle.expected_lifecycle_revision,
+                )?;
+                if campaign.current_play_session_id.as_deref()
+                    != Some(command.play_session_id.as_str())
+                {
+                    return Err(PersistenceError::NotFound {
+                        entity: "campaign_play_session",
+                        id: command.play_session_id.clone(),
+                    });
+                }
+                let now = DateTime::now();
+                let closed = play_sessions
+                    .update_one(
+                        doc! {
+                            "_id": &command.play_session_id,
+                            "campaign_id": &campaign.id,
+                            "gm_account_id": &owner,
+                            "state": { "$in": ["waiting", "active"] },
+                        },
+                        doc! {
+                            "$set": {
+                                "state": "closed",
+                                "closed_at": now,
+                                "updated_at": now,
+                                "close_reason": "game_master_ended",
+                                "ended_campaign_revision": campaign.revision,
+                            },
+                            "$inc": { "revision": 1_i64 },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("end play session", error))?;
+                if closed.modified_count != 1 {
+                    return Err(PersistenceError::NotFound {
+                        entity: "campaign_play_session",
+                        id: command.play_session_id.clone(),
+                    });
+                }
+                let updated = campaigns
+                    .update_one(
+                        doc! {
+                            "_id": &campaign.id,
+                            "owner_account_id": &owner,
+                            "lifecycle_revision": campaign.lifecycle_revision,
+                            "current_play_session_id": &command.play_session_id,
+                        },
+                        doc! {
+                            "$set": {
+                                "current_play_session_id": Bson::Null,
+                                "updated_at": now,
+                            },
+                            "$inc": { "lifecycle_revision": 1_i64 },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("close campaign play state", error))?;
+                if updated.modified_count != 1 {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_lifecycle",
+                        id: campaign.id,
+                        expected: command.lifecycle.expected_lifecycle_revision,
+                        actual: nonnegative_u64(campaign.lifecycle_revision),
+                    });
+                }
+                let result_revision =
+                    next_revision(campaign.lifecycle_revision, "lifecycle revision")?;
+                let outcome = CampaignLifecycleOutcome {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: command.lifecycle.campaign_session_id.clone(),
+                    lifecycle_revision: nonnegative_u64(result_revision),
+                    lifecycle_state: Some(CampaignLifecycleState::Active),
+                    play_session_id: Some(command.play_session_id.clone()),
+                    deleted: false,
+                };
+                insert_lifecycle_audit(
+                    &audits,
+                    session,
+                    &owner,
+                    &outcome,
+                    LifecycleAuditPayload::PlayEnded {
+                        play_session_id: command.play_session_id.clone(),
+                    },
+                )
+                .await?;
+                insert_lifecycle_receipt(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.lifecycle,
+                    "campaign_play_end",
+                    fingerprint,
+                    &outcome,
+                    false,
+                )
+                .await?;
+                Ok(outcome)
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?;
-        if updated.rows_affected() != 1 {
-            return invalid(
-                "play session",
-                &command.play_session_id,
-                "the requested play session is not open for this campaign",
-            );
-        }
-        let outcome = advance_lifecycle(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            locked,
-            CampaignLifecycleState::Active,
-            LifecycleAuditPayload::PlayEnded {
-                play_session_id: command.play_session_id.clone(),
-            },
-            Some(command.play_session_id.clone()),
-            false,
-        )
-        .await?;
-        insert_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            "play_end",
-            &request_fingerprint,
-            &outcome,
-        )
-        .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(outcome)
+        .map_err(|error| map_transaction_error(error, "campaign play session", &play_id))
     }
 
     pub async fn archive_campaign(
@@ -3874,7 +916,15 @@ impl PostgresRepository {
         owner_key: &str,
         command: &CampaignLifecycleCommand,
     ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
-        self.change_archive_state(owner_key, command, true).await
+        self.change_campaign_lifecycle(
+            owner_key,
+            command,
+            CampaignLifecycleState::Active,
+            CampaignLifecycleState::Archived,
+            "campaign_archive",
+            LifecycleAuditPayload::Archived,
+        )
+        .await
     }
 
     pub async fn restore_archived_campaign(
@@ -3882,928 +932,186 @@ impl PostgresRepository {
         owner_key: &str,
         command: &CampaignLifecycleCommand,
     ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
-        self.change_archive_state(owner_key, command, false).await
+        self.change_campaign_lifecycle(
+            owner_key,
+            command,
+            CampaignLifecycleState::Archived,
+            CampaignLifecycleState::Active,
+            "campaign_unarchive",
+            LifecycleAuditPayload::Restored,
+        )
+        .await
     }
 
-    async fn change_archive_state(
+    async fn change_campaign_lifecycle(
         &self,
         owner_key: &str,
         command: &CampaignLifecycleCommand,
-        archive: bool,
+        required: CampaignLifecycleState,
+        target: CampaignLifecycleState,
+        command_kind: &'static str,
+        payload: LifecycleAuditPayload,
     ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
+        validate_owner(owner_key)?;
         command.validate()?;
-        validate_owner_key(owner_key)?;
-        let (command_kind, required_state, next_state, payload) = if archive {
-            (
-                "archive",
-                CampaignLifecycleState::Active,
-                CampaignLifecycleState::Archived,
-                LifecycleAuditPayload::Archived,
-            )
-        } else {
-            (
-                "restore_archive",
-                CampaignLifecycleState::Archived,
-                CampaignLifecycleState::Active,
-                LifecycleAuditPayload::Restored,
-            )
-        };
-        let request_fingerprint = command_fingerprint(command_kind, command)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        if let Some(outcome) = replay_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            command,
-            command_kind,
-            &request_fingerprint,
-        )
-        .await?
-        {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(outcome);
-        }
-        let locked =
-            lock_owned_campaign(&mut transaction, owner_key, &command.campaign_session_id).await?;
-        locked.require_revision(command.expected_lifecycle_revision)?;
-        locked.require_state(required_state)?;
-        if archive {
-            require_no_open_play_session(&mut transaction, &command.campaign_session_id).await?;
-        }
-        let outcome = advance_lifecycle(
-            &mut transaction,
-            owner_key,
-            command,
-            locked,
-            next_state,
-            payload,
-            None,
-            false,
-        )
-        .await?;
-        insert_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            command,
-            command_kind,
-            &request_fingerprint,
-            &outcome,
-        )
-        .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(outcome)
-    }
-
-    pub async fn delete_archived_campaign(
-        &self,
-        owner_key: &str,
-        command: &DeleteCampaignCommand,
-    ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
-        command.lifecycle.validate()?;
-        validate_owner_key(owner_key)?;
-        if !is_valid_opaque_id(&command.deletion_id) || !command.confirm_permanent_delete {
-            return invalid(
-                "campaign delete command",
-                &command.deletion_id,
-                "deletion id and explicit permanent-delete confirmation are required",
-            );
-        }
-        let request_fingerprint = command_fingerprint("delete", command)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        if let Some(outcome) = replay_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            "delete",
-            &request_fingerprint,
-        )
-        .await?
-        {
-            transaction
-                .commit()
-                .await
-                .map_err(RepositoryError::Database)?;
-            return Ok(outcome);
-        }
-        let locked = lock_owned_campaign(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle.campaign_session_id,
-        )
-        .await?;
-        locked.require_revision(command.lifecycle.expected_lifecycle_revision)?;
-        locked.require_state(CampaignLifecycleState::Archived)?;
-        require_no_open_play_session(&mut transaction, &command.lifecycle.campaign_session_id)
-            .await?;
-        let preparation = sqlx::query(
-            "SELECT campaign_revision, lifecycle_revision, canonical_export_digest
-             FROM campaign_deletion_preparations
-             WHERE owner_key = $1 AND campaign_session_id = $2 AND deletion_id = $3
-               AND expires_at > CURRENT_TIMESTAMP
-             FOR UPDATE",
-        )
-        .bind(owner_key)
-        .bind(&command.lifecycle.campaign_session_id)
-        .bind(&command.deletion_id)
-        .fetch_optional(&mut *transaction)
+        let fingerprint = command_fingerprint(command_kind, command)?;
+        let campaigns = self.campaigns();
+        let receipts = self
+            .store()
+            .collection::<LifecycleReceiptDocument>(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let store = self.store().clone();
+        let command_owned = command.clone();
+        let owner_owned = owner_key.to_owned();
+        let campaign_id = command.campaign_session_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let store = store.clone();
+            let command = command_owned.clone();
+            let owner = owner_owned.clone();
+            let fingerprint = fingerprint.clone();
+            let payload = payload.clone();
+            Box::pin(async move {
+                if let Some(replay) = load_lifecycle_replay(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.campaign_session_id,
+                    &command.idempotency_key,
+                    command_kind,
+                    &fingerprint,
+                )
+                .await?
+                {
+                    return Ok(replay);
+                }
+                let campaign = load_owned_gm_campaign(
+                    &campaigns,
+                    session,
+                    &owner,
+                    &command.campaign_session_id,
+                )
+                .await?;
+                require_lifecycle_revision(&campaign, command.expected_lifecycle_revision)?;
+                if campaign.lifecycle.state != required.storage_value()
+                    || campaign.current_play_session_id.is_some()
+                {
+                    return Err(PersistenceError::AlreadyExists {
+                        entity: "campaign_lifecycle",
+                        id: campaign.id,
+                    });
+                }
+                require_no_open_campaign_runtime(&store, session, &campaign.id).await?;
+                let now = DateTime::now();
+                let archived_at = match target {
+                    CampaignLifecycleState::Active => Bson::Null,
+                    CampaignLifecycleState::Archived => Bson::DateTime(now),
+                };
+                let updated = campaigns
+                    .update_one(
+                        doc! {
+                            "_id": &campaign.id,
+                            "owner_account_id": &owner,
+                            "lifecycle_revision": campaign.lifecycle_revision,
+                            "lifecycle.state": required.storage_value(),
+                            "current_play_session_id": Bson::Null,
+                        },
+                        doc! {
+                            "$set": {
+                                "lifecycle.state": target.storage_value(),
+                                "lifecycle.archived_at": archived_at,
+                                "updated_at": now,
+                            },
+                            "$inc": { "lifecycle_revision": 1_i64 },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("change campaign lifecycle", error))?;
+                if updated.modified_count != 1 {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_lifecycle",
+                        id: campaign.id,
+                        expected: command.expected_lifecycle_revision,
+                        actual: nonnegative_u64(campaign.lifecycle_revision),
+                    });
+                }
+                let result_revision =
+                    next_revision(campaign.lifecycle_revision, "lifecycle revision")?;
+                let outcome = CampaignLifecycleOutcome {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: command.campaign_session_id.clone(),
+                    lifecycle_revision: nonnegative_u64(result_revision),
+                    lifecycle_state: Some(target),
+                    play_session_id: None,
+                    deleted: false,
+                };
+                insert_lifecycle_audit(&audits, session, &owner, &outcome, payload).await?;
+                insert_lifecycle_receipt(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command,
+                    command_kind,
+                    fingerprint,
+                    &outcome,
+                    false,
+                )
+                .await?;
+                Ok(outcome)
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?
-        .ok_or_else(|| RepositoryError::NotFound {
-            entity: "campaign deletion preparation",
-            id: command.deletion_id.clone(),
-        })?;
-        let prepared_campaign_revision = from_i64(
-            preparation
-                .try_get("campaign_revision")
-                .map_err(RepositoryError::Database)?,
-            "prepared campaign revision",
-        )?;
-        let prepared_lifecycle_revision = from_i64(
-            preparation
-                .try_get("lifecycle_revision")
-                .map_err(RepositoryError::Database)?,
-            "prepared lifecycle revision",
-        )?;
-        if prepared_campaign_revision != locked.campaign_revision
-            || prepared_lifecycle_revision != locked.lifecycle_revision
-        {
-            return invalid(
-                "campaign deletion preparation",
-                &command.deletion_id,
-                "campaign changed after its delete export was prepared",
-            );
-        }
-        let prepared_export_digest: String = preparation
-            .try_get("canonical_export_digest")
-            .map_err(RepositoryError::Database)?;
-        let result_revision = command
-            .lifecycle
-            .expected_lifecycle_revision
-            .checked_add(1)
-            .ok_or(RepositoryError::NumericRange {
-                field: "lifecycle revision",
-            })?;
-        let outcome = CampaignLifecycleOutcome {
-            schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
-            campaign_session_id: command.lifecycle.campaign_session_id.clone(),
-            lifecycle_revision: result_revision,
-            lifecycle_state: None,
-            play_session_id: None,
-            deleted: true,
-        };
-        insert_lifecycle_receipt(
-            &mut transaction,
-            owner_key,
-            &command.lifecycle,
-            "delete",
-            &request_fingerprint,
-            &outcome,
-        )
-        .await?;
-        sqlx::query(
-            "INSERT INTO campaign_deletion_tombstones
-             (owner_key, campaign_session_id, deletion_id,
-              deleted_lifecycle_revision, canonical_export_digest)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(owner_key)
-        .bind(&command.lifecycle.campaign_session_id)
-        .bind(&command.deletion_id)
-        .bind(to_i64(result_revision, "lifecycle revision")?)
-        .bind(prepared_export_digest)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| {
-            map_lifecycle_insert(error, "campaign deletion tombstone", &command.deletion_id)
-        })?;
-        let deleted = sqlx::query("DELETE FROM campaign_sessions WHERE id = $1 AND owner_key = $2")
-            .bind(&command.lifecycle.campaign_session_id)
-            .bind(owner_key)
-            .execute(&mut *transaction)
-            .await
-            .map_err(RepositoryError::Database)?;
-        if deleted.rows_affected() != 1 {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign session",
-                id: command.lifecycle.campaign_session_id.clone(),
-            });
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(outcome)
+        .map_err(|error| map_transaction_error(error, "campaign lifecycle", &campaign_id))
     }
 
-    pub async fn delete_expired_campaign_lifecycle_metadata(
-        &self,
-        limit: u16,
-    ) -> Result<(u64, u64, u64), RepositoryError> {
-        if limit == 0 || limit > 1_000 {
-            return invalid(
-                "campaign lifecycle cleanup",
-                "retention",
-                "cleanup limit must be between one and one thousand",
-            );
-        }
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let preparations = sqlx::query(
-            "WITH expired AS (
-                SELECT owner_key, campaign_session_id, deletion_id
-                FROM campaign_deletion_preparations
-                WHERE expires_at <= CURRENT_TIMESTAMP
-                ORDER BY expires_at, owner_key, campaign_session_id, deletion_id
-                LIMIT $1 FOR UPDATE SKIP LOCKED
-             )
-             DELETE FROM campaign_deletion_preparations p
-             USING expired e
-             WHERE p.owner_key = e.owner_key
-               AND p.campaign_session_id = e.campaign_session_id
-               AND p.deletion_id = e.deletion_id",
-        )
-        .bind(i64::from(limit))
-        .execute(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .rows_affected();
-        let receipts = sqlx::query(
-            "WITH expired AS (
-                SELECT owner_key, campaign_session_id, idempotency_key
-                FROM campaign_lifecycle_receipts
-                WHERE retention_delete_after <= CURRENT_TIMESTAMP
-                ORDER BY retention_delete_after, owner_key, campaign_session_id, idempotency_key
-                LIMIT $1 FOR UPDATE SKIP LOCKED
-             )
-             DELETE FROM campaign_lifecycle_receipts r
-             USING expired e
-             WHERE r.owner_key = e.owner_key
-               AND r.campaign_session_id = e.campaign_session_id
-               AND r.idempotency_key = e.idempotency_key",
-        )
-        .bind(i64::from(limit))
-        .execute(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .rows_affected();
-        let tombstones = sqlx::query(
-            "WITH expired AS (
-                SELECT owner_key, campaign_session_id, deletion_id
-                FROM campaign_deletion_tombstones
-                WHERE retention_delete_after <= CURRENT_TIMESTAMP
-                ORDER BY retention_delete_after, owner_key, campaign_session_id
-                LIMIT $1 FOR UPDATE SKIP LOCKED
-             )
-             DELETE FROM campaign_deletion_tombstones t
-             USING expired e
-             WHERE t.owner_key = e.owner_key
-               AND t.campaign_session_id = e.campaign_session_id
-               AND t.deletion_id = e.deletion_id",
-        )
-        .bind(i64::from(limit))
-        .execute(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .rows_affected();
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok((preparations, receipts, tombstones))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LockedCampaign {
-    campaign_revision: u64,
-    lifecycle_revision: u64,
-    lifecycle_state: CampaignLifecycleState,
-}
-
-impl LockedCampaign {
-    fn require_revision(self, expected: u64) -> Result<(), RepositoryError> {
-        if self.lifecycle_revision != expected {
-            return Err(RepositoryError::RevisionConflict {
-                entity: "campaign lifecycle",
-                id: "owner-scoped-campaign".to_owned(),
-                expected,
-                actual: self.lifecycle_revision,
-            });
-        }
-        Ok(())
-    }
-
-    fn require_state(self, expected: CampaignLifecycleState) -> Result<(), RepositoryError> {
-        if self.lifecycle_state != expected {
-            return invalid(
-                "campaign lifecycle",
-                "owner-scoped-campaign",
-                match expected {
-                    CampaignLifecycleState::Active => "campaign must be active",
-                    CampaignLifecycleState::Archived => "campaign must be archived",
-                },
-            );
-        }
-        Ok(())
-    }
-}
-
-async fn lock_owned_campaign(
-    transaction: &mut Transaction<'_, Postgres>,
-    owner_key: &str,
-    campaign_session_id: &str,
-) -> Result<LockedCampaign, RepositoryError> {
-    let row = sqlx::query(
-        "SELECT revision, lifecycle_revision, lifecycle_state
-         FROM campaign_sessions
-         WHERE id = $1 AND owner_key = $2
-         FOR UPDATE",
-    )
-    .bind(campaign_session_id)
-    .bind(owner_key)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?
-    .ok_or_else(|| RepositoryError::NotFound {
-        entity: "campaign session",
-        id: campaign_session_id.to_owned(),
-    })?;
-    let state: String = row
-        .try_get("lifecycle_state")
-        .map_err(RepositoryError::Database)?;
-    Ok(LockedCampaign {
-        campaign_revision: from_i64(
-            row.try_get("revision").map_err(RepositoryError::Database)?,
-            "campaign revision",
-        )?,
-        lifecycle_revision: from_i64(
-            row.try_get("lifecycle_revision")
-                .map_err(RepositoryError::Database)?,
-            "lifecycle revision",
-        )?,
-        lifecycle_state: CampaignLifecycleState::try_from(state.as_str())?,
-    })
-}
-
-async fn require_no_open_play_session(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<(), RepositoryError> {
-    let open: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM campaign_play_sessions
-         WHERE campaign_session_id = $1 AND state IN ('waiting', 'active') FOR UPDATE",
-    )
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?;
-    if open.is_some() {
-        return invalid(
-            "campaign lifecycle",
-            campaign_session_id,
-            "end the open play session before this lifecycle change",
-        );
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn advance_lifecycle(
-    transaction: &mut Transaction<'_, Postgres>,
-    owner_key: &str,
-    command: &CampaignLifecycleCommand,
-    locked: LockedCampaign,
-    next_state: CampaignLifecycleState,
-    payload: LifecycleAuditPayload,
-    play_session_id: Option<String>,
-    deleted: bool,
-) -> Result<CampaignLifecycleOutcome, RepositoryError> {
-    if !payload.validate() {
-        return invalid(
-            "campaign lifecycle audit",
-            &command.campaign_session_id,
-            "audit payload is invalid",
-        );
-    }
-    let next_revision =
-        locked
-            .lifecycle_revision
-            .checked_add(1)
-            .ok_or(RepositoryError::NumericRange {
-                field: "lifecycle revision",
-            })?;
-    let updated = match next_state {
-        CampaignLifecycleState::Active => sqlx::query(
-            "UPDATE campaign_sessions
-                 SET lifecycle_revision = $3, lifecycle_state = 'active',
-                     archived_at = NULL, retention_class = 'campaign_lifetime',
-                     retention_delete_after = NULL, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1 AND owner_key = $2 AND lifecycle_revision = $4",
-        )
-        .bind(&command.campaign_session_id)
-        .bind(owner_key)
-        .bind(to_i64(next_revision, "lifecycle revision")?)
-        .bind(to_i64(locked.lifecycle_revision, "lifecycle revision")?)
-        .execute(&mut **transaction)
-        .await
-        .map_err(RepositoryError::Database)?,
-        CampaignLifecycleState::Archived => sqlx::query(
-            "UPDATE campaign_sessions
-                 SET lifecycle_revision = $3, lifecycle_state = 'archived',
-                     archived_at = CURRENT_TIMESTAMP,
-                     retention_class = 'archived_owner_managed',
-                     retention_delete_after = NULL, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1 AND owner_key = $2 AND lifecycle_revision = $4",
-        )
-        .bind(&command.campaign_session_id)
-        .bind(owner_key)
-        .bind(to_i64(next_revision, "lifecycle revision")?)
-        .bind(to_i64(locked.lifecycle_revision, "lifecycle revision")?)
-        .execute(&mut **transaction)
-        .await
-        .map_err(RepositoryError::Database)?,
-    };
-    if updated.rows_affected() != 1 {
-        return Err(RepositoryError::RevisionConflict {
-            entity: "campaign lifecycle",
-            id: command.campaign_session_id.clone(),
-            expected: locked.lifecycle_revision,
-            actual: locked.lifecycle_revision.saturating_add(1),
-        });
-    }
-    let audit_id = format!("lifecycle-{}", uuid::Uuid::new_v4());
-    let payload_json = serialize("campaign lifecycle audit", &payload)?;
-    sqlx::query(
-        "INSERT INTO campaign_lifecycle_audits
-         (id, campaign_session_id, owner_key, schema_version,
-          lifecycle_revision, event_kind, payload_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
-    )
-    .bind(&audit_id)
-    .bind(&command.campaign_session_id)
-    .bind(owner_key)
-    .bind(i64::from(CAMPAIGN_LIFECYCLE_SCHEMA_VERSION))
-    .bind(to_i64(next_revision, "lifecycle revision")?)
-    .bind(payload.event_kind())
-    .bind(payload_json)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| map_lifecycle_insert(error, "campaign lifecycle audit", &audit_id))?;
-    Ok(CampaignLifecycleOutcome {
-        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
-        campaign_session_id: command.campaign_session_id.clone(),
-        lifecycle_revision: next_revision,
-        lifecycle_state: Some(next_state),
-        play_session_id,
-        deleted,
-    })
-}
-
-async fn replay_lifecycle_receipt(
-    transaction: &mut Transaction<'_, Postgres>,
-    owner_key: &str,
-    command: &CampaignLifecycleCommand,
-    command_kind: &str,
-    request_fingerprint: &Sha256Digest,
-) -> Result<Option<CampaignLifecycleOutcome>, RepositoryError> {
-    let row = sqlx::query(
-        "SELECT command_kind, request_fingerprint, expected_lifecycle_revision,
-                response_json
-         FROM campaign_lifecycle_receipts
-         WHERE owner_key = $1 AND campaign_session_id = $2 AND idempotency_key = $3
-         FOR UPDATE",
-    )
-    .bind(owner_key)
-    .bind(&command.campaign_session_id)
-    .bind(&command.idempotency_key)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let stored_kind: String = row
-        .try_get("command_kind")
-        .map_err(RepositoryError::Database)?;
-    let stored_fingerprint: String = row
-        .try_get("request_fingerprint")
-        .map_err(RepositoryError::Database)?;
-    let stored_expected = from_i64(
-        row.try_get("expected_lifecycle_revision")
-            .map_err(RepositoryError::Database)?,
-        "expected lifecycle revision",
-    )?;
-    if stored_kind != command_kind
-        || stored_fingerprint != request_fingerprint.as_str()
-        || stored_expected != command.expected_lifecycle_revision
-    {
-        return invalid(
-            "campaign lifecycle receipt",
-            &command.idempotency_key,
-            "idempotency key was reused for a different command",
-        );
-    }
-    let response_json: String = row
-        .try_get("response_json")
-        .map_err(RepositoryError::Database)?;
-    let outcome = serde_json::from_str(&response_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity: "campaign lifecycle receipt",
-            id: command.idempotency_key.clone(),
-            source,
-        }
-    })?;
-    Ok(Some(outcome))
-}
-
-async fn insert_lifecycle_receipt(
-    transaction: &mut Transaction<'_, Postgres>,
-    owner_key: &str,
-    command: &CampaignLifecycleCommand,
-    command_kind: &str,
-    request_fingerprint: &Sha256Digest,
-    outcome: &CampaignLifecycleOutcome,
-) -> Result<(), RepositoryError> {
-    let response_json = serialize("campaign lifecycle response", outcome)?;
-    sqlx::query(
-        "INSERT INTO campaign_lifecycle_receipts
-         (owner_key, campaign_session_id, idempotency_key, command_kind,
-          request_fingerprint, expected_lifecycle_revision,
-          result_lifecycle_revision, response_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    )
-    .bind(owner_key)
-    .bind(&command.campaign_session_id)
-    .bind(&command.idempotency_key)
-    .bind(command_kind)
-    .bind(request_fingerprint.as_str())
-    .bind(to_i64(
-        command.expected_lifecycle_revision,
-        "expected lifecycle revision",
-    )?)
-    .bind(to_i64(
-        outcome.lifecycle_revision,
-        "result lifecycle revision",
-    )?)
-    .bind(response_json)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| {
-        map_lifecycle_insert(
-            error,
-            "campaign lifecycle receipt",
-            &command.idempotency_key,
-        )
-    })?;
-    Ok(())
-}
-
-impl PostgresRepository {
-    /// Creates a consistent private snapshot without selecting operational
-    /// attempts. Only owner-selected presentation/artifact provenance is read.
     pub async fn export_campaign_private(
         &self,
         owner_key: &str,
         campaign_session_id: &str,
     ) -> Result<CampaignPrivateExportV1, RepositoryError> {
         validate_owner_campaign(owner_key, campaign_session_id)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
+        let campaigns = self.campaigns();
+        let store = self.store().clone();
+        let owner_owned = owner_key.to_owned();
+        let campaign_id_owned = campaign_session_id.to_owned();
+        let snapshot = self
+            .with_transaction(move |session| {
+                let campaigns = campaigns.clone();
+                let store = store.clone();
+                let owner = owner_owned.clone();
+                let campaign_id = campaign_id_owned.clone();
+                Box::pin(async move {
+                    let campaign = campaigns
+                        .find_one(doc! {
+                            "_id": &campaign_id,
+                            "owner_account_id": &owner,
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load campaign export", error))?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "campaign_session",
+                            id: campaign_id.clone(),
+                        })?;
+                    let documents = load_export_documents(&store, session, &campaign_id).await?;
+                    Ok(ExportSnapshot {
+                        campaign,
+                        documents,
+                    })
+                })
+            })
             .await
-            .map_err(RepositoryError::Database)?;
-        let campaign_row = sqlx::query(
-            "SELECT id, schema_version, revision, payload_json::text AS payload_json,
-                    owner_key, lifecycle_revision, lifecycle_state,
-                    archived_at::text AS archived_at, safety_policy_id,
-                    progression_policy_id, retention_class,
-                    retention_delete_after::text AS retention_delete_after,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM campaign_sessions
-             WHERE id = $1 AND owner_key = $2",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .ok_or_else(|| RepositoryError::NotFound {
-            entity: "campaign session",
-            id: campaign_session_id.to_owned(),
-        })?;
-        let campaign = exported_campaign_from_row(campaign_row)?;
-        let exported_at: String = sqlx::query_scalar("SELECT CURRENT_TIMESTAMP::text")
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(RepositoryError::Database)?;
-
-        let character_rows = sqlx::query(
-            "SELECT id, schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM characters WHERE campaign_session_id = $1 ORDER BY id",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let characters = character_rows
-            .into_iter()
-            .map(|row| exported_document_from_row(&row, "character"))
-            .collect::<Result<Vec<ExportedDocument<Character>>, _>>()?;
-
-        let draft_rows = sqlx::query(
-            "SELECT id, schema_version, revision, payload_json::text AS payload_json,
-                    expires_at_epoch_seconds, retention_delete_after_epoch_seconds,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_creation_drafts
-             WHERE campaign_session_id = $1 AND owner_key = $2
-             ORDER BY created_at, id",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let hero_drafts = draft_rows
-            .into_iter()
-            .map(exported_hero_draft_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let hero_row = sqlx::query(
-            "SELECT id, schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_characters
-             WHERE campaign_session_id = $1 AND owner_key = $2",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let hero_character = hero_row
-            .map(|row| exported_document_from_row(&row, "hero character"))
-            .transpose()?;
-
-        let turn_rows = sqlx::query(
-            "SELECT id, turn_number, actor_id, correlation_id, schema_version,
-                    payload_json::text AS payload_json, created_at::text AS created_at
-             FROM turn_audits WHERE campaign_session_id = $1
-             ORDER BY turn_number, id",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let turns = turn_rows
-            .into_iter()
-            .map(exported_turn_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let receipt_rows = sqlx::query(
-            "SELECT idempotency_key, command_kind, request_fingerprint,
-                    expected_revision, result_revision, audit_id, response_json,
-                    created_at::text AS created_at
-             FROM command_receipts WHERE campaign_session_id = $1
-             ORDER BY created_at, idempotency_key",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let command_receipts = receipt_rows
-            .into_iter()
-            .map(exported_command_receipt_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let text_receipt_rows = sqlx::query(
-            "SELECT schema_version, origin_turn_id, client_idempotency_key,
-                    presentation_id, generation_job_id, generation_attempt_id,
-                    version, source, config_digest, prompt_digest, policy_digest,
-                    output_digest, created_at::text AS created_at
-             FROM generated_text_presentation_receipts
-             WHERE campaign_session_id = $1
-             ORDER BY origin_turn_id, version, client_idempotency_key",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let text_presentation_receipts = text_receipt_rows
-            .into_iter()
-            .map(exported_text_presentation_receipt_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let typed_receipt_rows = sqlx::query(
-            "SELECT schema_version, client_idempotency_key, player_intent_digest,
-                    expected_campaign_revision, expected_encounter_revision,
-                    resolved_intent_json::text AS resolved_intent_json,
-                    interpretation_label,
-                    interpretation_evidence_json::text AS interpretation_evidence_json,
-                    state, origin_turn_id, event_sequence, result_campaign_revision,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM typed_intent_command_receipts
-             WHERE campaign_session_id = $1
-             ORDER BY created_at, client_idempotency_key",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let typed_intent_receipts = typed_receipt_rows
-            .into_iter()
-            .map(exported_typed_intent_receipt_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let hero_audit_rows = sqlx::query(
-            "SELECT id, subject_kind, subject_id, audit_kind, schema_version,
-                    subject_revision, occurred_at_epoch_seconds,
-                    payload_json::text AS payload_json, created_at::text AS created_at
-             FROM hero_audits WHERE campaign_session_id = $1
-             ORDER BY occurred_at_epoch_seconds, subject_revision, id",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let hero_audits = hero_audit_rows
-            .into_iter()
-            .map(exported_hero_audit_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let hero_receipt_rows = sqlx::query(
-            "SELECT scope_kind, scope_id, idempotency_key, command_kind,
-                    request_fingerprint, expected_revision, result_revision,
-                    audit_id, response_json, created_at::text AS created_at
-             FROM hero_command_receipts WHERE campaign_session_id = $1
-             ORDER BY created_at, scope_kind, scope_id, idempotency_key",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let hero_receipts = hero_receipt_rows
-            .into_iter()
-            .map(exported_hero_receipt_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let reward_rows = sqlx::query(
-            "SELECT encounter_id, character_id, encounter_revision,
-                    victory_event_sequence, reward_tier, experience_awarded,
-                    hero_audit_id, created_at::text AS created_at
-             FROM encounter_reward_claims WHERE campaign_session_id = $1
-             ORDER BY created_at, encounter_id",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let encounter_reward_claims = reward_rows
-            .into_iter()
-            .map(exported_reward_claim_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let pins_row = sqlx::query(
-            "SELECT seal_reason, payload_json::text AS payload_json,
-                    legacy_source_json::text AS legacy_source_json,
-                    created_at::text AS created_at
-             FROM campaign_content_pins WHERE campaign_session_id = $1",
-        )
-        .bind(campaign_session_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let content_pins = pins_row.map(exported_pins_from_row).transpose()?;
-
-        let play_rows = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key, schema_version, state,
-                    started_campaign_revision, ended_campaign_revision,
-                    opened_at::text AS opened_at, closed_at::text AS closed_at,
-                    close_reason
-             FROM campaign_play_sessions
-             WHERE campaign_session_id = $1 AND owner_key = $2
-             ORDER BY opened_at, id",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let play_sessions = play_rows
-            .into_iter()
-            .map(play_session_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let lifecycle_rows = sqlx::query(
-            "SELECT id, lifecycle_revision, event_kind,
-                    payload_json::text AS payload_json, created_at::text AS created_at
-             FROM campaign_lifecycle_audits
-             WHERE campaign_session_id = $1 AND owner_key = $2
-             ORDER BY lifecycle_revision, id",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let lifecycle_audits = lifecycle_rows
-            .into_iter()
-            .map(exported_lifecycle_audit_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let recap_rows = sqlx::query(
-            "SELECT id, campaign_session_id, schema_version, campaign_revision,
-                    idempotency_key, request_fingerprint, first_turn_number,
-                    last_turn_number, source_audit_count, source_audit_digest,
-                    template_id, body, body_digest, created_at::text AS created_at
-             FROM campaign_private_recaps
-             WHERE campaign_session_id = $1 AND owner_key = $2
-             ORDER BY campaign_revision, created_at, id",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let private_recaps = recap_rows
-            .into_iter()
-            .map(private_recap_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let presentation_rows = sqlx::query(
-            "SELECT id, origin_turn_id, generation_job_id, generation_attempt_id,
-                    client_idempotency_key, version, source, body, config_digest, prompt_digest,
-                    policy_digest, output_digest,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM generated_text_presentations
-             WHERE campaign_session_id = $1 AND selected
-             ORDER BY origin_turn_id, version, id",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let selected_text_presentations = presentation_rows
-            .into_iter()
-            .map(exported_presentation_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let asset_rows = sqlx::query(
-            "SELECT a.id, a.turn_id, a.asset_kind, a.provider, a.model,
-                    a.location, a.prompt_fingerprint,
-                    a.metadata_json::text AS metadata_json,
-                    a.created_at::text AS created_at
-             FROM generated_assets a
-             WHERE a.campaign_session_id = $1
-               AND EXISTS (
-                   SELECT 1 FROM generation_jobs j
-                   WHERE j.artifact_id = a.id
-                     AND j.campaign_session_id = a.campaign_session_id
-                     AND j.state = 'succeeded'
-                     AND j.retention_class = 'campaign_lifetime'
-               )
-             ORDER BY a.created_at, a.id",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let selected_generated_assets = asset_rows
-            .into_iter()
-            .map(exported_asset_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let exported = CampaignPrivateExportV1 {
-            schema_version: CAMPAIGN_EXPORT_SCHEMA_VERSION,
-            owner_key: owner_key.to_owned(),
-            exported_at,
-            campaign,
-            characters,
-            hero_drafts,
-            hero_character,
-            turns,
-            command_receipts,
-            text_presentation_receipts,
-            typed_intent_receipts,
-            hero_audits,
-            hero_receipts,
-            encounter_reward_claims,
-            content_pins,
-            play_sessions,
-            lifecycle_audits,
-            private_recaps,
-            selected_text_presentations,
-            selected_generated_assets,
-        };
-        exported.validate()?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
-        Ok(exported)
+            .map_err(|error| {
+                map_transaction_error(error, "campaign private export", campaign_session_id)
+            })?;
+        let export = export_from_snapshot(owner_key, snapshot)?;
+        export.validate()?;
+        Ok(export)
     }
 
     pub async fn export_campaign_canonical_json(
@@ -4821,10 +1129,42 @@ impl PostgresRepository {
         owner_key: &str,
         campaign_session_id: &str,
     ) -> Result<String, RepositoryError> {
-        let exported = self
+        let export = self
             .export_campaign_private(owner_key, campaign_session_id)
             .await?;
-        render_player_export(&exported)
+        let campaign: CampaignDocument = mongodb::bson::from_document(export.campaign.clone())?;
+        let state = CampaignLifecycleState::from_storage(&campaign.lifecycle.state, &campaign.id)?;
+        let mut lines = vec![
+            format!("# {}", campaign.title),
+            String::new(),
+            format!("Campaign: {}", campaign.id),
+            format!("State: {}", state_label(state)),
+            format!("Revision: {}", nonnegative_u64(campaign.revision)),
+            format!("Members: {}", campaign.members.len()),
+            format!("Assigned characters: {}", export.character_instances.len()),
+            format!("Play sessions: {}", export.play_sessions.len()),
+            format!("Turns: {}", export.turn_events.len()),
+        ];
+        for body in export
+            .selected_generated_presentations
+            .iter()
+            .filter(|document| document.get_str("presentation_type") == Ok("private_recap"))
+            .filter_map(|document| document.get_str("body").ok())
+        {
+            lines.push(String::new());
+            lines.push("## Private recap".to_owned());
+            lines.push(String::new());
+            lines.push(body.to_owned());
+        }
+        let readable = lines.join("\n");
+        if readable.len() > MAX_PLAYER_EXPORT_BYTES {
+            return invalid(
+                "campaign player-readable export",
+                campaign_session_id,
+                "rendered export exceeds the supported size",
+            );
+        }
+        Ok(readable)
     }
 
     pub async fn prepare_campaign_deletion(
@@ -4839,100 +1179,2248 @@ impl PostgresRepository {
             return invalid(
                 "campaign deletion preparation",
                 deletion_id,
-                "expected lifecycle revision and deletion id are invalid",
+                "deletion id or expected lifecycle revision is invalid",
             );
         }
-        let exported = self
+        let preparations = self
+            .store()
+            .collection::<DeletionPreparationDocument>(CollectionName::DeletionPreparations);
+        if let Some(existing) = preparations
+            .find_one(doc! { "deletion_id": deletion_id })
+            .await
+            .map_err(|error| mongo_error("load campaign deletion preparation replay", error))?
+        {
+            if existing.owner_account_id != owner_key
+                || existing.scope_kind != "campaign"
+                || existing.scope_id != campaign_session_id
+            {
+                return Err(RepositoryError::AlreadyExists {
+                    entity: "campaign deletion preparation",
+                    id: deletion_id.to_owned(),
+                });
+            }
+            if existing.expires_at > DateTime::now() {
+                let current = require_owned_campaign(self, owner_key, campaign_session_id).await?;
+                if nonnegative_u64(existing.lifecycle_revision) != expected_lifecycle_revision
+                    || existing.campaign_revision != current.revision
+                    || existing.lifecycle_revision != current.lifecycle_revision
+                    || current.lifecycle.state != "archived"
+                    || current.current_play_session_id.is_some()
+                    || digest(existing.canonical_export_json.as_bytes()) != existing.digest
+                {
+                    return Err(RepositoryError::RevisionConflict {
+                        entity: "campaign deletion preparation",
+                        id: deletion_id.to_owned(),
+                        expected: expected_lifecycle_revision,
+                        actual: nonnegative_u64(existing.lifecycle_revision),
+                    });
+                }
+                return prepared_deletion_from_document(existing);
+            }
+        }
+        let export = self
             .export_campaign_private(owner_key, campaign_session_id)
             .await?;
-        let canonical_export_json = exported.canonical_json()?;
+        let campaign: CampaignDocument = mongodb::bson::from_document(export.campaign.clone())?;
+        if campaign.lifecycle.state != "archived"
+            || nonnegative_u64(campaign.lifecycle_revision) != expected_lifecycle_revision
+            || campaign.current_play_session_id.is_some()
+        {
+            return invalid(
+                "campaign deletion preparation",
+                campaign_session_id,
+                "campaign must be archived, closed, and at the expected revision",
+            );
+        }
+        let canonical_export_json = export.canonical_json()?;
         let canonical_export_digest = digest(canonical_export_json.as_bytes());
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let locked = lock_owned_campaign(&mut transaction, owner_key, campaign_session_id).await?;
-        locked.require_revision(expected_lifecycle_revision)?;
-        locked.require_state(CampaignLifecycleState::Archived)?;
-        require_no_open_play_session(&mut transaction, campaign_session_id).await?;
-        if locked.campaign_revision != exported.campaign.document.revision
-            || locked.lifecycle_revision != exported.campaign.lifecycle_revision
-        {
-            return invalid(
-                "campaign deletion preparation",
-                deletion_id,
-                "campaign changed while its delete export was being prepared",
-            );
-        }
-        sqlx::query(
-            "INSERT INTO campaign_deletion_preparations
-             (owner_key, campaign_session_id, deletion_id, campaign_revision,
-              lifecycle_revision, canonical_export_digest, canonical_export_json)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (owner_key, campaign_session_id, deletion_id) DO NOTHING",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .bind(deletion_id)
-        .bind(to_i64(locked.campaign_revision, "campaign revision")?)
-        .bind(to_i64(locked.lifecycle_revision, "lifecycle revision")?)
-        .bind(canonical_export_digest.as_str())
-        .bind(&canonical_export_json)
-        .execute(&mut *transaction)
+        let now = DateTime::now();
+        let expires_at = add_seconds(now, DELETION_PREPARATION_SECONDS);
+        let preparation_key = format!(
+            "deletion-preparation:{:x}",
+            Sha256::digest(format!("{owner_key}\0{deletion_id}").as_bytes())
+        );
+        let preparation = DeletionPreparationDocument {
+            id: preparation_key.clone(),
+            schema_version: 1,
+            deletion_id: deletion_id.to_owned(),
+            owner_account_id: owner_key.to_owned(),
+            scope_kind: "campaign".to_owned(),
+            scope_id: campaign_session_id.to_owned(),
+            campaign_revision: campaign.revision,
+            lifecycle_revision: campaign.lifecycle_revision,
+            digest: canonical_export_digest.clone(),
+            canonical_export_json: canonical_export_json.clone(),
+            expires_at,
+            purge_at: expires_at,
+            created_at: now,
+        };
+        let campaigns = self.campaigns();
+        let store = self.store().clone();
+        let campaign_id = campaign_session_id.to_owned();
+        let owner = owner_key.to_owned();
+        let preparation_for_write = preparation.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let store = store.clone();
+            let preparations = preparations.clone();
+            let campaign_id = campaign_id.clone();
+            let owner = owner.clone();
+            let preparation = preparation_for_write.clone();
+            Box::pin(async move {
+                let locked =
+                    load_owned_gm_campaign(&campaigns, session, &owner, &campaign_id).await?;
+                if locked.lifecycle.state != "archived"
+                    || locked.current_play_session_id.is_some()
+                    || locked.revision != preparation.campaign_revision
+                    || locked.lifecycle_revision != preparation.lifecycle_revision
+                {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_lifecycle",
+                        id: campaign_id,
+                        expected: nonnegative_u64(preparation.lifecycle_revision),
+                        actual: nonnegative_u64(locked.lifecycle_revision),
+                    });
+                }
+                require_no_open_campaign_runtime(&store, session, &locked.id).await?;
+                preparations
+                    .replace_one(doc! { "_id": &preparation.id }, preparation)
+                    .upsert(true)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("prepare campaign deletion", error))?;
+                Ok(())
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?;
-        let row = sqlx::query(
-            "SELECT campaign_revision, lifecycle_revision, canonical_export_digest,
-                    canonical_export_json, expires_at::text AS expires_at
-             FROM campaign_deletion_preparations
-             WHERE owner_key = $1 AND campaign_session_id = $2 AND deletion_id = $3",
-        )
-        .bind(owner_key)
-        .bind(campaign_session_id)
-        .bind(deletion_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let stored_digest: String = row
-            .try_get("canonical_export_digest")
-            .map_err(RepositoryError::Database)?;
-        let stored_json: String = row
-            .try_get("canonical_export_json")
-            .map_err(RepositoryError::Database)?;
-        let stored_campaign_revision = from_i64(
-            row.try_get("campaign_revision")
-                .map_err(RepositoryError::Database)?,
-            "prepared campaign revision",
-        )?;
-        let stored_lifecycle_revision = from_i64(
-            row.try_get("lifecycle_revision")
-                .map_err(RepositoryError::Database)?,
-            "prepared lifecycle revision",
-        )?;
-        if stored_digest != canonical_export_digest.as_str()
-            || stored_json != canonical_export_json
-            || stored_campaign_revision != locked.campaign_revision
-            || stored_lifecycle_revision != locked.lifecycle_revision
-        {
-            return invalid(
-                "campaign deletion preparation",
-                deletion_id,
-                "deletion id was already used for another snapshot",
-            );
-        }
-        let prepared = PreparedCampaignDeletion {
+        .map_err(|error| {
+            map_transaction_error(error, "campaign deletion preparation", deletion_id)
+        })?;
+        Ok(PreparedCampaignDeletion {
             schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
             campaign_session_id: campaign_session_id.to_owned(),
             deletion_id: deletion_id.to_owned(),
-            campaign_revision: stored_campaign_revision,
-            lifecycle_revision: stored_lifecycle_revision,
+            campaign_revision: nonnegative_u64(campaign.revision),
+            lifecycle_revision: nonnegative_u64(campaign.lifecycle_revision),
             canonical_export_digest,
-            canonical_export_json: stored_json,
-            expires_at: row
-                .try_get("expires_at")
-                .map_err(RepositoryError::Database)?,
-        };
-        transaction
-            .commit()
+            canonical_export_json,
+            expires_at: date_string(expires_at, "deletion_preparations")?,
+        })
+    }
+
+    pub async fn delete_archived_campaign(
+        &self,
+        owner_key: &str,
+        command: &DeleteCampaignCommand,
+    ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
+        validate_owner(owner_key)?;
+        command.lifecycle.validate()?;
+        if !command.confirm_permanent_delete || !is_valid_opaque_id(&command.deletion_id) {
+            return invalid(
+                "campaign deletion",
+                &command.deletion_id,
+                "explicit confirmation and a valid deletion id are required",
+            );
+        }
+        let fingerprint = command_fingerprint("campaign_delete", command)?;
+        if let Some(replay) = self
+            .load_retained_lifecycle_replay(
+                owner_key,
+                &command.lifecycle.campaign_session_id,
+                &command.lifecycle.idempotency_key,
+                "campaign_delete",
+                &fingerprint,
+            )
+            .await?
+        {
+            return Ok(replay);
+        }
+        let campaigns = self.campaigns();
+        let store = self.store().clone();
+        let receipts = self
+            .store()
+            .collection::<LifecycleReceiptDocument>(CollectionName::CommandReceipts);
+        let preparations = self
+            .store()
+            .collection::<DeletionPreparationDocument>(CollectionName::DeletionPreparations);
+        let tombstones = self
+            .store()
+            .collection::<DeletionTombstoneDocument>(CollectionName::DeletionTombstones);
+        let command_owned = command.clone();
+        let owner_owned = owner_key.to_owned();
+        let campaign_id = command.lifecycle.campaign_session_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let store = store.clone();
+            let receipts = receipts.clone();
+            let preparations = preparations.clone();
+            let tombstones = tombstones.clone();
+            let command = command_owned.clone();
+            let owner = owner_owned.clone();
+            let fingerprint = fingerprint.clone();
+            Box::pin(async move {
+                if let Some(replay) = load_lifecycle_replay(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.lifecycle.campaign_session_id,
+                    &command.lifecycle.idempotency_key,
+                    "campaign_delete",
+                    &fingerprint,
+                )
+                .await?
+                {
+                    return Ok(replay);
+                }
+                let campaign = load_owned_gm_campaign(
+                    &campaigns,
+                    session,
+                    &owner,
+                    &command.lifecycle.campaign_session_id,
+                )
+                .await?;
+                require_lifecycle_revision(
+                    &campaign,
+                    command.lifecycle.expected_lifecycle_revision,
+                )?;
+                if campaign.lifecycle.state != "archived"
+                    || campaign.current_play_session_id.is_some()
+                {
+                    return Err(PersistenceError::AlreadyExists {
+                        entity: "campaign_deletion",
+                        id: campaign.id,
+                    });
+                }
+                require_no_open_campaign_runtime(&store, session, &campaign.id).await?;
+                let preparation = preparations
+                    .find_one(doc! {
+                        "deletion_id": &command.deletion_id,
+                        "owner_account_id": &owner,
+                        "scope_kind": "campaign",
+                        "scope_id": &campaign.id,
+                        "expires_at": { "$gt": DateTime::now() },
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load campaign deletion preparation", error)
+                    })?
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "campaign_deletion_preparation",
+                        id: command.deletion_id.clone(),
+                    })?;
+                if preparation.campaign_revision != campaign.revision
+                    || preparation.lifecycle_revision != campaign.lifecycle_revision
+                    || digest(preparation.canonical_export_json.as_bytes()) != preparation.digest
+                {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_deletion_preparation",
+                        id: command.deletion_id.clone(),
+                        expected: nonnegative_u64(preparation.lifecycle_revision),
+                        actual: nonnegative_u64(campaign.lifecycle_revision),
+                    });
+                }
+                require_external_cleanup_complete(&store, session, &campaign.id).await?;
+                let prepared_export: CampaignPrivateExportV1 =
+                    serde_json::from_str(&preparation.canonical_export_json).map_err(|_| {
+                        PersistenceError::SchemaDrift {
+                            collection: "deletion_preparations".to_owned(),
+                            detail: "stored canonical campaign export is invalid".to_owned(),
+                        }
+                    })?;
+                let current_documents =
+                    load_export_documents(&store, session, &campaign.id).await?;
+                let mut current_export = export_from_snapshot(
+                    &owner,
+                    ExportSnapshot {
+                        campaign: campaign.clone(),
+                        documents: current_documents,
+                    },
+                )
+                .map_err(repository_to_persistence)?;
+                current_export.exported_at = prepared_export.exported_at;
+                let current_digest = current_export
+                    .canonical_digest()
+                    .map_err(repository_to_persistence)?;
+                if current_digest != preparation.digest {
+                    return Err(PersistenceError::AlreadyExists {
+                        entity: "stale_campaign_deletion_preparation",
+                        id: command.deletion_id.clone(),
+                    });
+                }
+                let result_revision =
+                    next_revision(campaign.lifecycle_revision, "lifecycle revision")?;
+                let outcome = CampaignLifecycleOutcome {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: campaign.id.clone(),
+                    lifecycle_revision: nonnegative_u64(result_revision),
+                    lifecycle_state: None,
+                    play_session_id: None,
+                    deleted: true,
+                };
+                insert_lifecycle_receipt(
+                    &receipts,
+                    session,
+                    &owner,
+                    &command.lifecycle,
+                    "campaign_delete",
+                    fingerprint,
+                    &outcome,
+                    true,
+                )
+                .await?;
+                let now = DateTime::now();
+                tombstones
+                    .insert_one(DeletionTombstoneDocument {
+                        id: format!("deletion-tombstone:{}", Uuid::new_v4()),
+                        schema_version: 1,
+                        entity_kind: "campaign".to_owned(),
+                        entity_id: campaign.id.clone(),
+                        deletion_id: command.deletion_id.clone(),
+                        digest: preparation.digest,
+                        owner_account_id: owner.clone(),
+                        deleted_lifecycle_revision: result_revision,
+                        deleted_at: now,
+                        purge_at: add_seconds(now, DELETION_TOMBSTONE_SECONDS),
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("write campaign deletion tombstone", error)
+                    })?;
+                cascade_campaign_documents(
+                    &store,
+                    session,
+                    &campaign.id,
+                    &command.lifecycle.idempotency_key,
+                )
+                .await?;
+                let deleted = campaigns
+                    .delete_one(doc! {
+                        "_id": &campaign.id,
+                        "owner_account_id": &owner,
+                        "lifecycle_revision": campaign.lifecycle_revision,
+                        "lifecycle.state": "archived",
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("delete campaign root", error))?;
+                if deleted.deleted_count != 1 {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign_lifecycle",
+                        id: campaign.id,
+                        expected: command.lifecycle.expected_lifecycle_revision,
+                        actual: nonnegative_u64(campaign.lifecycle_revision),
+                    });
+                }
+                Ok(outcome)
+            })
+        })
+        .await
+        .map_err(|error| map_transaction_error(error, "campaign deletion", &campaign_id))
+    }
+
+    pub async fn delete_expired_campaign_lifecycle_metadata(
+        &self,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
+        if limit == 0 || limit > 1_000 {
+            return invalid(
+                "campaign lifecycle cleanup",
+                &limit.to_string(),
+                "limit is outside the supported range",
+            );
+        }
+        let now = DateTime::now();
+        let mut deleted = 0_u64;
+        for collection in [
+            CollectionName::DeletionPreparations,
+            CollectionName::DeletionTombstones,
+        ] {
+            let documents = self.store().document_collection(collection);
+            let mut cursor = documents
+                .find(doc! { "purge_at": { "$lte": now } })
+                .projection(doc! { "_id": 1 })
+                .sort(doc! { "purge_at": 1, "_id": 1 })
+                .limit(i64::from(limit))
+                .await
+                .map_err(|error| mongo_error("find expired lifecycle metadata", error))?;
+            let mut ids = Vec::new();
+            while cursor
+                .advance()
+                .await
+                .map_err(|error| mongo_error("read expired lifecycle metadata", error))?
+            {
+                let document = cursor
+                    .deserialize_current()
+                    .map_err(|error| mongo_error("decode expired lifecycle metadata", error))?;
+                if let Ok(id) = document.get_str("_id") {
+                    ids.push(id.to_owned());
+                }
+            }
+            if !ids.is_empty() {
+                deleted = deleted.saturating_add(
+                    documents
+                        .delete_many(doc! { "_id": { "$in": ids } })
+                        .await
+                        .map_err(|error| mongo_error("delete expired lifecycle metadata", error))?
+                        .deleted_count,
+                );
+            }
+        }
+        Ok(deleted)
+    }
+
+    pub async fn restore_campaign_export(
+        &self,
+        owner_key: &str,
+        command: &RestoreCampaignExportCommand,
+    ) -> Result<CampaignLifecycleOutcome, RepositoryError> {
+        validate_owner(owner_key)?;
+        if command.schema_version != CAMPAIGN_LIFECYCLE_SCHEMA_VERSION
+            || !is_valid_opaque_id(&command.idempotency_key)
+            || command.canonical_export_json.is_empty()
+            || command.canonical_export_json.len() > MAX_PLAYER_EXPORT_BYTES
+        {
+            return invalid(
+                "campaign export restore",
+                &command.idempotency_key,
+                "restore command is invalid or exceeds the size limit",
+            );
+        }
+        let export: CampaignPrivateExportV1 = serde_json::from_str(&command.canonical_export_json)
+            .map_err(|source| RepositoryError::InvalidStoredData {
+                entity: "campaign private export",
+                id: command.idempotency_key.clone(),
+                source,
+            })?;
+        export.validate()?;
+        if export.owner_key != owner_key
+            || export.canonical_json()? != command.canonical_export_json
+        {
+            return invalid(
+                "campaign export restore",
+                &command.idempotency_key,
+                "export owner or canonical representation does not match",
+            );
+        }
+        let campaign: CampaignDocument = mongodb::bson::from_document(export.campaign.clone())?;
+        let campaign_id = campaign.id.clone();
+        let fingerprint = command_fingerprint("campaign_restore_import", command)?;
+        if let Some(replay) = self
+            .load_retained_lifecycle_replay(
+                owner_key,
+                &campaign_id,
+                &command.idempotency_key,
+                "campaign_restore_import",
+                &fingerprint,
+            )
+            .await?
+        {
+            return Ok(replay);
+        }
+        if self
+            .campaigns()
+            .find_one(doc! { "_id": &campaign_id })
+            .projection(doc! { "_id": 1 })
             .await
-            .map_err(RepositoryError::Database)?;
-        Ok(prepared)
+            .map_err(|error| mongo_error("check campaign restore target", error))?
+            .is_some()
+        {
+            return Err(RepositoryError::AlreadyExists {
+                entity: "campaign_session",
+                id: campaign_id,
+            });
+        }
+        let store = self.store().clone();
+        let receipts = self
+            .store()
+            .collection::<LifecycleReceiptDocument>(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let campaign_collection = self.campaigns();
+        let owner = owner_key.to_owned();
+        let command_owned = command.clone();
+        let export_owned = export.clone();
+        let campaign_for_insert = campaign.clone();
+        let campaign_id_for_error = campaign.id.clone();
+        let closed_play_session_ids = export
+            .play_sessions
+            .iter()
+            .filter(|document| matches!(document.get_str("state"), Ok("waiting" | "active")))
+            .filter_map(|document| document.get_str("_id").ok().map(str::to_owned))
+            .collect::<Vec<_>>();
+        self.with_transaction(move |session| {
+            let store = store.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let campaign_collection = campaign_collection.clone();
+            let owner = owner.clone();
+            let command = command_owned.clone();
+            let export = export_owned.clone();
+            let campaign = campaign_for_insert.clone();
+            let fingerprint = fingerprint.clone();
+            let closed_play_session_ids = closed_play_session_ids.clone();
+            Box::pin(async move {
+                if let Some(replay) = load_lifecycle_replay(
+                    &receipts,
+                    session,
+                    &owner,
+                    &campaign.id,
+                    &command.idempotency_key,
+                    "campaign_restore_import",
+                    &fingerprint,
+                )
+                .await?
+                {
+                    return Ok(replay);
+                }
+                if campaign_collection
+                    .find_one(doc! { "_id": &campaign.id })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check campaign restore transaction", error)
+                    })?
+                    .is_some()
+                {
+                    return Err(PersistenceError::AlreadyExists {
+                        entity: "campaign_session",
+                        id: campaign.id,
+                    });
+                }
+                restore_export_documents(&store, session, &export).await?;
+                let mut restored_campaign = campaign;
+                restored_campaign.current_play_session_id = None;
+                restored_campaign.lifecycle_revision =
+                    next_revision(restored_campaign.lifecycle_revision, "lifecycle revision")?;
+                restored_campaign.updated_at = DateTime::now();
+                campaign_collection
+                    .insert_one(restored_campaign.clone())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("restore campaign root", error))?;
+                let restored_state = match restored_campaign.lifecycle.state.as_str() {
+                    "open" => CampaignLifecycleState::Active,
+                    "archived" => CampaignLifecycleState::Archived,
+                    _ => {
+                        return Err(PersistenceError::SchemaDrift {
+                            collection: "campaigns".to_owned(),
+                            detail: "restored campaign lifecycle is invalid".to_owned(),
+                        });
+                    }
+                };
+                let outcome = CampaignLifecycleOutcome {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: restored_campaign.id.clone(),
+                    lifecycle_revision: nonnegative_u64(restored_campaign.lifecycle_revision),
+                    lifecycle_state: Some(restored_state),
+                    play_session_id: None,
+                    deleted: false,
+                };
+                insert_lifecycle_audit(
+                    &audits,
+                    session,
+                    &owner,
+                    &outcome,
+                    LifecycleAuditPayload::RestoreImported {
+                        closed_play_session_ids,
+                    },
+                )
+                .await?;
+                insert_lifecycle_receipt(
+                    &receipts,
+                    session,
+                    &owner,
+                    &CampaignLifecycleCommand {
+                        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                        campaign_session_id: restored_campaign.id,
+                        expected_lifecycle_revision: nonnegative_u64(
+                            restored_campaign.lifecycle_revision.saturating_sub(1),
+                        ),
+                        idempotency_key: command.idempotency_key,
+                    },
+                    "campaign_restore_import",
+                    fingerprint,
+                    &outcome,
+                    true,
+                )
+                .await?;
+                Ok(outcome)
+            })
+        })
+        .await
+        .map_err(|error| {
+            map_transaction_error(error, "campaign export restore", &campaign_id_for_error)
+        })
+    }
+
+    async fn load_retained_lifecycle_replay(
+        &self,
+        owner_key: &str,
+        campaign_id: &str,
+        idempotency_key: &str,
+        command_kind: &'static str,
+        fingerprint: &Sha256Digest,
+    ) -> Result<Option<CampaignLifecycleOutcome>, RepositoryError> {
+        let receipt = self
+            .store()
+            .collection::<LifecycleReceiptDocument>(CollectionName::CommandReceipts)
+            .find_one(doc! {
+                "scope_kind": "campaign",
+                "scope_id": campaign_id,
+                "actor_account_id": owner_key,
+                "idempotency_key": idempotency_key,
+                "state": "committed",
+            })
+            .await
+            .map_err(|error| mongo_error("load retained lifecycle receipt", error))?;
+        receipt
+            .map(|receipt| decode_lifecycle_replay(receipt, command_kind, fingerprint))
+            .transpose()
+    }
+}
+
+pub(crate) fn campaign_summary_from_document(
+    campaign: CampaignDocument,
+) -> Result<CampaignSummary, RepositoryError> {
+    if campaign.schema_version != 1
+        || campaign.revision <= 0
+        || campaign.lifecycle_revision <= 0
+        || campaign.session.id != campaign.id
+        || campaign.session.title != campaign.title
+    {
+        return invalid(
+            "campaign session",
+            &campaign.id,
+            "stored campaign envelope is inconsistent",
+        );
+    }
+    campaign
+        .session
+        .validate()
+        .map_err(|source| RepositoryError::CoreValidation {
+            entity: "campaign session",
+            id: campaign.id.clone(),
+            source,
+        })?;
+    Ok(CampaignSummary {
+        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+        campaign_session_id: campaign.id.clone(),
+        owner_key: campaign.owner_account_id.clone(),
+        title: campaign.title,
+        campaign_revision: nonnegative_u64(campaign.revision),
+        lifecycle_revision: nonnegative_u64(campaign.lifecycle_revision),
+        lifecycle_state: CampaignLifecycleState::from_storage(
+            &campaign.lifecycle.state,
+            &campaign.id,
+        )?,
+        archived_at: campaign
+            .lifecycle
+            .archived_at
+            .map(|value| date_string(value, "campaigns"))
+            .transpose()?,
+        safety_policy_id: campaign.safety_policy_id,
+        progression_policy_id: campaign.progression_policy_id,
+        retention_class: campaign.retention_class,
+        retention_delete_after: campaign
+            .retention_delete_after
+            .map(|value| date_string(value, "campaigns"))
+            .transpose()?,
+        open_play_session_id: campaign.current_play_session_id,
+        created_at: date_string(campaign.created_at, "campaigns")?,
+        updated_at: date_string(campaign.updated_at, "campaigns")?,
+    })
+}
+
+fn prepared_deletion_from_document(
+    document: DeletionPreparationDocument,
+) -> Result<PreparedCampaignDeletion, RepositoryError> {
+    if document.schema_version != 1
+        || document.scope_kind != "campaign"
+        || document.campaign_revision <= 0
+        || document.lifecycle_revision <= 0
+        || document.canonical_export_json.len() > MAX_PLAYER_EXPORT_BYTES
+        || digest(document.canonical_export_json.as_bytes()) != document.digest
+    {
+        return invalid(
+            "campaign deletion preparation",
+            &document.deletion_id,
+            "stored deletion preparation is invalid",
+        );
+    }
+    Ok(PreparedCampaignDeletion {
+        schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+        campaign_session_id: document.scope_id,
+        deletion_id: document.deletion_id,
+        campaign_revision: nonnegative_u64(document.campaign_revision),
+        lifecycle_revision: nonnegative_u64(document.lifecycle_revision),
+        canonical_export_digest: document.digest,
+        canonical_export_json: document.canonical_export_json,
+        expires_at: date_string(document.expires_at, "deletion_preparations")?,
+    })
+}
+
+fn export_collection_specs(
+    campaign_id: &str,
+) -> Vec<(&'static str, CollectionName, Document, Document)> {
+    vec![
+        (
+            "character_instances",
+            CollectionName::CampaignCharacterInstances,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "play_sessions",
+            CollectionName::PlaySessions,
+            doc! { "campaign_id": campaign_id },
+            doc! { "opened_at": 1, "_id": 1 },
+        ),
+        (
+            "turn_events",
+            CollectionName::TurnEvents,
+            doc! { "campaign_id": campaign_id },
+            doc! { "sequence": 1, "_id": 1 },
+        ),
+        (
+            "command_receipts",
+            CollectionName::CommandReceipts,
+            doc! {
+                "state": "committed",
+                "$or": [
+                    { "campaign_id": campaign_id },
+                    { "scope_kind": "campaign", "scope_id": campaign_id },
+                ],
+            },
+            doc! { "created_at": 1, "_id": 1 },
+        ),
+        (
+            "audit_events",
+            CollectionName::AuditEvents,
+            doc! { "$or": [{ "campaign_id": campaign_id }, { "scope_kind": "campaign", "scope_id": campaign_id }] },
+            doc! { "created_at": 1, "_id": 1 },
+        ),
+        (
+            "campaign_enemy_instances",
+            CollectionName::CampaignEnemyInstances,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "campaign_events",
+            CollectionName::CampaignEvents,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "encounters",
+            CollectionName::Encounters,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "bde_ledger",
+            CollectionName::BdeLedger,
+            doc! { "campaign_id": campaign_id },
+            doc! { "created_at": 1, "_id": 1 },
+        ),
+        (
+            "private_inspiration_participants",
+            CollectionName::PrivateInspirationParticipants,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "private_inspiration_sources",
+            CollectionName::PrivateInspirationSources,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "private_inspiration_consents",
+            CollectionName::PrivateInspirationConsents,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "private_inspiration_vetoes",
+            CollectionName::PrivateInspirationVetoes,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "private_inspiration_selections",
+            CollectionName::PrivateInspirationSelections,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "private_inspiration_work",
+            CollectionName::PrivateInspirationWork,
+            doc! { "campaign_id": campaign_id },
+            doc! { "_id": 1 },
+        ),
+        (
+            "selected_generated_presentations",
+            CollectionName::GeneratedPresentations,
+            doc! { "campaign_id": campaign_id, "selected": true },
+            doc! { "created_at": 1, "_id": 1 },
+        ),
+        (
+            "selected_generated_assets",
+            CollectionName::GeneratedAssets,
+            doc! { "campaign_id": campaign_id, "state": { "$in": ["published", "selected", "ready"] } },
+            doc! { "created_at": 1, "_id": 1 },
+        ),
+    ]
+}
+
+async fn find_documents(
+    collection: &Collection<Document>,
+    session: &mut ClientSession,
+    filter: Document,
+    sort: Document,
+    operation: &'static str,
+) -> Result<Vec<Document>, PersistenceError> {
+    let mut cursor = collection
+        .find(filter)
+        .sort(sort)
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo(operation, error))?;
+    let mut documents = Vec::new();
+    while let Some(document) = cursor
+        .next(&mut *session)
+        .await
+        .transpose()
+        .map_err(|error| PersistenceError::mongo(operation, error))?
+    {
+        documents.push(document);
+    }
+    Ok(documents)
+}
+
+async fn load_export_documents(
+    store: &crate::persistence::MongoStore,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<BTreeMap<&'static str, Vec<Document>>, PersistenceError> {
+    let mut documents = BTreeMap::new();
+    for (key, collection, filter, sort) in export_collection_specs(campaign_id) {
+        documents.insert(
+            key,
+            find_documents(
+                &store.document_collection(collection),
+                session,
+                filter,
+                sort,
+                "read campaign export collection",
+            )
+            .await?,
+        );
+    }
+    Ok(documents)
+}
+
+fn export_from_snapshot(
+    owner_key: &str,
+    snapshot: ExportSnapshot,
+) -> Result<CampaignPrivateExportV1, RepositoryError> {
+    let campaign = mongodb::bson::to_document(&snapshot.campaign)?;
+    let mut documents = snapshot.documents;
+    Ok(CampaignPrivateExportV1 {
+        schema_version: CAMPAIGN_EXPORT_SCHEMA_VERSION,
+        owner_key: owner_key.to_owned(),
+        exported_at: date_string(DateTime::now(), "campaign export")?,
+        campaign,
+        character_instances: documents.remove("character_instances").unwrap_or_default(),
+        play_sessions: documents.remove("play_sessions").unwrap_or_default(),
+        turn_events: documents.remove("turn_events").unwrap_or_default(),
+        command_receipts: documents.remove("command_receipts").unwrap_or_default(),
+        audit_events: documents.remove("audit_events").unwrap_or_default(),
+        campaign_enemy_instances: documents
+            .remove("campaign_enemy_instances")
+            .unwrap_or_default(),
+        campaign_events: documents.remove("campaign_events").unwrap_or_default(),
+        encounters: documents.remove("encounters").unwrap_or_default(),
+        bde_ledger: documents.remove("bde_ledger").unwrap_or_default(),
+        private_inspiration_participants: documents
+            .remove("private_inspiration_participants")
+            .unwrap_or_default(),
+        private_inspiration_sources: documents
+            .remove("private_inspiration_sources")
+            .unwrap_or_default(),
+        private_inspiration_consents: documents
+            .remove("private_inspiration_consents")
+            .unwrap_or_default(),
+        private_inspiration_vetoes: documents
+            .remove("private_inspiration_vetoes")
+            .unwrap_or_default(),
+        private_inspiration_selections: documents
+            .remove("private_inspiration_selections")
+            .unwrap_or_default(),
+        private_inspiration_work: documents
+            .remove("private_inspiration_work")
+            .unwrap_or_default(),
+        selected_generated_presentations: documents
+            .remove("selected_generated_presentations")
+            .unwrap_or_default(),
+        selected_generated_assets: documents
+            .remove("selected_generated_assets")
+            .unwrap_or_default(),
+    })
+}
+
+fn validate_export(export: &CampaignPrivateExportV1) -> Result<(), RepositoryError> {
+    if export.schema_version != CAMPAIGN_EXPORT_SCHEMA_VERSION
+        || !is_valid_opaque_id(&export.owner_key)
+        || DateTime::parse_rfc3339_str(&export.exported_at).is_err()
+    {
+        return invalid(
+            "campaign private export",
+            &export.owner_key,
+            "schema, owner, or export timestamp is invalid",
+        );
+    }
+    let campaign: CampaignDocument = mongodb::bson::from_document(export.campaign.clone())
+        .map_err(RepositoryError::BsonDecoding)?;
+    let member_ids = campaign
+        .members
+        .iter()
+        .map(|member| member.account_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if campaign.owner_account_id != export.owner_key
+        || campaign.members.len() > 16
+        || member_ids.len() != campaign.members.len()
+        || campaign.members.iter().any(|member| {
+            !matches!(member.role.as_str(), "game_master" | "player")
+                || !matches!(
+                    member.state.as_str(),
+                    "invited" | "active" | "left" | "removed"
+                )
+        })
+        || campaign.active_game_master(&export.owner_key).is_none()
+    {
+        return invalid(
+            "campaign private export",
+            &campaign.id,
+            "campaign ownership or bounded membership is invalid",
+        );
+    }
+    campaign_summary_from_document(campaign.clone())?;
+    let groups = export_document_groups(export);
+    let document_count = groups.iter().fold(0_usize, |total, (_, documents)| {
+        total.saturating_add(documents.len())
+    });
+    if document_count > MAX_EXPORTED_DOCUMENTS {
+        return invalid(
+            "campaign private export",
+            &campaign.id,
+            "export document count exceeds the supported bound",
+        );
+    }
+    reject_private_keys(&export.campaign, &campaign.id)?;
+    for (name, documents) in groups {
+        let mut ids = BTreeSet::new();
+        for document in documents {
+            let id = document
+                .get_str("_id")
+                .map_err(|_| RepositoryError::InvalidDomainState {
+                    entity: "campaign private export",
+                    id: campaign.id.clone(),
+                    reason: "exported document is missing a string id",
+                })?;
+            if !is_valid_opaque_id(id) || !ids.insert(id.to_owned()) {
+                return invalid(
+                    "campaign private export",
+                    id,
+                    "exported document id is invalid or duplicated",
+                );
+            }
+            if !matches!(
+                document.get("schema_version"),
+                Some(Bson::Int32(1) | Bson::Int64(1))
+            ) {
+                return invalid(
+                    "campaign private export",
+                    id,
+                    "exported document schema version is unsupported",
+                );
+            }
+            let scoped = document.get_str("campaign_id") == Ok(campaign.id.as_str())
+                || (document.get_str("scope_kind") == Ok("campaign")
+                    && document.get_str("scope_id") == Ok(campaign.id.as_str()));
+            if !scoped {
+                return invalid(
+                    "campaign private export",
+                    id,
+                    "exported document is outside the campaign scope",
+                );
+            }
+            reject_private_keys(document, id)?;
+            if name == "selected_generated_presentations"
+                && document.get_bool("selected") != Ok(true)
+            {
+                return invalid(
+                    "campaign private export",
+                    id,
+                    "only selected presentations may be exported",
+                );
+            }
+            if name == "character_instances" {
+                validate_exported_character_instance(document, &campaign.id)?;
+            } else if name == "play_sessions" {
+                let play: PlaySessionDocument = mongodb::bson::from_document(document.clone())
+                    .map_err(RepositoryError::BsonDecoding)?;
+                play_session_from_document(play)?;
+            } else if name == "turn_events" {
+                let turn: TurnEventDocument = mongodb::bson::from_document(document.clone())
+                    .map_err(RepositoryError::BsonDecoding)?;
+                turn_history_from_document(turn)?;
+            }
+        }
+    }
+    if canonical_json_unchecked(export)?.len() > MAX_PLAYER_EXPORT_BYTES {
+        return invalid(
+            "campaign private export",
+            &campaign.id,
+            "canonical export exceeds the supported size",
+        );
+    }
+    Ok(())
+}
+
+fn validate_exported_character_instance(
+    document: &Document,
+    campaign_id: &str,
+) -> Result<(), RepositoryError> {
+    let instance: CampaignCharacterInstanceDocument =
+        mongodb::bson::from_document(document.clone()).map_err(RepositoryError::BsonDecoding)?;
+    let source = &instance.source_snapshot.player_character;
+    let hero = &instance.runtime.hero;
+    let encoded = serde_json::to_vec(source).map_err(|source| RepositoryError::Serialize {
+        entity: "campaign character source snapshot",
+        source,
+    })?;
+    let expected_digest = format!("sha256:{:x}", Sha256::digest(encoded));
+    if instance.schema_version != 1
+        || instance.revision <= 0
+        || !matches!(instance.state.as_str(), "active" | "retired")
+        || instance.campaign_id != campaign_id
+        || instance.account_id != source.owner_account_id
+        || instance.source_player_character_id != source.character_id
+        || instance.source_snapshot.source_revision
+            != i64::try_from(source.revision).map_err(|_| RepositoryError::NumericRange {
+                field: "source character revision",
+            })?
+        || instance.source_snapshot.source_schema_version != i64::from(source.schema_version)
+        || instance.source_snapshot.source_digest != expected_digest
+        || instance.source_snapshot.display_name != source.display_name
+        || hero.campaign_id != campaign_id
+        || hero.owner_id != instance.account_id
+        || hero.character_id != instance.runtime_hero_character_id
+        || instance.progression.level != i64::from(hero.level.value())
+        || instance.progression.experience_points != i64::from(hero.experience_points)
+        || instance.progression.milestone_count < 0
+        || instance.runtime.current_hit_points != i64::from(hero.sheet.current_hit_points)
+        || instance.runtime.maximum_hit_points != i64::from(hero.sheet.maximum_hit_points)
+        || instance.runtime.current_hit_points < 0
+        || instance.runtime.current_hit_points > instance.runtime.maximum_hit_points
+        || instance.runtime.temporary_hit_points < 0
+    {
+        return invalid(
+            "campaign private export character instance",
+            &instance.id,
+            "source snapshot, progression, or runtime boundary is inconsistent",
+        );
+    }
+    source
+        .validate()
+        .map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "campaign private export character instance",
+            id: instance.id.clone(),
+            reason: "source player character failed validation",
+        })?;
+    hero.validate()
+        .map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "campaign private export character instance",
+            id: instance.id,
+            reason: "runtime hero character failed validation",
+        })?;
+    Ok(())
+}
+
+fn export_document_groups(export: &CampaignPrivateExportV1) -> Vec<(&'static str, &[Document])> {
+    vec![
+        ("character_instances", &export.character_instances),
+        ("play_sessions", &export.play_sessions),
+        ("turn_events", &export.turn_events),
+        ("command_receipts", &export.command_receipts),
+        ("audit_events", &export.audit_events),
+        ("campaign_enemy_instances", &export.campaign_enemy_instances),
+        ("campaign_events", &export.campaign_events),
+        ("encounters", &export.encounters),
+        ("bde_ledger", &export.bde_ledger),
+        (
+            "private_inspiration_participants",
+            &export.private_inspiration_participants,
+        ),
+        (
+            "private_inspiration_sources",
+            &export.private_inspiration_sources,
+        ),
+        (
+            "private_inspiration_consents",
+            &export.private_inspiration_consents,
+        ),
+        (
+            "private_inspiration_vetoes",
+            &export.private_inspiration_vetoes,
+        ),
+        (
+            "private_inspiration_selections",
+            &export.private_inspiration_selections,
+        ),
+        ("private_inspiration_work", &export.private_inspiration_work),
+        (
+            "selected_generated_presentations",
+            &export.selected_generated_presentations,
+        ),
+        (
+            "selected_generated_assets",
+            &export.selected_generated_assets,
+        ),
+    ]
+}
+
+fn reject_private_keys(document: &Document, id: &str) -> Result<(), RepositoryError> {
+    for (key, value) in document {
+        let normalized = key.to_ascii_lowercase();
+        if normalized.contains("password")
+            || normalized.contains("email_cipher")
+            || normalized.contains("session_token")
+            || normalized.contains("access_token")
+            || normalized.contains("refresh_token")
+            || normalized.contains("throttle")
+            || normalized.contains("private_key")
+            || normalized.contains("secret")
+            || normalized.contains("prompt_text")
+        {
+            return invalid(
+                "campaign private export",
+                id,
+                "export contains a prohibited private field",
+            );
+        }
+        reject_private_value(value, id)?;
+    }
+    Ok(())
+}
+
+fn reject_private_value(value: &Bson, id: &str) -> Result<(), RepositoryError> {
+    match value {
+        Bson::Document(nested) => reject_private_keys(nested, id),
+        Bson::Array(values) => {
+            for value in values {
+                reject_private_value(value, id)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn restore_export_documents(
+    store: &crate::persistence::MongoStore,
+    session: &mut ClientSession,
+    export: &CampaignPrivateExportV1,
+) -> Result<(), PersistenceError> {
+    for (collection, documents) in restore_groups(export) {
+        if documents.is_empty() {
+            continue;
+        }
+        let mut restored = documents.to_vec();
+        if collection == CollectionName::PlaySessions {
+            let now = DateTime::now();
+            for document in &mut restored {
+                if matches!(document.get_str("state"), Ok("waiting" | "active")) {
+                    document.insert("state", "closed");
+                    document.insert("closed_at", now);
+                    document.insert("updated_at", now);
+                    document.insert("close_reason", "restore_import");
+                }
+            }
+        }
+        if collection == CollectionName::CommandReceipts {
+            let receipts = store.document_collection(collection);
+            for document in restored {
+                let id = document
+                    .get_str("_id")
+                    .map_err(|_| PersistenceError::SchemaDrift {
+                        collection: "command_receipts".to_owned(),
+                        detail: "restored receipt is missing its string id".to_owned(),
+                    })?;
+                receipts
+                    .replace_one(doc! { "_id": id }, document.clone())
+                    .upsert(true)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("restore campaign receipt", error))?;
+            }
+            continue;
+        }
+        store
+            .document_collection(collection)
+            .insert_many(restored)
+            .session(&mut *session)
+            .await
+            .map_err(|error| PersistenceError::mongo("restore campaign collection", error))?;
+    }
+    Ok(())
+}
+
+fn restore_groups(export: &CampaignPrivateExportV1) -> Vec<(CollectionName, &[Document])> {
+    vec![
+        (
+            CollectionName::CampaignCharacterInstances,
+            &export.character_instances,
+        ),
+        (CollectionName::PlaySessions, &export.play_sessions),
+        (CollectionName::TurnEvents, &export.turn_events),
+        (CollectionName::CommandReceipts, &export.command_receipts),
+        (CollectionName::AuditEvents, &export.audit_events),
+        (
+            CollectionName::CampaignEnemyInstances,
+            &export.campaign_enemy_instances,
+        ),
+        (CollectionName::CampaignEvents, &export.campaign_events),
+        (CollectionName::Encounters, &export.encounters),
+        (CollectionName::BdeLedger, &export.bde_ledger),
+        (
+            CollectionName::PrivateInspirationParticipants,
+            &export.private_inspiration_participants,
+        ),
+        (
+            CollectionName::PrivateInspirationSources,
+            &export.private_inspiration_sources,
+        ),
+        (
+            CollectionName::PrivateInspirationConsents,
+            &export.private_inspiration_consents,
+        ),
+        (
+            CollectionName::PrivateInspirationVetoes,
+            &export.private_inspiration_vetoes,
+        ),
+        (
+            CollectionName::PrivateInspirationSelections,
+            &export.private_inspiration_selections,
+        ),
+        (
+            CollectionName::PrivateInspirationWork,
+            &export.private_inspiration_work,
+        ),
+        (
+            CollectionName::GeneratedPresentations,
+            &export.selected_generated_presentations,
+        ),
+        (
+            CollectionName::GeneratedAssets,
+            &export.selected_generated_assets,
+        ),
+    ]
+}
+
+async fn cascade_campaign_documents(
+    store: &crate::persistence::MongoStore,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    retained_receipt_key: &str,
+) -> Result<(), PersistenceError> {
+    let generation_jobs = store.document_collection(CollectionName::GenerationJobs);
+    let mut job_cursor = generation_jobs
+        .find(doc! { "campaign_id": campaign_id })
+        .projection(doc! { "_id": 1 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("load campaign generation jobs for deletion", error)
+        })?;
+    let mut job_ids = Vec::new();
+    while let Some(document) =
+        job_cursor
+            .next(&mut *session)
+            .await
+            .transpose()
+            .map_err(|error| {
+                PersistenceError::mongo("read campaign generation jobs for deletion", error)
+            })?
+    {
+        if let Ok(id) = document.get_str("_id") {
+            job_ids.push(id.to_owned());
+        }
+    }
+    if !job_ids.is_empty() {
+        store
+            .document_collection(CollectionName::QuarantinedAssets)
+            .delete_many(doc! { "job_id": { "$in": &job_ids } })
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("delete campaign quarantined assets", error)
+            })?;
+    }
+    for collection in [
+        CollectionName::CampaignInvitations,
+        CollectionName::CampaignCharacterInstances,
+        CollectionName::CampaignEnemyInstances,
+        CollectionName::CampaignEvents,
+        CollectionName::PlaySessions,
+        CollectionName::Encounters,
+        CollectionName::TurnEvents,
+        CollectionName::BdeLedger,
+        CollectionName::GenerationJobs,
+        CollectionName::GeneratedPresentations,
+        CollectionName::GeneratedAssets,
+        CollectionName::PrivateInspirationParticipants,
+        CollectionName::PrivateInspirationSources,
+        CollectionName::PrivateInspirationConsents,
+        CollectionName::PrivateInspirationVetoes,
+        CollectionName::PrivateInspirationSelections,
+        CollectionName::PrivateInspirationWork,
+    ] {
+        store
+            .document_collection(collection)
+            .delete_many(doc! { "campaign_id": campaign_id })
+            .session(&mut *session)
+            .await
+            .map_err(|error| PersistenceError::mongo("cascade campaign deletion", error))?;
+    }
+    store
+        .document_collection(CollectionName::GenerationBudgetReservations)
+        .delete_many(doc! {
+            "$or": [
+                { "scope_kind": "campaign", "scope_id": campaign_id },
+                { "job_id": { "$in": &job_ids } },
+            ]
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("delete campaign reservations", error))?;
+    store
+        .document_collection(CollectionName::DeletionPreparations)
+        .delete_many(doc! {
+            "scope_kind": "campaign",
+            "scope_id": campaign_id,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("delete campaign deletion preparations", error))?;
+    store
+        .document_collection(CollectionName::AuditEvents)
+        .delete_many(doc! {
+            "$or": [
+                { "campaign_id": campaign_id },
+                { "scope_kind": "campaign", "scope_id": campaign_id },
+            ]
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("delete campaign audits", error))?;
+    store
+        .document_collection(CollectionName::CommandReceipts)
+        .delete_many(doc! {
+            "scope_kind": "campaign",
+            "scope_id": campaign_id,
+            "idempotency_key": { "$ne": retained_receipt_key },
+            "retain_after_delete": { "$ne": true },
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("delete campaign receipts", error))?;
+    Ok(())
+}
+
+async fn load_owned_gm_campaign(
+    campaigns: &Collection<CampaignDocument>,
+    session: &mut ClientSession,
+    owner_key: &str,
+    campaign_id: &str,
+) -> Result<CampaignDocument, PersistenceError> {
+    campaigns
+        .find_one(doc! {
+            "_id": campaign_id,
+            "owner_account_id": owner_key,
+            "members": {
+                "$elemMatch": {
+                    "account_id": owner_key,
+                    "role": "game_master",
+                    "state": "active",
+                }
+            },
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("authorize campaign lifecycle", error))?
+        .ok_or_else(|| PersistenceError::NotFound {
+            entity: "campaign_session",
+            id: campaign_id.to_owned(),
+        })
+}
+
+async fn require_owned_campaign(
+    repository: &MongoRepository,
+    owner_key: &str,
+    campaign_id: &str,
+) -> Result<CampaignDocument, RepositoryError> {
+    repository
+        .campaigns()
+        .find_one(doc! {
+            "_id": campaign_id,
+            "owner_account_id": owner_key,
+            "members": {
+                "$elemMatch": {
+                    "account_id": owner_key,
+                    "role": "game_master",
+                    "state": "active",
+                }
+            },
+        })
+        .await
+        .map_err(|error| mongo_error("authorize owned campaign", error))?
+        .ok_or_else(|| RepositoryError::NotFound {
+            entity: "campaign_session",
+            id: campaign_id.to_owned(),
+        })
+}
+
+async fn require_no_open_campaign_runtime(
+    store: &crate::persistence::MongoStore,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<(), PersistenceError> {
+    let open_play = store
+        .document_collection(CollectionName::PlaySessions)
+        .find_one(doc! {
+            "campaign_id": campaign_id,
+            "state": { "$in": ["waiting", "active"] },
+        })
+        .projection(doc! { "_id": 1 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("check open campaign play sessions", error))?;
+    if open_play.is_some() {
+        return Err(PersistenceError::AlreadyExists {
+            entity: "campaign_play_session",
+            id: campaign_id.to_owned(),
+        });
+    }
+    let active_encounter = store
+        .document_collection(CollectionName::Encounters)
+        .find_one(doc! {
+            "campaign_id": campaign_id,
+            "status": "active",
+        })
+        .projection(doc! { "_id": 1 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("check active campaign encounters", error))?;
+    if active_encounter.is_some() {
+        return Err(PersistenceError::AlreadyExists {
+            entity: "campaign_encounter",
+            id: campaign_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn require_external_cleanup_complete(
+    store: &crate::persistence::MongoStore,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<(), PersistenceError> {
+    let pending_asset = store
+        .document_collection(CollectionName::GeneratedAssets)
+        .find_one(doc! {
+            "campaign_id": campaign_id,
+            "object_key": { "$type": "string" },
+            "state": { "$nin": ["erased", "deleted"] },
+        })
+        .projection(doc! { "_id": 1 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("check campaign external asset cleanup", error))?;
+    if pending_asset.is_some() {
+        return Err(PersistenceError::AlreadyExists {
+            entity: "campaign_external_asset_cleanup",
+            id: campaign_id.to_owned(),
+        });
+    }
+
+    let generation_jobs = store.document_collection(CollectionName::GenerationJobs);
+    let mut job_cursor = generation_jobs
+        .find(doc! { "campaign_id": campaign_id })
+        .projection(doc! { "_id": 1 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("load campaign jobs for external cleanup check", error)
+        })?;
+    let mut job_ids = Vec::new();
+    while let Some(document) =
+        job_cursor
+            .next(&mut *session)
+            .await
+            .transpose()
+            .map_err(|error| {
+                PersistenceError::mongo("read campaign jobs for external cleanup check", error)
+            })?
+    {
+        if let Ok(id) = document.get_str("_id") {
+            job_ids.push(id.to_owned());
+        }
+    }
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let pending_quarantine = store
+        .document_collection(CollectionName::QuarantinedAssets)
+        .find_one(doc! {
+            "job_id": { "$in": job_ids },
+            "$or": [
+                { "object_key": { "$type": "string" } },
+                { "storage_key": { "$type": "string" } },
+            ],
+        })
+        .projection(doc! { "_id": 1 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("check campaign quarantined asset cleanup", error)
+        })?;
+    if pending_quarantine.is_some() {
+        return Err(PersistenceError::AlreadyExists {
+            entity: "campaign_external_asset_cleanup",
+            id: campaign_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn require_lifecycle_revision(
+    campaign: &CampaignDocument,
+    expected: u64,
+) -> Result<(), PersistenceError> {
+    let actual = nonnegative_u64(campaign.lifecycle_revision);
+    if actual != expected {
+        return Err(PersistenceError::RevisionConflict {
+            entity: "campaign_lifecycle",
+            id: campaign.id.clone(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+async fn load_lifecycle_replay(
+    receipts: &Collection<LifecycleReceiptDocument>,
+    session: &mut ClientSession,
+    owner_key: &str,
+    campaign_id: &str,
+    idempotency_key: &str,
+    command_kind: &'static str,
+    fingerprint: &Sha256Digest,
+) -> Result<Option<CampaignLifecycleOutcome>, PersistenceError> {
+    receipts
+        .find_one(doc! {
+            "scope_kind": "campaign",
+            "scope_id": campaign_id,
+            "actor_account_id": owner_key,
+            "idempotency_key": idempotency_key,
+            "state": "committed",
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load lifecycle receipt", error))?
+        .map(|receipt| {
+            decode_lifecycle_replay(receipt, command_kind, fingerprint)
+                .map_err(repository_to_persistence)
+        })
+        .transpose()
+}
+
+fn decode_lifecycle_replay(
+    receipt: LifecycleReceiptDocument,
+    command_kind: &'static str,
+    fingerprint: &Sha256Digest,
+) -> Result<CampaignLifecycleOutcome, RepositoryError> {
+    if receipt.command_kind != command_kind || receipt.request_fingerprint != *fingerprint {
+        return Err(RepositoryError::AlreadyExists {
+            entity: "campaign lifecycle idempotency key",
+            id: receipt.idempotency_key,
+        });
+    }
+    mongodb::bson::from_document(receipt.response).map_err(RepositoryError::BsonDecoding)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_lifecycle_receipt(
+    receipts: &Collection<LifecycleReceiptDocument>,
+    session: &mut ClientSession,
+    owner_key: &str,
+    command: &CampaignLifecycleCommand,
+    command_kind: &'static str,
+    fingerprint: Sha256Digest,
+    outcome: &CampaignLifecycleOutcome,
+    retain_after_delete: bool,
+) -> Result<(), PersistenceError> {
+    let response = mongodb::bson::to_document(outcome).map_err(PersistenceError::BsonEncoding)?;
+    receipts
+        .insert_one(LifecycleReceiptDocument {
+            id: format!("command-receipt:{}", Uuid::new_v4()),
+            schema_version: 1,
+            scope_kind: "campaign".to_owned(),
+            scope_id: command.campaign_session_id.clone(),
+            campaign_id: command.campaign_session_id.clone(),
+            actor_account_id: owner_key.to_owned(),
+            command_kind: command_kind.to_owned(),
+            idempotency_key: command.idempotency_key.clone(),
+            request_fingerprint: fingerprint,
+            expected_revision: to_i64_persistence(command.expected_lifecycle_revision)?,
+            result_revision: to_i64_persistence(outcome.lifecycle_revision)?,
+            response,
+            state: "committed".to_owned(),
+            retain_after_delete,
+            created_at: DateTime::now(),
+            purge_at: None,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("write lifecycle receipt", error))?;
+    Ok(())
+}
+
+async fn insert_lifecycle_audit(
+    audits: &Collection<Document>,
+    session: &mut ClientSession,
+    owner_key: &str,
+    outcome: &CampaignLifecycleOutcome,
+    payload: LifecycleAuditPayload,
+) -> Result<(), PersistenceError> {
+    let metadata = mongodb::bson::to_document(&payload).map_err(PersistenceError::BsonEncoding)?;
+    audits
+        .insert_one(doc! {
+            "_id": format!("audit:{}", Uuid::new_v4()),
+            "schema_version": 1_i64,
+            "category": "campaign_lifecycle",
+            "action": payload.event_kind(),
+            "outcome": "committed",
+            "scope_kind": "campaign",
+            "scope_id": &outcome.campaign_session_id,
+            "campaign_id": &outcome.campaign_session_id,
+            "actor_account_id": owner_key,
+            "revision": to_i64_persistence(outcome.lifecycle_revision)?,
+            "metadata": metadata,
+            "created_at": DateTime::now(),
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("write lifecycle audit", error))?;
+    Ok(())
+}
+
+fn turn_history_from_document(
+    document: TurnEventDocument,
+) -> Result<CampaignTurnHistoryItem, RepositoryError> {
+    if document.sequence <= 0
+        || document.event.session_id != document.campaign_id
+        || document.event.sequence != nonnegative_u64(document.sequence)
+    {
+        return invalid(
+            "campaign turn event",
+            &document.id,
+            "event envelope does not match stored campaign sequence",
+        );
+    }
+    document
+        .event
+        .validate()
+        .map_err(|source| RepositoryError::CoreValidation {
+            entity: "campaign turn event",
+            id: document.id.clone(),
+            source,
+        })?;
+    Ok(CampaignTurnHistoryItem {
+        schema_version: u32::try_from(document.schema_version).map_err(|_| {
+            RepositoryError::NumericRange {
+                field: "turn event schema version",
+            }
+        })?,
+        id: document.id,
+        campaign_session_id: document.campaign_id,
+        turn_number: nonnegative_u64(document.sequence),
+        actor_id: document.actor_account_id,
+        correlation_id: document.correlation_id,
+        event: document.event,
+        created_at: date_string(document.created_at, "turn_events")?,
+    })
+}
+
+fn play_session_from_document(
+    document: PlaySessionDocument,
+) -> Result<CampaignPlaySession, RepositoryError> {
+    if !matches!(document.state.as_str(), "waiting" | "active" | "closed") {
+        return invalid(
+            "campaign play session",
+            &document.id,
+            "unknown play session state",
+        );
+    }
+    Ok(CampaignPlaySession {
+        schema_version: u16::try_from(document.schema_version).map_err(|_| {
+            RepositoryError::NumericRange {
+                field: "play session schema version",
+            }
+        })?,
+        id: document.id,
+        campaign_session_id: document.campaign_id,
+        owner_key: document.gm_account_id,
+        state: document.state,
+        started_campaign_revision: nonnegative_u64(document.started_campaign_revision),
+        ended_campaign_revision: document.ended_campaign_revision.map(nonnegative_u64),
+        opened_at: date_string(document.opened_at, "play_sessions")?,
+        closed_at: document
+            .closed_at
+            .map(|value| date_string(value, "play_sessions"))
+            .transpose()?,
+        close_reason: document.close_reason,
+    })
+}
+
+fn canonical_json<T: Serialize>(value: &T) -> Result<String, RepositoryError> {
+    let encoded = canonical_json_unchecked(value)?;
+    if encoded.len() > MAX_PLAYER_EXPORT_BYTES {
+        return invalid(
+            "canonical JSON",
+            "campaign-export",
+            "canonical value exceeds the supported size",
+        );
+    }
+    Ok(encoded)
+}
+
+fn canonical_json_unchecked<T: Serialize>(value: &T) -> Result<String, RepositoryError> {
+    let value = serde_json::to_value(value).map_err(|source| RepositoryError::Serialize {
+        entity: "canonical JSON",
+        source,
+    })?;
+    serde_json::to_string(&canonicalize_value(value)).map_err(|source| RepositoryError::Serialize {
+        entity: "canonical JSON",
+        source,
+    })
+}
+
+fn canonicalize_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted = map
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),
+        scalar => scalar,
+    }
+}
+
+fn command_fingerprint<T: Serialize>(
+    command_kind: &str,
+    command: &T,
+) -> Result<Sha256Digest, RepositoryError> {
+    let payload = canonical_json(command)?;
+    Ok(digest(format!("{command_kind}\n{payload}").as_bytes()))
+}
+
+pub(crate) fn digest(bytes: &[u8]) -> Sha256Digest {
+    let bytes: [u8; 32] = Sha256::digest(bytes).into();
+    Sha256Digest::from_bytes(bytes)
+}
+
+fn validate_owner(owner_key: &str) -> Result<(), RepositoryError> {
+    if !is_valid_opaque_id(owner_key) {
+        return invalid(
+            "campaign owner",
+            owner_key,
+            "owner account identifier is invalid",
+        );
+    }
+    Ok(())
+}
+
+fn validate_owner_campaign(owner_key: &str, campaign_id: &str) -> Result<(), RepositoryError> {
+    validate_owner(owner_key)?;
+    if !is_valid_opaque_id(campaign_id) {
+        return invalid(
+            "campaign session",
+            campaign_id,
+            "campaign identifier is invalid",
+        );
+    }
+    Ok(())
+}
+
+fn date_string(value: DateTime, collection: &str) -> Result<String, RepositoryError> {
+    value.try_to_rfc3339_string().map_err(|_| {
+        RepositoryError::Persistence(PersistenceError::SchemaDrift {
+            collection: collection.to_owned(),
+            detail: "stored BSON date is outside RFC 3339 range".to_owned(),
+        })
+    })
+}
+
+fn add_seconds(value: DateTime, seconds: i64) -> DateTime {
+    DateTime::from_millis(
+        value
+            .timestamp_millis()
+            .saturating_add(seconds.saturating_mul(1_000)),
+    )
+}
+
+fn next_revision(value: i64, field: &'static str) -> Result<i64, PersistenceError> {
+    value
+        .checked_add(1)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| PersistenceError::SchemaDrift {
+            collection: "campaigns".to_owned(),
+            detail: format!("{field} overflowed"),
+        })
+}
+
+fn nonnegative_u64(value: i64) -> u64 {
+    if value < 0 { 0 } else { value as u64 }
+}
+
+fn to_i64(value: u64, field: &'static str) -> Result<i64, RepositoryError> {
+    i64::try_from(value).map_err(|_| RepositoryError::NumericRange { field })
+}
+
+fn to_i64_persistence(value: u64) -> Result<i64, PersistenceError> {
+    i64::try_from(value).map_err(|_| PersistenceError::SchemaDrift {
+        collection: "command_receipts".to_owned(),
+        detail: "revision is outside the supported range".to_owned(),
+    })
+}
+
+fn repository_to_persistence(error: RepositoryError) -> PersistenceError {
+    match error {
+        RepositoryError::NotFound { entity, id } => PersistenceError::NotFound { entity, id },
+        RepositoryError::AlreadyExists { entity, id } => {
+            PersistenceError::AlreadyExists { entity, id }
+        }
+        RepositoryError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        } => PersistenceError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        },
+        _ => PersistenceError::SchemaDrift {
+            collection: "campaigns".to_owned(),
+            detail: "stored campaign failed lifecycle validation".to_owned(),
+        },
+    }
+}
+
+fn mongo_error(operation: &'static str, error: mongodb::error::Error) -> RepositoryError {
+    RepositoryError::Persistence(PersistenceError::mongo(operation, error))
+}
+
+fn map_transaction_error(
+    error: PersistenceError,
+    entity: &'static str,
+    id: &str,
+) -> RepositoryError {
+    match error {
+        PersistenceError::NotFound { entity, id } => RepositoryError::NotFound { entity, id },
+        PersistenceError::AlreadyExists { entity, id } => {
+            RepositoryError::AlreadyExists { entity, id }
+        }
+        PersistenceError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        } => RepositoryError::RevisionConflict {
+            entity,
+            id,
+            expected,
+            actual,
+        },
+        other if other.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey) => {
+            RepositoryError::AlreadyExists {
+                entity,
+                id: id.to_owned(),
+            }
+        }
+        other if other.mongo_failure_kind() == Some(MongoFailureKind::DocumentValidation) => {
+            RepositoryError::InvalidDomainState {
+                entity,
+                id: id.to_owned(),
+                reason: "document failed MongoDB schema validation",
+            }
+        }
+        other => RepositoryError::Persistence(other),
+    }
+}
+
+fn state_label(state: CampaignLifecycleState) -> &'static str {
+    match state {
+        CampaignLifecycleState::Active => "active",
+        CampaignLifecycleState::Archived => "archived",
+    }
+}
+
+fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T, RepositoryError> {
+    Err(RepositoryError::InvalidDomainState {
+        entity,
+        id: id.to_owned(),
+        reason,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{MongoStore, SchemaReconciler},
+    };
+
+    async fn test_repository() -> Option<(MongoRepository, String)> {
+        let uri = std::env::var("MONGODB_TEST_URI").ok()?;
+        if uri.trim().is_empty() {
+            return None;
+        }
+        let database = format!("mdnd_test_lifecycle_{}", Uuid::new_v4().simple());
+        let config = MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 5,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(5),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 3,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        };
+        let store = MongoStore::connect(&config)
+            .await
+            .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("schema must apply");
+        Some((MongoRepository::new(store), database))
+    }
+
+    async fn insert_account(repository: &MongoRepository, account_id: &str) {
+        repository
+            .store()
+            .document_collection(CollectionName::Accounts)
+            .insert_one(doc! {
+                "_id": account_id,
+                "schema_version": 1_i64,
+                "revision": 1_i64,
+                "role": "user",
+                "username_normalized": format!("user-{}", Uuid::new_v4()),
+                "email_lookup_hmac": format!("hmac-sha256:{}", Uuid::new_v4().simple()),
+                "password_phc": "$argon2id$test",
+                "login_enabled": false,
+                "created_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            })
+            .await
+            .expect("account fixture must insert");
+    }
+
+    fn lifecycle_command(campaign_id: &str, revision: u64, key: &str) -> CampaignLifecycleCommand {
+        CampaignLifecycleCommand {
+            schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+            campaign_session_id: campaign_id.to_owned(),
+            expected_lifecycle_revision: revision,
+            idempotency_key: key.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mongo_lifecycle_replay_export_delete_restore_contract() {
+        let Some((repository, database)) = test_repository().await else {
+            return;
+        };
+        let owner = format!("account:{}", Uuid::new_v4());
+        insert_account(&repository, &owner).await;
+        let campaign = repository
+            .create_campaign_with_owner(
+                &owner,
+                "Lifecycle Test",
+                "dev.manchester-arcana.rainbound-borough",
+            )
+            .await
+            .expect("campaign fixture must create");
+        let start = StartPlaySessionCommand {
+            lifecycle: lifecycle_command(&campaign.campaign_id, 1, "command:start-once"),
+            play_session_id: format!("play-session:{}", Uuid::new_v4()),
+        };
+        let started = repository
+            .start_campaign_play_session(&owner, &start)
+            .await
+            .expect("start must work");
+        assert_eq!(
+            repository
+                .start_campaign_play_session(&owner, &start)
+                .await
+                .expect("exact replay must work"),
+            started
+        );
+        let mut changed = start.clone();
+        changed.play_session_id = format!("play-session:{}", Uuid::new_v4());
+        assert!(
+            repository
+                .start_campaign_play_session(&owner, &changed)
+                .await
+                .is_err()
+        );
+        repository
+            .end_campaign_play_session(
+                &owner,
+                &EndPlaySessionCommand {
+                    lifecycle: lifecycle_command(&campaign.campaign_id, 2, "command:end-once"),
+                    play_session_id: start.play_session_id,
+                },
+            )
+            .await
+            .expect("end must work");
+        repository
+            .archive_campaign(
+                &owner,
+                &lifecycle_command(&campaign.campaign_id, 3, "command:archive-once"),
+            )
+            .await
+            .expect("archive must work");
+        let export = repository
+            .export_campaign_private(&owner, &campaign.campaign_id)
+            .await
+            .expect("export must work");
+        let canonical = export.canonical_json().expect("export must canonicalize");
+        assert!(!canonical.contains("password_hash"));
+        assert!(!canonical.contains("email_ciphertext"));
+        let asset_id = format!("asset:{}", Uuid::new_v4());
+        repository
+            .store()
+            .document_collection(CollectionName::GeneratedAssets)
+            .insert_one(doc! {
+                "_id": &asset_id,
+                "schema_version": 1_i64,
+                "owner_account_id": &owner,
+                "campaign_id": &campaign.campaign_id,
+                "entity_kind": "campaign",
+                "entity_id": &campaign.campaign_id,
+                "object_key": format!("campaign-assets/{asset_id}.png"),
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "state": "published",
+                "created_at": DateTime::now(),
+            })
+            .await
+            .expect("asset fixture must insert");
+        let pending_cleanup = repository
+            .prepare_campaign_deletion(
+                &owner,
+                &campaign.campaign_id,
+                4,
+                "deletion:external-cleanup",
+            )
+            .await
+            .expect("pending-cleanup deletion preparation must work");
+        assert!(matches!(
+            repository
+                .delete_archived_campaign(
+                    &owner,
+                    &DeleteCampaignCommand {
+                        lifecycle: lifecycle_command(
+                            &campaign.campaign_id,
+                            4,
+                            "command:delete-before-cleanup",
+                        ),
+                        deletion_id: pending_cleanup.deletion_id,
+                        confirm_permanent_delete: true,
+                    },
+                )
+                .await,
+            Err(RepositoryError::AlreadyExists {
+                entity: "campaign_external_asset_cleanup",
+                ..
+            })
+        ));
+        repository
+            .store()
+            .document_collection(CollectionName::GeneratedAssets)
+            .update_one(
+                doc! { "_id": &asset_id },
+                doc! { "$set": { "state": "erased" } },
+            )
+            .await
+            .expect("asset erasure evidence must update");
+        let prepared = repository
+            .prepare_campaign_deletion(&owner, &campaign.campaign_id, 4, "deletion:lifecycle-test")
+            .await
+            .expect("deletion preparation must work");
+        assert_eq!(
+            repository
+                .prepare_campaign_deletion(
+                    &owner,
+                    &campaign.campaign_id,
+                    4,
+                    "deletion:lifecycle-test",
+                )
+                .await
+                .expect("deletion preparation replay must work"),
+            prepared
+        );
+        let delete = DeleteCampaignCommand {
+            lifecycle: lifecycle_command(&campaign.campaign_id, 4, "command:delete-once"),
+            deletion_id: prepared.deletion_id,
+            confirm_permanent_delete: true,
+        };
+        let late_audit_id = format!("audit:{}", Uuid::new_v4());
+        repository
+            .store()
+            .document_collection(CollectionName::AuditEvents)
+            .insert_one(doc! {
+                "_id": &late_audit_id,
+                "schema_version": 1_i64,
+                "category": "lifecycle",
+                "action": "test_child_mutation",
+                "outcome": "success",
+                "scope_kind": "campaign",
+                "scope_id": &campaign.campaign_id,
+                "campaign_id": &campaign.campaign_id,
+                "created_at": DateTime::now(),
+            })
+            .await
+            .expect("late audit fixture must insert");
+        assert!(matches!(
+            repository.delete_archived_campaign(&owner, &delete).await,
+            Err(RepositoryError::AlreadyExists {
+                entity: "stale_campaign_deletion_preparation",
+                ..
+            })
+        ));
+        repository
+            .store()
+            .document_collection(CollectionName::AuditEvents)
+            .delete_one(doc! { "_id": late_audit_id })
+            .await
+            .expect("late audit fixture must delete");
+        let deleted = repository
+            .delete_archived_campaign(&owner, &delete)
+            .await
+            .expect("delete must work");
+        assert!(deleted.deleted);
+        assert_eq!(
+            repository
+                .delete_archived_campaign(&owner, &delete)
+                .await
+                .expect("delete replay must work"),
+            deleted
+        );
+        assert!(
+            repository
+                .has_campaign_deletion_tombstone(&owner, &campaign.campaign_id)
+                .await
+                .expect("tombstone check must work")
+        );
+        let tombstone = repository
+            .store()
+            .document_collection(CollectionName::DeletionTombstones)
+            .find_one(doc! {
+                "entity_kind": "campaign",
+                "entity_id": &campaign.campaign_id,
+                "owner_account_id": &owner,
+            })
+            .await
+            .expect("tombstone read must work")
+            .expect("tombstone must exist");
+        let deleted_at = tombstone
+            .get_datetime("deleted_at")
+            .expect("deleted timestamp must exist");
+        let purge_at = tombstone
+            .get_datetime("purge_at")
+            .expect("purge timestamp must exist");
+        assert_eq!(
+            purge_at
+                .timestamp_millis()
+                .saturating_sub(deleted_at.timestamp_millis()),
+            DELETION_TOMBSTONE_SECONDS.saturating_mul(1_000)
+        );
+        assert!(
+            repository
+                .store()
+                .document_collection(CollectionName::PlaySessions)
+                .find_one(doc! { "campaign_id": &campaign.campaign_id })
+                .await
+                .expect("cascade read must work")
+                .is_none()
+        );
+        assert!(
+            repository
+                .store()
+                .document_collection(CollectionName::DeletionPreparations)
+                .find_one(doc! { "scope_id": &campaign.campaign_id })
+                .await
+                .expect("preparation cascade read must work")
+                .is_none()
+        );
+        let restored = repository
+            .restore_campaign_export(
+                &owner,
+                &RestoreCampaignExportCommand {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    idempotency_key: "command:restore-once".to_owned(),
+                    canonical_export_json: canonical,
+                },
+            )
+            .await
+            .expect("restore must work");
+        assert_eq!(restored.campaign_session_id, campaign.campaign_id);
+        assert!(
+            repository
+                .list_campaign_play_sessions(&owner, &restored.campaign_session_id)
+                .await
+                .expect("restored play history must load")
+                .iter()
+                .all(|play| play.state == "closed")
+        );
+
+        assert!(
+            database.starts_with("mdnd_test_lifecycle_"),
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
+            .await
+            .expect("test database must drop");
     }
 }

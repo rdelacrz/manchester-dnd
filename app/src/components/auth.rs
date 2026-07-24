@@ -11,9 +11,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignUpInput {
+pub struct BeginSignupInput {
+    pub access_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteSignupInput {
+    pub signup_csrf_token: String,
     pub email: String,
-    pub display_name: String,
+    pub username: String,
     pub password: String,
     #[serde(default)]
     pub next: Option<String>,
@@ -22,10 +29,33 @@ pub struct SignUpInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoginInput {
-    pub email: String,
+    pub identifier: String,
     pub password: String,
     #[serde(default)]
     pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "payload", rename_all = "snake_case")]
+pub enum SignupChallengeResponse {
+    Ready { csrf_token: String },
+    Error { code: String, message: String },
+}
+
+impl SignupChallengeResponse {
+    fn invalid_access() -> Self {
+        Self::Error {
+            code: "invalid_signup_access".to_owned(),
+            message: "That sign-up access code is invalid or has expired.".to_owned(),
+        }
+    }
+
+    fn internal_error() -> Self {
+        Self::Error {
+            code: "internal_error".to_owned(),
+            message: "Sign-up is temporarily unavailable.".to_owned(),
+        }
+    }
 }
 
 /// Safe session-state view. Contains no token, CSRF secret, email, or account
@@ -136,59 +166,108 @@ fn is_safe_relative_path(path: &str) -> bool {
         && path.chars().all(|c| c.is_ascii_graphic() || c == ' ')
 }
 
-#[server(SignUp)]
-pub async fn sign_up(input: SignUpInput) -> Result<AuthResponse, ServerFnError> {
+#[server(BeginSignup)]
+pub async fn begin_signup(
+    input: BeginSignupInput,
+) -> Result<SignupChallengeResponse, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        let Some(context) = use_context::<manchester_dnd_server::ServerContext>() else {
+            return Ok(SignupChallengeResponse::internal_error());
+        };
+        let Some(_parts) = use_context::<axum::http::request::Parts>() else {
+            return Ok(SignupChallengeResponse::internal_error());
+        };
+
+        let access_token = manchester_dnd_server::AuthenticationSecret::new(input.access_token);
+        let issued = match context.authentication.begin_signup(&access_token).await {
+            Ok(issued) => issued,
+            Err(manchester_dnd_server::AuthenticationError::InvalidSignupAccess)
+            | Err(manchester_dnd_server::AuthenticationError::Throttled) => {
+                return Ok(SignupChallengeResponse::invalid_access());
+            }
+            Err(_) => return Ok(SignupChallengeResponse::internal_error()),
+        };
+
+        set_signup_cookie(&issued.session_token, &context.config);
+        Ok(SignupChallengeResponse::Ready {
+            csrf_token: issued.csrf_token.expose_secret().to_owned(),
+        })
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = input;
+        unreachable!("the server-function macro replaces this body in browser builds")
+    }
+}
+
+#[server(CompleteSignup)]
+pub async fn complete_signup(input: CompleteSignupInput) -> Result<AuthResponse, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         let Some(context) = use_context::<manchester_dnd_server::ServerContext>() else {
             return Ok(AuthResponse::internal_error());
         };
-        let Some(_parts) = use_context::<axum::http::request::Parts>() else {
+        let Some(parts) = use_context::<axum::http::request::Parts>() else {
             return Ok(AuthResponse::internal_error());
         };
+        let Some(raw_signup_session) = crate::auth_boundary::signup_session_cookie(&parts.headers)
+        else {
+            return Ok(AuthResponse::account_unavailable());
+        };
 
-        // Throttle by HMAC-digested email before any password work.
         let throttle_key = context.authentication.throttle_key_digest(
             &input.email,
             manchester_dnd_server::AuthenticationActionKind::SignUp,
         );
-        let throttle = context
+        let throttle = match context
             .authentication
             .record_authentication_attempt(
                 &throttle_key,
                 manchester_dnd_server::AuthenticationActionKind::SignUp,
             )
             .await
-            .map_err(|_| {
-                ServerFnError::<std::convert::Infallible>::ServerError(
-                    "throttle check failed".to_owned(),
-                )
-            })?;
+        {
+            Ok(throttle) => throttle,
+            Err(_) => return Ok(AuthResponse::internal_error()),
+        };
         if manchester_dnd_server::AuthService::is_throttled(&throttle) {
             return Ok(AuthResponse::throttled());
         }
 
-        let password = manchester_dnd_server::AuthenticationSecret::new(input.password.clone());
+        let signup_session = manchester_dnd_server::AuthenticationSecret::new(raw_signup_session);
+        let signup_csrf = manchester_dnd_server::AuthenticationSecret::new(input.signup_csrf_token);
+        let password = manchester_dnd_server::AuthenticationSecret::new(input.password);
         let issued = match context
             .authentication
-            .sign_up(&input.email, &input.display_name, &password)
+            .complete_signup(
+                &signup_session,
+                &signup_csrf,
+                &input.email,
+                &input.username,
+                &password,
+            )
             .await
         {
             Ok(issued) => issued,
-            Err(manchester_dnd_server::AuthenticationError::AccountUnavailable) => {
+            Err(manchester_dnd_server::AuthenticationError::AccountUnavailable)
+            | Err(manchester_dnd_server::AuthenticationError::InvalidSignupSession)
+            | Err(manchester_dnd_server::AuthenticationError::InvalidSignupAccess)
+            | Err(manchester_dnd_server::AuthenticationError::InvalidInput(_)) => {
                 return Ok(AuthResponse::account_unavailable());
             }
-            Err(manchester_dnd_server::AuthenticationError::InvalidCredentials) => {
-                return Ok(AuthResponse::invalid_credentials());
+            Err(manchester_dnd_server::AuthenticationError::Throttled) => {
+                return Ok(AuthResponse::throttled());
             }
             Err(_) => return Ok(AuthResponse::internal_error()),
         };
 
+        clear_signup_cookie(&context.config);
         set_session_cookie(&issued.session_token, &context.config);
-        let redirect_to = safe_redirect_target(&input.next);
         Ok(AuthResponse::Success {
             display_name: issued.account.display_name,
-            redirect_to,
+            redirect_to: safe_redirect_target(&input.next),
             csrf_token: issued.csrf_token.expose_secret().to_owned(),
         })
     }
@@ -208,9 +287,9 @@ pub async fn login(input: LoginInput) -> Result<AuthResponse, ServerFnError> {
             return Ok(AuthResponse::internal_error());
         };
 
-        // Throttle by HMAC-digested email before any password work.
+        // Throttle a keyed digest of the submitted username or email before password work.
         let throttle_key = context.authentication.throttle_key_digest(
-            &input.email,
+            &input.identifier,
             manchester_dnd_server::AuthenticationActionKind::Login,
         );
         let throttle = context
@@ -230,7 +309,11 @@ pub async fn login(input: LoginInput) -> Result<AuthResponse, ServerFnError> {
         }
 
         let password = manchester_dnd_server::AuthenticationSecret::new(input.password.clone());
-        let issued = match context.authentication.login(&input.email, &password).await {
+        let issued = match context
+            .authentication
+            .login(&input.identifier, &password)
+            .await
+        {
             Ok(issued) => issued,
             Err(manchester_dnd_server::AuthenticationError::InvalidCredentials) => {
                 return Ok(AuthResponse::invalid_credentials());
@@ -359,6 +442,54 @@ fn set_session_cookie(
         return;
     };
     let cookie = crate::auth_boundary::session_cookie_header(session_token, config);
+    response_options.append_header(axum::http::header::SET_COOKIE, cookie);
+}
+
+#[cfg(feature = "ssr")]
+fn set_signup_cookie(
+    signup_token: &manchester_dnd_server::AuthenticationSecret,
+    config: &manchester_dnd_server::AppConfig,
+) {
+    use leptos_axum::ResponseOptions;
+
+    let Some(response_options) = use_context::<ResponseOptions>() else {
+        tracing::warn!("ResponseOptions unavailable; cannot set signup cookie");
+        return;
+    };
+    let secure = if config.authentication.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    let Ok(cookie) = axum::http::HeaderValue::from_str(&format!(
+        "{}={}; Path=/signup; HttpOnly; SameSite=Strict; Max-Age=86400{secure}",
+        crate::auth_boundary::SIGNUP_SESSION_COOKIE_NAME,
+        signup_token.expose_secret(),
+    )) else {
+        tracing::warn!("generated signup token was not cookie-safe");
+        return;
+    };
+    response_options.append_header(axum::http::header::SET_COOKIE, cookie);
+}
+
+#[cfg(feature = "ssr")]
+fn clear_signup_cookie(config: &manchester_dnd_server::AppConfig) {
+    use leptos_axum::ResponseOptions;
+
+    let Some(response_options) = use_context::<ResponseOptions>() else {
+        tracing::warn!("ResponseOptions unavailable; cannot clear signup cookie");
+        return;
+    };
+    let secure = if config.authentication.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = axum::http::HeaderValue::from_str(&format!(
+        "{}=; Path=/signup; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
+        crate::auth_boundary::SIGNUP_SESSION_COOKIE_NAME,
+    ))
+    .expect("static signup cookie attributes are header-safe");
     response_options.append_header(axum::http::header::SET_COOKIE, cookie);
 }
 

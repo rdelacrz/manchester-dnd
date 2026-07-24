@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub const SESSION_COOKIE_NAME: &str = "manchester_arcana_session";
+pub const SIGNUP_SESSION_COOKIE_NAME: &str = "manchester_arcana_signup";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 const LOCAL_COMPATIBILITY_SESSION_ID: &str = "session:local-compatibility";
 
@@ -257,12 +258,20 @@ pub fn request_origin_allowed(config: &AppConfig, headers: &HeaderMap, method: &
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    opaque_cookie(headers, SESSION_COOKIE_NAME)
+}
+
+pub fn signup_session_cookie(headers: &HeaderMap) -> Option<String> {
+    opaque_cookie(headers, SIGNUP_SESSION_COOKIE_NAME)
+}
+
+fn opaque_cookie(headers: &HeaderMap, expected_name: &str) -> Option<String> {
     let mut found = None;
     for header in headers.get_all(COOKIE) {
         let raw = header.to_str().ok()?;
         for pair in raw.split(';') {
             let (name, value) = pair.trim().split_once('=')?;
-            if name == SESSION_COOKIE_NAME {
+            if name == expected_name {
                 if found.is_some()
                     || value.is_empty()
                     || value.len() > 128
@@ -319,6 +328,9 @@ mod tests {
     fn test_config(access_mode: AccessMode) -> AppConfig {
         let mut config = AppConfig::load().unwrap();
         config.access_mode = access_mode;
+        let email_encryption_key_id = config.authentication.email_encryption_key_id.clone();
+        let email_encryption_key = config.authentication.email_encryption_key.clone();
+        let email_lookup_hmac_key = config.authentication.email_lookup_hmac_key.clone();
         config.authentication = AuthenticationConfig {
             session_idle_lifetime: Duration::from_secs(60),
             session_absolute_lifetime: Duration::from_secs(600),
@@ -334,6 +346,9 @@ mod tests {
             argon2_memory_kib: 19_456,
             argon2_iterations: 2,
             argon2_parallelism: 1,
+            email_encryption_key_id,
+            email_encryption_key,
+            email_lookup_hmac_key,
         };
         config
     }

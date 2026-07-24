@@ -10,15 +10,27 @@ use manchester_dnd_core::{
     is_valid_opaque_id,
     rules_matrix::RuntimeResources,
 };
+use mongodb::{
+    ClientSession, Collection,
+    bson::{Bson, DateTime, Document, doc},
+    options::ReturnDocument,
+};
 use serde::{Deserialize, Serialize};
-use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+use uuid::Uuid;
 
 use super::{
-    PostgresRepository, SaveOutcome, StoredDocument, map_insert_error,
-    pins::{SealAuthority, seal_campaign_pins_in_transaction},
+    AuditEventDocument, BdeRuntimeDocument, CommandReceiptDocument, MongoRepository, SaveOutcome,
+    StoredDocument, active_campaign_filter, date_string, ensure_campaign_access_in_session,
+    map_persistence, map_write_result, mongo_error,
+    pins::{seal_campaign_pins_in_transaction, validate_seal},
+    validate_account_id, validate_opaque,
 };
-use crate::error::RepositoryError;
+use crate::{
+    error::{MongoFailureKind, PersistenceError, RepositoryError},
+    persistence::CollectionName,
+};
 
+const STORAGE_SCHEMA_VERSION: u32 = 1;
 const HERO_RECEIPT_RESPONSE_MAX_BYTES: usize = 128 * 1024;
 const CREATION_COMMAND_KIND: &str = "hero_creation_transition";
 const REWARD_COMMAND_KIND: &str = "hero_reward";
@@ -40,14 +52,15 @@ pub(crate) enum HeroReceiptScope {
 impl HeroReceiptScope {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Draft => "draft",
-            Self::Character => "character",
+            Self::Draft => "hero_draft",
+            Self::Character => "campaign_character_instance",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewHeroCommandReceipt {
+    pub(crate) actor_account_id: String,
     pub(crate) scope: HeroReceiptScope,
     pub(crate) scope_id: String,
     pub(crate) campaign_session_id: String,
@@ -67,6 +80,7 @@ pub(crate) struct HeroCreationCommitMetadata<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredHeroCommandReceipt {
+    pub(crate) actor_account_id: String,
     pub(crate) scope: HeroReceiptScope,
     pub(crate) scope_id: String,
     pub(crate) campaign_session_id: String,
@@ -198,7 +212,8 @@ pub(crate) struct HeroMutationCommitOutcome {
     pub(crate) created_character: Option<SaveOutcome>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NewEncounterRewardClaim {
     pub(crate) campaign_session_id: String,
     pub(crate) encounter_id: String,
@@ -243,99 +258,168 @@ impl HeroCharacterMutationCommand<'_> {
     }
 }
 
-impl PostgresRepository {
+impl MongoRepository {
     pub(crate) async fn create_hero_draft(
         &self,
+        actor_account_id: &str,
         draft: &HeroCreationDraft,
         retention_delete_after_epoch_seconds: u64,
     ) -> Result<SaveOutcome, RepositoryError> {
+        validate_account_id(actor_account_id)?;
         validate_draft(draft)?;
-        if retention_delete_after_epoch_seconds < draft.expires_at_epoch_seconds {
+        if draft.owner_id != actor_account_id
+            || retention_delete_after_epoch_seconds < draft.expires_at_epoch_seconds
+        {
             return invalid(
                 "hero creation draft",
                 &draft.draft_id,
-                "retention deadline cannot precede expiry",
+                "actor ownership and retention deadline must be valid",
             );
         }
-        let payload = serialize("hero creation draft", draft)?;
-        let row = sqlx::query(
-            "INSERT INTO hero_creation_drafts
-             (id, campaign_session_id, owner_key, schema_version, revision,
-              expires_at_epoch_seconds, retention_delete_after_epoch_seconds, payload_json)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-             RETURNING updated_at::text AS updated_at",
-        )
-        .bind(&draft.draft_id)
-        .bind(&draft.campaign_id)
-        .bind(&draft.owner_id)
-        .bind(i64::from(HERO_DRAFT_SCHEMA_VERSION))
-        .bind(to_i64(
-            durable_revision(draft.revision, "hero draft revision")?,
-            "hero draft revision",
-        )?)
-        .bind(to_i64(draft.expires_at_epoch_seconds, "hero draft expiry")?)
-        .bind(to_i64(
-            retention_delete_after_epoch_seconds,
-            "hero draft retention",
-        )?)
-        .bind(payload)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| map_insert_error(error, "hero creation draft", &draft.draft_id))?;
+        let now = DateTime::now();
+        let document = HeroDraftDocument {
+            id: draft.draft_id.clone(),
+            schema_version: STORAGE_SCHEMA_VERSION,
+            revision: durable_revision(draft.revision, "hero draft revision")?,
+            owner_account_id: actor_account_id.to_owned(),
+            campaign_id: draft.campaign_id.clone(),
+            step: draft.revision,
+            state: draft_state(draft).to_owned(),
+            expires_at: date_from_epoch_seconds(
+                draft.expires_at_epoch_seconds,
+                "hero draft expiry",
+            )?,
+            purge_at: date_from_epoch_seconds(
+                retention_delete_after_epoch_seconds,
+                "hero draft retention",
+            )?,
+            draft: draft.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        let campaigns = self.campaigns();
+        let drafts = self.hero_drafts();
+        let actor = actor_account_id.to_owned();
+        let campaign_id = draft.campaign_id.clone();
+        let result = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let drafts = drafts.clone();
+                let actor = actor.clone();
+                let campaign_id = campaign_id.clone();
+                let document = document.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        &campaign_id,
+                    )
+                    .await?;
+                    drafts
+                        .insert_one(document)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("create hero draft", error))?;
+                    Ok(())
+                })
+            })
+            .await;
+        map_write_result(result, "hero creation draft", &draft.draft_id)?;
         Ok(SaveOutcome {
             revision: durable_revision(draft.revision, "hero draft revision")?,
-            updated_at: row
-                .try_get("updated_at")
-                .map_err(RepositoryError::Database)?,
+            updated_at: date_string(now),
         })
     }
 
     pub async fn load_hero_draft(
         &self,
+        actor_account_id: &str,
         id: &str,
     ) -> Result<Option<StoredDocument<HeroCreationDraft>>, RepositoryError> {
-        if !is_valid_opaque_id(id) {
-            return invalid(
-                "hero creation draft",
-                id,
-                "draft id must be a valid opaque identifier",
-            );
-        }
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key, expires_at_epoch_seconds,
-                    schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_creation_drafts WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_draft_from_row).transpose()
+        validate_account_id(actor_account_id)?;
+        validate_opaque("hero creation draft", id)?;
+        let campaigns = self.campaigns();
+        let drafts = self.hero_drafts();
+        let actor = actor_account_id.to_owned();
+        let draft_id = id.to_owned();
+        self.store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let drafts = drafts.clone();
+                let actor = actor.clone();
+                let draft_id = draft_id.clone();
+                Box::pin(async move {
+                    let Some(stored) = drafts
+                        .find_one(doc! { "_id": &draft_id, "owner_account_id": &actor })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load hero draft", error))?
+                    else {
+                        return Ok(None);
+                    };
+                    let authorized = campaigns
+                        .find_one(active_campaign_filter(&actor, &stored.campaign_id))
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("authorize hero draft", error))?
+                        .is_some();
+                    Ok(authorized.then_some(stored))
+                })
+            })
+            .await
+            .map_err(map_persistence)?
+            .map(stored_draft)
+            .transpose()
     }
 
     pub async fn load_hero_character(
         &self,
+        actor_account_id: &str,
         id: &str,
     ) -> Result<Option<StoredDocument<HeroCharacter>>, RepositoryError> {
-        if !is_valid_opaque_id(id) {
-            return invalid(
-                "hero character",
-                id,
-                "character id must be a valid opaque identifier",
-            );
-        }
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key,
-                    schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_characters WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_hero_from_row).transpose()
+        validate_account_id(actor_account_id)?;
+        validate_opaque("hero character", id)?;
+        let campaigns = self.campaigns();
+        let heroes = self.hero_instances();
+        let actor = actor_account_id.to_owned();
+        let character_id = id.to_owned();
+        self.store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let heroes = heroes.clone();
+                let actor = actor.clone();
+                let character_id = character_id.clone();
+                Box::pin(async move {
+                    let Some(stored) = heroes
+                        .find_one(doc! {
+                            "_id": &character_id,
+                            "account_id": &actor,
+                            "state": "active",
+                            "runtime_kind": "hero_character",
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load hero character", error))?
+                    else {
+                        return Ok(None);
+                    };
+                    let authorized = campaigns
+                        .find_one(active_campaign_filter(&actor, &stored.campaign_id))
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("authorize hero character", error)
+                        })?
+                        .is_some();
+                    Ok(authorized.then_some(stored))
+                })
+            })
+            .await
+            .map_err(map_persistence)?
+            .map(stored_hero)
+            .transpose()
     }
 
     pub async fn load_latest_hero_draft_for_owner(
@@ -345,51 +429,83 @@ impl PostgresRepository {
         now_epoch_seconds: u64,
     ) -> Result<Option<StoredDocument<HeroCreationDraft>>, RepositoryError> {
         validate_owner_lookup(campaign_session_id, owner_key)?;
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key, expires_at_epoch_seconds,
-                    schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_creation_drafts
-             WHERE campaign_session_id = $1 AND owner_key = $2
-               AND expires_at_epoch_seconds >= $3
-             ORDER BY updated_at DESC, id DESC
-             LIMIT 1",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .bind(to_i64(now_epoch_seconds, "hero draft lookup time")?)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_draft_from_row).transpose()
+        let now = date_from_epoch_seconds(now_epoch_seconds, "hero draft lookup time")?;
+        let campaigns = self.campaigns();
+        let drafts = self.hero_drafts();
+        let campaign = campaign_session_id.to_owned();
+        let owner = owner_key.to_owned();
+        let stored = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let drafts = drafts.clone();
+                let campaign = campaign.clone();
+                let owner = owner.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &owner,
+                        &campaign,
+                    )
+                    .await?;
+                    drafts
+                        .find_one(doc! {
+                            "campaign_id": &campaign,
+                            "owner_account_id": &owner,
+                            "expires_at": { "$gte": now },
+                        })
+                        .sort(doc! { "updated_at": -1_i64, "_id": -1_i64 })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load latest hero draft", error))
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        stored.map(stored_draft).transpose()
     }
 
-    /// Loads retained theme evidence even when a newer replacement draft has
-    /// not selected a theme yet. Campaign pins are immutable for the campaign,
-    /// not scoped to whichever draft happens to be newest.
     pub(crate) async fn load_latest_pinned_hero_draft_for_owner(
         &self,
         campaign_session_id: &str,
         owner_key: &str,
     ) -> Result<Option<StoredDocument<HeroCreationDraft>>, RepositoryError> {
         validate_owner_lookup(campaign_session_id, owner_key)?;
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key, expires_at_epoch_seconds,
-                    schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_creation_drafts
-             WHERE campaign_session_id = $1 AND owner_key = $2
-               AND payload_json->'pins' IS NOT NULL
-               AND payload_json->'pins' <> 'null'::jsonb
-             ORDER BY updated_at DESC, id DESC
-             LIMIT 1",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_draft_from_row).transpose()
+        let campaigns = self.campaigns();
+        let drafts = self.hero_drafts();
+        let campaign = campaign_session_id.to_owned();
+        let owner = owner_key.to_owned();
+        let stored = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let drafts = drafts.clone();
+                let campaign = campaign.clone();
+                let owner = owner.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &owner,
+                        &campaign,
+                    )
+                    .await?;
+                    drafts
+                        .find_one(doc! {
+                            "campaign_id": &campaign,
+                            "owner_account_id": &owner,
+                            "draft.pins": { "$ne": Bson::Null },
+                        })
+                        .sort(doc! { "updated_at": -1_i64, "_id": -1_i64 })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load pinned hero draft", error))
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        stored.map(stored_draft).transpose()
     }
 
     pub async fn load_hero_character_for_owner(
@@ -398,84 +514,156 @@ impl PostgresRepository {
         owner_key: &str,
     ) -> Result<Option<StoredDocument<HeroCharacter>>, RepositoryError> {
         validate_owner_lookup(campaign_session_id, owner_key)?;
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, owner_key,
-                    schema_version, revision, payload_json::text AS payload_json,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM hero_characters
-             WHERE campaign_session_id = $1 AND owner_key = $2",
-        )
-        .bind(campaign_session_id)
-        .bind(owner_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_hero_from_row).transpose()
+        let campaigns = self.campaigns();
+        let heroes = self.hero_instances();
+        let campaign = campaign_session_id.to_owned();
+        let owner = owner_key.to_owned();
+        let stored = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let heroes = heroes.clone();
+                let campaign = campaign.clone();
+                let owner = owner.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &owner,
+                        &campaign,
+                    )
+                    .await?;
+                    heroes
+                        .find_one(doc! {
+                            "campaign_id": &campaign,
+                            "account_id": &owner,
+                            "state": "active",
+                            "runtime_kind": "hero_character",
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load hero for owner", error))
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        stored.map(stored_hero).transpose()
     }
 
     pub(crate) async fn delete_retired_hero_drafts(
         &self,
         now_epoch_seconds: u64,
     ) -> Result<u64, RepositoryError> {
-        let result = sqlx::query(
-            "DELETE FROM hero_creation_drafts
-             WHERE retention_delete_after_epoch_seconds <= $1",
-        )
-        .bind(to_i64(now_epoch_seconds, "hero draft cleanup time")?)
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        Ok(result.rows_affected())
+        let now = date_from_epoch_seconds(now_epoch_seconds, "hero draft cleanup time")?;
+        self.hero_drafts()
+            .delete_many(doc! { "purge_at": { "$lte": now } })
+            .await
+            .map(|result| result.deleted_count)
+            .map_err(|error| mongo_error("delete retired hero drafts", error))
     }
 
     pub(crate) async fn load_hero_command_receipt(
         &self,
+        actor_account_id: &str,
         scope: HeroReceiptScope,
         scope_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<StoredHeroCommandReceipt>, RepositoryError> {
-        validate_receipt_lookup(scope_id, idempotency_key)?;
-        let row = sqlx::query(
-            "SELECT scope_kind, scope_id, campaign_session_id, idempotency_key,
-                    command_kind, request_fingerprint, expected_revision, result_revision,
-                    audit_id, response_json, created_at::text AS created_at
-             FROM hero_command_receipts
-             WHERE scope_kind = $1 AND scope_id = $2 AND idempotency_key = $3",
-        )
-        .bind(scope.as_str())
-        .bind(scope_id)
-        .bind(idempotency_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_receipt_from_row).transpose()
+        validate_receipt_lookup(actor_account_id, scope_id, idempotency_key)?;
+        let campaigns = self.campaigns();
+        let receipts = self.receipts();
+        let actor = actor_account_id.to_owned();
+        let scope_id = scope_id.to_owned();
+        let key = idempotency_key.to_owned();
+        let stored = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let receipts = receipts.clone();
+                let actor = actor.clone();
+                let scope_id = scope_id.clone();
+                let key = key.clone();
+                Box::pin(async move {
+                    let Some(receipt) = receipts
+                        .find_one(doc! {
+                            "scope_kind": scope.as_str(),
+                            "scope_id": &scope_id,
+                            "actor_account_id": &actor,
+                            "idempotency_key": &key,
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load hero receipt", error))?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(campaign_id) = receipt.campaign_id.as_deref() else {
+                        return Err(PersistenceError::SchemaDrift {
+                            collection: CollectionName::CommandReceipts.as_str().to_owned(),
+                            detail: "hero receipt is missing campaign scope".to_owned(),
+                        });
+                    };
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        campaign_id,
+                    )
+                    .await?;
+                    Ok(Some(receipt))
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        stored.map(stored_receipt).transpose()
     }
 
     pub(crate) async fn load_encounter_reward_claim(
         &self,
+        actor_account_id: &str,
         campaign_session_id: &str,
         encounter_id: &str,
     ) -> Result<Option<StoredEncounterRewardClaim>, RepositoryError> {
-        if !is_valid_opaque_id(campaign_session_id) || !is_valid_opaque_id(encounter_id) {
-            return invalid(
-                "encounter reward claim",
-                encounter_id,
-                "campaign and encounter ids must be valid opaque identifiers",
-            );
-        }
-        let row = sqlx::query(
-            "SELECT campaign_session_id, encounter_id, character_id,
-                    encounter_revision, victory_event_sequence, reward_tier,
-                    experience_awarded, hero_audit_id, created_at::text AS created_at
-             FROM encounter_reward_claims
-             WHERE campaign_session_id = $1 AND encounter_id = $2",
-        )
-        .bind(campaign_session_id)
-        .bind(encounter_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(stored_encounter_reward_claim_from_row).transpose()
+        validate_owner_lookup(campaign_session_id, actor_account_id)?;
+        validate_opaque("encounter", encounter_id)?;
+        let campaigns = self.campaigns();
+        let audits = self.audits();
+        let actor = actor_account_id.to_owned();
+        let campaign = campaign_session_id.to_owned();
+        let encounter = encounter_id.to_owned();
+        let stored = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let audits = audits.clone();
+                let actor = actor.clone();
+                let campaign = campaign.clone();
+                let encounter = encounter.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        &campaign,
+                    )
+                    .await?;
+                    audits
+                        .find_one(doc! {
+                            "category": "encounter_reward_claim",
+                            "scope_kind": "encounter",
+                            "scope_id": &encounter,
+                            "metadata.campaign_session_id": &campaign,
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load encounter reward claim", error)
+                        })
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        stored.map(stored_encounter_claim).transpose()
     }
 
     pub(crate) async fn commit_hero_creation_transition(
@@ -487,10 +675,7 @@ impl PostgresRepository {
         created_character: Option<&HeroCharacter>,
         metadata: HeroCreationCommitMetadata<'_>,
     ) -> Result<HeroMutationCommitOutcome, RepositoryError> {
-        let HeroCreationCommitMetadata {
-            receipt,
-            campaign_pins,
-        } = metadata;
+        let receipt = metadata.receipt;
         validate_draft(draft)?;
         audit.validate()?;
         validate_receipt(receipt, audit)?;
@@ -502,11 +687,20 @@ impl PostgresRepository {
             created_character,
             receipt,
         )?;
-        match (&command.intent, campaign_pins) {
+        if receipt.actor_account_id != draft.owner_id {
+            return invalid(
+                "hero creation draft",
+                &draft.draft_id,
+                "receipt actor must own the draft",
+            );
+        }
+        match (&command.intent, metadata.campaign_pins) {
             (
                 manchester_dnd_core::hero::HeroCreationIntent::SelectCampaignTheme { pins },
                 Some(evidence),
-            ) if evidence.pins.hero == *pins => {}
+            ) if evidence.pins.hero == *pins => {
+                validate_seal(&receipt.actor_account_id, &draft.campaign_id, evidence)?;
+            }
             (manchester_dnd_core::hero::HeroCreationIntent::SelectCampaignTheme { .. }, None) => {
                 return invalid(
                     "campaign content pins",
@@ -521,7 +715,7 @@ impl PostgresRepository {
                 return invalid(
                     "campaign content pins",
                     &draft.campaign_id,
-                    "campaign pins must match the selected hero theme exactly",
+                    "campaign pins must match the selected hero theme",
                 );
             }
             (_, Some(_)) => {
@@ -534,13 +728,13 @@ impl PostgresRepository {
             (_, None) => {}
         }
 
-        let draft_payload = serialize("hero creation draft", draft)?;
-        let character_payload = created_character
-            .map(|character| serialize("hero character", character))
-            .transpose()?;
-        let audit_payload = serialize("hero audit", audit)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let stored = load_locked_draft(&mut transaction, &draft.draft_id).await?;
+        let stored = self
+            .load_hero_draft(&receipt.actor_account_id, &draft.draft_id)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound {
+                entity: "hero creation draft",
+                id: draft.draft_id.clone(),
+            })?;
         validate_draft_successor(
             &stored,
             draft,
@@ -549,90 +743,176 @@ impl PostgresRepository {
             audit,
             created_character,
         )?;
-        if let Some(evidence) = campaign_pins {
-            seal_campaign_pins_in_transaction(
-                &mut transaction,
-                &draft.campaign_id,
-                evidence,
-                SealAuthority::ThemeSelection,
-            )
-            .await?;
-        }
+        let now = DateTime::now();
+        let next_durable_revision = durable_revision(draft.revision, "hero draft revision")?;
+        let expected_durable_revision =
+            durable_revision(expected_revision, "expected hero draft revision")?;
+        let created_document = created_character
+            .map(|character| HeroInstanceDocument::new(character.clone(), now))
+            .transpose()?;
+        let audit_document = hero_audit_document(&draft.campaign_id, audit, now)?;
+        let receipt_document = hero_receipt_document(receipt, now)?;
 
-        let row = sqlx::query(
-            "UPDATE hero_creation_drafts
-             SET schema_version = $1, revision = $2, payload_json = $3::jsonb,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4 AND revision = $5
-             RETURNING updated_at::text AS updated_at",
-        )
-        .bind(i64::from(HERO_DRAFT_SCHEMA_VERSION))
-        .bind(to_i64(
-            durable_revision(draft.revision, "hero draft revision")?,
-            "hero draft revision",
-        )?)
-        .bind(draft_payload)
-        .bind(&draft.draft_id)
-        .bind(to_i64(
-            durable_revision(expected_revision, "expected hero draft revision")?,
-            "expected hero draft revision",
-        )?)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .ok_or_else(|| RepositoryError::RevisionConflict {
-            entity: "hero creation draft",
-            id: draft.draft_id.clone(),
-            expected: expected_revision,
-            actual: stored.value.revision,
-        })?;
-        let draft_save = SaveOutcome {
-            revision: durable_revision(draft.revision, "hero draft revision")?,
-            updated_at: row
-                .try_get("updated_at")
-                .map_err(RepositoryError::Database)?,
-        };
-
-        let character_save = if let (Some(character), Some(payload)) =
-            (created_character, character_payload)
-        {
-            let row = sqlx::query(
-                "INSERT INTO hero_characters
-                 (id, campaign_session_id, owner_key, schema_version, revision, payload_json)
-                 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                 RETURNING updated_at::text AS updated_at",
-            )
-            .bind(&character.character_id)
-            .bind(&character.campaign_id)
-            .bind(&character.owner_id)
-            .bind(i64::from(HERO_CHARACTER_SCHEMA_VERSION))
-            .bind(to_i64(
-                durable_revision(character.revision, "hero character revision")?,
-                "hero character revision",
-            )?)
-            .bind(payload)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|error| map_insert_error(error, "hero character", &character.character_id))?;
-            Some(SaveOutcome {
-                revision: durable_revision(character.revision, "hero character revision")?,
-                updated_at: row
-                    .try_get("updated_at")
-                    .map_err(RepositoryError::Database)?,
+        let campaigns = self.campaigns();
+        let drafts = self.hero_drafts();
+        let heroes = self.hero_instances();
+        let audits = self.audits();
+        let receipts = self.receipts();
+        let actor = receipt.actor_account_id.clone();
+        let campaign_id = draft.campaign_id.clone();
+        let draft_id = draft.draft_id.clone();
+        let successor = draft.clone();
+        let pins = metadata.campaign_pins.cloned();
+        let result = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let drafts = drafts.clone();
+                let heroes = heroes.clone();
+                let audits = audits.clone();
+                let receipts = receipts.clone();
+                let actor = actor.clone();
+                let campaign_id = campaign_id.clone();
+                let draft_id = draft_id.clone();
+                let successor = successor.clone();
+                let created = created_document.clone();
+                let audit = audit_document.clone();
+                let receipt = receipt_document.clone();
+                let pins = pins.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        &campaign_id,
+                    )
+                    .await?;
+                    reject_conflicting_hero_receipt(&receipts, client_session, &receipt).await?;
+                    let updated = drafts
+                        .find_one_and_update(
+                            doc! {
+                                "_id": &draft_id,
+                                "owner_account_id": &actor,
+                                "campaign_id": &campaign_id,
+                                "revision": i64::try_from(expected_durable_revision).map_err(
+                                    |_| PersistenceError::SchemaDrift {
+                                        collection: CollectionName::PlayerCharacterDrafts
+                                            .as_str()
+                                            .to_owned(),
+                                        detail: "hero draft revision exceeds BSON range"
+                                            .to_owned(),
+                                    },
+                                )?,
+                            },
+                            doc! {
+                                "$set": {
+                                    "revision": i64::try_from(next_durable_revision).map_err(
+                                        |_| PersistenceError::SchemaDrift {
+                                            collection: CollectionName::PlayerCharacterDrafts
+                                                .as_str()
+                                                .to_owned(),
+                                            detail: "hero draft revision exceeds BSON range"
+                                                .to_owned(),
+                                        },
+                                    )?,
+                                    "step": i64::try_from(successor.revision).map_err(
+                                        |_| PersistenceError::SchemaDrift {
+                                            collection: CollectionName::PlayerCharacterDrafts
+                                                .as_str()
+                                                .to_owned(),
+                                            detail: "hero draft step exceeds BSON range".to_owned(),
+                                        },
+                                    )?,
+                                    "state": draft_state(&successor),
+                                    "draft": mongodb::bson::to_bson(&successor)
+                                        .map_err(PersistenceError::BsonEncoding)?,
+                                    "updated_at": now,
+                                }
+                            },
+                        )
+                        .return_document(ReturnDocument::After)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("commit hero draft transition", error)
+                        })?;
+                    let updated = match updated {
+                        Some(updated) => updated,
+                        None => {
+                            let current = drafts
+                                .find_one(doc! {
+                                    "_id": &draft_id,
+                                    "owner_account_id": &actor,
+                                    "campaign_id": &campaign_id,
+                                })
+                                .session(&mut *client_session)
+                                .await
+                                .map_err(|error| {
+                                    PersistenceError::mongo(
+                                        "load conflicting hero draft revision",
+                                        error,
+                                    )
+                                })?
+                                .ok_or_else(|| PersistenceError::NotFound {
+                                    entity: "hero creation draft",
+                                    id: draft_id.clone(),
+                                })?;
+                            return Err(PersistenceError::RevisionConflict {
+                                entity: "hero creation draft",
+                                id: draft_id,
+                                expected: expected_revision,
+                                actual: current.draft.revision,
+                            });
+                        }
+                    };
+                    if let Some(character) = created {
+                        heroes
+                            .insert_one(character)
+                            .session(&mut *client_session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("create campaign hero instance", error)
+                            })?;
+                    }
+                    if let Some(pins) = pins {
+                        seal_campaign_pins_in_transaction(
+                            &campaigns,
+                            client_session,
+                            &actor,
+                            &campaign_id,
+                            &pins,
+                            now,
+                        )
+                        .await?;
+                    }
+                    audits
+                        .insert_one(audit)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert hero audit", error))?;
+                    receipts
+                        .insert_one(receipt)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert hero receipt", error))?;
+                    Ok(updated.updated_at)
+                })
             })
-        } else {
-            None
-        };
-
-        insert_hero_audit(&mut transaction, &draft.campaign_id, audit, audit_payload).await?;
-        insert_hero_receipt(&mut transaction, receipt).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
+            .await;
+        let updated_at = map_hero_commit_result(self, result, receipt).await?;
         Ok(HeroMutationCommitOutcome {
-            subject: draft_save,
-            created_character: character_save,
+            subject: SaveOutcome {
+                revision: next_durable_revision,
+                updated_at: date_string(updated_at),
+            },
+            created_character: created_character
+                .map(|character| {
+                    Ok::<SaveOutcome, RepositoryError>(SaveOutcome {
+                        revision: durable_revision(character.revision, "hero character revision")?,
+                        updated_at: date_string(now),
+                    })
+                })
+                .transpose()?,
         })
     }
 
@@ -647,13 +927,23 @@ impl PostgresRepository {
         validate_character(character)?;
         audit.validate()?;
         validate_receipt(receipt, audit)?;
+        if receipt.actor_account_id != character.owner_id {
+            return invalid(
+                "hero character",
+                &character.character_id,
+                "receipt actor must own the campaign character",
+            );
+        }
         if let HeroCharacterMutationCommand::EncounterReward { reward, claim } = command {
             validate_encounter_reward_claim(character, reward, claim, audit, receipt)?;
         }
-        let character_payload = serialize("hero character", character)?;
-        let audit_payload = serialize("hero audit", audit)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        let stored = load_locked_hero(&mut transaction, &character.character_id).await?;
+        let stored = self
+            .load_hero_character(&receipt.actor_account_id, &character.character_id)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound {
+                entity: "hero character",
+                id: character.character_id.clone(),
+            })?;
         validate_character_successor(
             &stored,
             character,
@@ -663,216 +953,333 @@ impl PostgresRepository {
             receipt,
         )?;
 
-        let row = sqlx::query(
-            "UPDATE hero_characters
-             SET schema_version = $1, revision = $2, payload_json = $3::jsonb,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4 AND revision = $5
-             RETURNING updated_at::text AS updated_at",
-        )
-        .bind(i64::from(HERO_CHARACTER_SCHEMA_VERSION))
-        .bind(to_i64(
-            durable_revision(character.revision, "hero character revision")?,
-            "hero character revision",
-        )?)
-        .bind(character_payload)
-        .bind(&character.character_id)
-        .bind(to_i64(
-            durable_revision(expected_revision, "expected hero character revision")?,
-            "expected hero character revision",
-        )?)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?
-        .ok_or_else(|| RepositoryError::RevisionConflict {
-            entity: "hero character",
-            id: character.character_id.clone(),
-            expected: expected_revision,
-            actual: stored.value.revision,
-        })?;
-        let save = SaveOutcome {
-            revision: durable_revision(character.revision, "hero character revision")?,
-            updated_at: row
-                .try_get("updated_at")
-                .map_err(RepositoryError::Database)?,
+        let now = DateTime::now();
+        let next_durable_revision =
+            durable_revision(character.revision, "hero character revision")?;
+        let expected_durable_revision =
+            durable_revision(expected_revision, "expected hero character revision")?;
+        let progression = hero_progression(character)?;
+        let audit_document = hero_audit_document(&character.campaign_id, audit, now)?;
+        let claim_document = match command {
+            HeroCharacterMutationCommand::EncounterReward { claim, .. } => Some(
+                encounter_claim_document(&receipt.actor_account_id, claim, now)?,
+            ),
+            HeroCharacterMutationCommand::Reward(_) | HeroCharacterMutationCommand::LevelUp(_) => {
+                None
+            }
         };
-        insert_hero_audit(
-            &mut transaction,
-            &character.campaign_id,
-            audit,
-            audit_payload,
-        )
-        .await?;
-        if let HeroCharacterMutationCommand::EncounterReward { claim, .. } = command {
-            insert_encounter_reward_claim(&mut transaction, claim).await?;
-        }
-        insert_hero_receipt(&mut transaction, receipt).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
+        let receipt_document = hero_receipt_document(receipt, now)?;
+        let campaigns = self.campaigns();
+        let heroes = self.hero_instances();
+        let audits = self.audits();
+        let receipts = self.receipts();
+        let actor = receipt.actor_account_id.clone();
+        let campaign_id = character.campaign_id.clone();
+        let character_id = character.character_id.clone();
+        let successor = character.clone();
+        let result = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let heroes = heroes.clone();
+                let audits = audits.clone();
+                let receipts = receipts.clone();
+                let actor = actor.clone();
+                let campaign_id = campaign_id.clone();
+                let character_id = character_id.clone();
+                let successor = successor.clone();
+                let progression = progression.clone();
+                let audit = audit_document.clone();
+                let claim = claim_document.clone();
+                let receipt = receipt_document.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        &campaign_id,
+                    )
+                    .await?;
+                    reject_conflicting_hero_receipt(&receipts, client_session, &receipt).await?;
+                    let updated = heroes
+                        .find_one_and_update(
+                            doc! {
+                                "_id": &character_id,
+                                "campaign_id": &campaign_id,
+                                "account_id": &actor,
+                                "runtime_kind": "hero_character",
+                                "state": "active",
+                                "revision": i64::try_from(expected_durable_revision).map_err(
+                                    |_| PersistenceError::SchemaDrift {
+                                        collection: CollectionName::CampaignCharacterInstances
+                                            .as_str()
+                                            .to_owned(),
+                                        detail: "hero revision exceeds BSON range".to_owned(),
+                                    },
+                                )?,
+                            },
+                            doc! {
+                                "$set": {
+                                    "revision": i64::try_from(next_durable_revision).map_err(
+                                        |_| PersistenceError::SchemaDrift {
+                                            collection: CollectionName::CampaignCharacterInstances
+                                                .as_str()
+                                                .to_owned(),
+                                            detail: "hero revision exceeds BSON range".to_owned(),
+                                        },
+                                    )?,
+                                    "progression": progression,
+                                    "runtime.hero_character": mongodb::bson::to_bson(&successor)
+                                        .map_err(PersistenceError::BsonEncoding)?,
+                                    "updated_at": now,
+                                }
+                            },
+                        )
+                        .return_document(ReturnDocument::After)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("commit hero character mutation", error)
+                        })?;
+                    let updated = match updated {
+                        Some(updated) => updated,
+                        None => {
+                            let current = heroes
+                                .find_one(doc! {
+                                    "_id": &character_id,
+                                    "campaign_id": &campaign_id,
+                                    "account_id": &actor,
+                                    "runtime_kind": "hero_character",
+                                    "state": "active",
+                                })
+                                .session(&mut *client_session)
+                                .await
+                                .map_err(|error| {
+                                    PersistenceError::mongo("load conflicting hero revision", error)
+                                })?
+                                .ok_or_else(|| PersistenceError::NotFound {
+                                    entity: "hero character",
+                                    id: character_id.clone(),
+                                })?;
+                            return Err(PersistenceError::RevisionConflict {
+                                entity: "hero character",
+                                id: character_id,
+                                expected: expected_revision,
+                                actual: current.runtime.hero_character.revision,
+                            });
+                        }
+                    };
+                    audits
+                        .insert_one(audit)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert hero audit", error))?;
+                    if let Some(claim) = claim {
+                        audits
+                            .insert_one(claim)
+                            .session(&mut *client_session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("insert encounter reward claim", error)
+                            })?;
+                    }
+                    receipts
+                        .insert_one(receipt)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert hero receipt", error))?;
+                    Ok(updated.updated_at)
+                })
+            })
+            .await;
+        let updated_at = map_hero_commit_result(self, result, receipt).await?;
         Ok(HeroMutationCommitOutcome {
-            subject: save,
+            subject: SaveOutcome {
+                revision: next_durable_revision,
+                updated_at: date_string(updated_at),
+            },
             created_character: None,
         })
     }
 
     pub async fn list_hero_audits(
         &self,
+        actor_account_id: &str,
         campaign_session_id: &str,
         subject_id: &str,
     ) -> Result<Vec<StoredHeroAudit>, RepositoryError> {
-        if !is_valid_opaque_id(campaign_session_id) || !is_valid_opaque_id(subject_id) {
-            return invalid(
-                "hero audit",
-                subject_id,
-                "campaign and subject ids must be valid opaque identifiers",
-            );
-        }
-        let rows = sqlx::query(
-            "SELECT id, campaign_session_id, subject_kind, subject_id, subject_revision,
-                    audit_kind, schema_version,
-                    occurred_at_epoch_seconds, payload_json::text AS payload_json,
-                    created_at::text AS created_at
-             FROM hero_audits
-             WHERE campaign_session_id = $1 AND subject_id = $2
-             ORDER BY subject_revision, id",
-        )
-        .bind(campaign_session_id)
-        .bind(subject_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        rows.into_iter().map(stored_audit_from_row).collect()
+        validate_owner_lookup(campaign_session_id, actor_account_id)?;
+        validate_opaque("hero audit subject", subject_id)?;
+        let campaigns = self.campaigns();
+        let audits = self.audits();
+        let actor = actor_account_id.to_owned();
+        let campaign = campaign_session_id.to_owned();
+        let subject = subject_id.to_owned();
+        let stored = self
+            .store()
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let audits = audits.clone();
+                let actor = actor.clone();
+                let campaign = campaign.clone();
+                let subject = subject.clone();
+                Box::pin(async move {
+                    ensure_campaign_access_in_session(
+                        &campaigns,
+                        client_session,
+                        &actor,
+                        &campaign,
+                    )
+                    .await?;
+                    let mut cursor = audits
+                        .find(doc! {
+                            "category": "hero",
+                            "scope_id": &subject,
+                            "metadata.campaign_session_id": &campaign,
+                        })
+                        .sort(doc! { "metadata.subject_revision": 1_i64, "_id": 1_i64 })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("list hero audits", error))?;
+                    let mut output = Vec::new();
+                    while cursor
+                        .advance(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("read hero audits", error))?
+                    {
+                        output.push(cursor.deserialize_current().map_err(|error| {
+                            PersistenceError::mongo("decode hero audit", error)
+                        })?);
+                    }
+                    Ok(output)
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        stored.into_iter().map(stored_audit).collect()
+    }
+
+    fn hero_drafts(&self) -> Collection<HeroDraftDocument> {
+        self.store()
+            .collection(CollectionName::PlayerCharacterDrafts)
+    }
+
+    fn hero_instances(&self) -> Collection<HeroInstanceDocument> {
+        self.store()
+            .collection(CollectionName::CampaignCharacterInstances)
     }
 }
 
-fn validate_owner_lookup(
-    campaign_session_id: &str,
-    owner_key: &str,
-) -> Result<(), RepositoryError> {
-    if !is_valid_opaque_id(campaign_session_id) || !is_valid_opaque_id(owner_key) {
-        return invalid(
-            "hero owner workspace",
-            owner_key,
-            "campaign and owner keys must be valid opaque identifiers",
-        );
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeroDraftDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: u32,
+    revision: u64,
+    owner_account_id: String,
+    campaign_id: String,
+    step: u64,
+    state: String,
+    expires_at: DateTime,
+    purge_at: DateTime,
+    draft: HeroCreationDraft,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeroRuntimeDocument {
+    hero_character: HeroCharacter,
+    bde: BdeRuntimeDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct HeroInstanceDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: u32,
+    revision: u64,
+    campaign_id: String,
+    account_id: String,
+    source_player_character_id: String,
+    runtime_kind: String,
+    state: String,
+    source_snapshot: Document,
+    progression: Document,
+    runtime: HeroRuntimeDocument,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+impl HeroInstanceDocument {
+    fn new(character: HeroCharacter, now: DateTime) -> Result<Self, RepositoryError> {
+        validate_character(&character)?;
+        let progression = hero_progression(&character)?;
+        Ok(Self {
+            id: character.character_id.clone(),
+            schema_version: STORAGE_SCHEMA_VERSION,
+            revision: durable_revision(character.revision, "hero character revision")?,
+            campaign_id: character.campaign_id.clone(),
+            account_id: character.owner_id.clone(),
+            source_player_character_id: character.character_id.clone(),
+            runtime_kind: "hero_character".to_owned(),
+            state: "active".to_owned(),
+            source_snapshot: doc! {
+                "source_kind": "hero_creation",
+                "source_id": &character.character_id,
+                "source_revision": 1_i64,
+            },
+            progression,
+            runtime: HeroRuntimeDocument {
+                hero_character: character,
+                bde: BdeRuntimeDocument::default(),
+            },
+            created_at: now,
+            updated_at: now,
+        })
     }
-    Ok(())
 }
 
-async fn load_locked_draft(
-    transaction: &mut Transaction<'_, Postgres>,
-    id: &str,
-) -> Result<StoredDocument<HeroCreationDraft>, RepositoryError> {
-    let row = sqlx::query(
-        "SELECT id, campaign_session_id, owner_key, expires_at_epoch_seconds,
-                schema_version, revision, payload_json::text AS payload_json,
-                created_at::text AS created_at, updated_at::text AS updated_at
-         FROM hero_creation_drafts WHERE id = $1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?
-    .ok_or_else(|| RepositoryError::NotFound {
-        entity: "hero creation draft",
-        id: id.to_owned(),
-    })?;
-    stored_draft_from_row(row)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct EncounterClaimEvidence {
+    claim: NewEncounterRewardClaim,
 }
 
-async fn load_locked_hero(
-    transaction: &mut Transaction<'_, Postgres>,
-    id: &str,
-) -> Result<StoredDocument<HeroCharacter>, RepositoryError> {
-    let row = sqlx::query(
-        "SELECT id, campaign_session_id, owner_key,
-                schema_version, revision, payload_json::text AS payload_json,
-                created_at::text AS created_at, updated_at::text AS updated_at
-         FROM hero_characters WHERE id = $1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?
-    .ok_or_else(|| RepositoryError::NotFound {
-        entity: "hero character",
-        id: id.to_owned(),
-    })?;
-    stored_hero_from_row(row)
+#[derive(Debug, Clone)]
+#[allow(dead_code, clippy::large_enum_variant)]
+pub(super) enum PreparedEncounterHeroUpdate {
+    Unchanged(SaveOutcome),
+    Update {
+        character_id: String,
+        expected_revision: u64,
+        result_revision: u64,
+        character: HeroCharacter,
+        progression: Document,
+    },
 }
 
-fn stored_draft_from_row(row: PgRow) -> Result<StoredDocument<HeroCreationDraft>, RepositoryError> {
-    let campaign_session_id: String = row
-        .try_get("campaign_session_id")
-        .map_err(RepositoryError::Database)?;
-    let owner_key: String = row
-        .try_get("owner_key")
-        .map_err(RepositoryError::Database)?;
-    let expires_at_epoch_seconds = from_i64(
-        row.try_get("expires_at_epoch_seconds")
-            .map_err(RepositoryError::Database)?,
-        "hero draft expiry",
-    )?;
-    let stored = stored_document_from_row(row, "hero creation draft")?;
-    validate_draft(&stored.value)?;
-    if stored.schema_version != u32::from(HERO_DRAFT_SCHEMA_VERSION)
-        || stored.id != stored.value.draft_id
-        || stored.revision != durable_revision(stored.value.revision, "hero draft revision")?
-        || campaign_session_id != stored.value.campaign_id
-        || owner_key != stored.value.owner_id
-        || expires_at_epoch_seconds != stored.value.expires_at_epoch_seconds
-    {
-        return invalid(
-            "hero creation draft",
-            &stored.id,
-            "row metadata and validated draft payload do not match",
-        );
-    }
-    Ok(stored)
-}
-
-fn stored_hero_from_row(row: PgRow) -> Result<StoredDocument<HeroCharacter>, RepositoryError> {
-    let campaign_session_id: String = row
-        .try_get("campaign_session_id")
-        .map_err(RepositoryError::Database)?;
-    let owner_key: String = row
-        .try_get("owner_key")
-        .map_err(RepositoryError::Database)?;
-    let stored = stored_document_from_row(row, "hero character")?;
-    validate_character(&stored.value)?;
-    if stored.schema_version != u32::from(HERO_CHARACTER_SCHEMA_VERSION)
-        || stored.id != stored.value.character_id
-        || stored.revision != durable_revision(stored.value.revision, "hero character revision")?
-        || campaign_session_id != stored.value.campaign_id
-        || owner_key != stored.value.owner_id
-    {
-        return invalid(
-            "hero character",
-            &stored.id,
-            "row metadata and validated character payload do not match",
-        );
-    }
-    Ok(stored)
-}
-
-/// Commits the authoritative hero runtime snapshot while the caller still owns
-/// the surrounding session-event transaction. The successor is reconstructed
-/// from the locked row so this path can change only current HP/resource counts.
-pub(super) async fn commit_encounter_hero_update(
-    transaction: &mut Transaction<'_, Postgres>,
+pub(super) async fn prepare_encounter_hero_update(
+    repository: &MongoRepository,
+    actor_account_id: &str,
     campaign_session_id: &str,
     event: &SessionEventDto,
     update: EncounterHeroUpdate<'_>,
-) -> Result<SaveOutcome, RepositoryError> {
+) -> Result<PreparedEncounterHeroUpdate, RepositoryError> {
     validate_character(update.character)?;
-    let stored = load_locked_hero(transaction, &update.character.character_id).await?;
+    let stored = repository
+        .load_hero_character(actor_account_id, &update.character.character_id)
+        .await?
+        .ok_or_else(|| RepositoryError::NotFound {
+            entity: "hero character",
+            id: update.character.character_id.clone(),
+        })?;
     if stored.value.campaign_id != campaign_session_id {
         return invalid(
             "hero character",
             &stored.id,
-            "encounter hero is not linked to the campaign session",
+            "encounter hero is not linked to the campaign",
         );
     }
     if stored.value.revision != update.expected_revision {
@@ -883,14 +1290,13 @@ pub(super) async fn commit_encounter_hero_update(
             actual: stored.value.revision,
         });
     }
-
     let outcome = match &event.payload {
         SessionEventPayload::EncounterResolved { outcome, .. } => outcome,
         _ => {
             return invalid(
                 "hero character",
                 &update.character.character_id,
-                "an encounter hero update requires an encounter resolution event",
+                "encounter hero update requires an encounter resolution event",
             );
         }
     };
@@ -902,7 +1308,7 @@ pub(super) async fn commit_encounter_hero_update(
     .map_err(|_| RepositoryError::InvalidDomainState {
         entity: "hero character",
         id: update.character.character_id.clone(),
-        reason: "hero resources cannot be projected into the encounter runtime",
+        reason: "hero resources cannot be projected into encounter runtime",
     })?;
     if state.schema_version != ENCOUNTER_SCHEMA_VERSION
         || state.hero.source_character_id.as_deref() != Some(update.character.character_id.as_str())
@@ -917,17 +1323,15 @@ pub(super) async fn commit_encounter_hero_update(
         return invalid(
             "hero character",
             &update.character.character_id,
-            "encounter outcome and authoritative hero revision/runtime do not match",
+            "encounter outcome and authoritative hero runtime do not match",
         );
     }
-
     if stored.value == *update.character {
-        return Ok(SaveOutcome {
+        return Ok(PreparedEncounterHeroUpdate::Unchanged(SaveOutcome {
             revision: stored.revision,
             updated_at: stored.updated_at,
-        });
+        }));
     }
-
     let resource_currents = update
         .character
         .sheet
@@ -953,272 +1357,485 @@ pub(super) async fn commit_encounter_hero_update(
             "encounter commits may only advance current HP and resource counters",
         );
     }
-
-    let payload = serialize("hero character", update.character)?;
-    let next_durable_revision =
-        durable_revision(update.character.revision, "hero character revision")?;
-    let expected_durable_revision =
-        durable_revision(update.expected_revision, "expected hero character revision")?;
-    let row = sqlx::query(
-        "UPDATE hero_characters
-         SET schema_version = $1, revision = $2, payload_json = $3::jsonb,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4 AND campaign_session_id = $5 AND revision = $6
-         RETURNING updated_at::text AS updated_at",
-    )
-    .bind(i64::from(HERO_CHARACTER_SCHEMA_VERSION))
-    .bind(to_i64(next_durable_revision, "hero character revision")?)
-    .bind(payload)
-    .bind(&update.character.character_id)
-    .bind(campaign_session_id)
-    .bind(to_i64(
-        expected_durable_revision,
-        "expected hero character revision",
-    )?)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(RepositoryError::Database)?
-    .ok_or_else(|| RepositoryError::RevisionConflict {
-        entity: "hero character",
-        id: update.character.character_id.clone(),
-        expected: update.expected_revision,
-        actual: update.expected_revision,
-    })?;
-    Ok(SaveOutcome {
-        revision: next_durable_revision,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
+    Ok(PreparedEncounterHeroUpdate::Update {
+        character_id: update.character.character_id.clone(),
+        expected_revision: durable_revision(
+            update.expected_revision,
+            "expected hero character revision",
+        )?,
+        result_revision: durable_revision(update.character.revision, "hero character revision")?,
+        character: update.character.clone(),
+        progression: hero_progression(update.character)?,
     })
 }
 
-fn stored_document_from_row<T>(
-    row: PgRow,
-    entity: &'static str,
-) -> Result<StoredDocument<T>, RepositoryError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let value =
-        serde_json::from_str(&payload).map_err(|source| RepositoryError::InvalidStoredData {
-            entity,
-            id: id.clone(),
-            source,
-        })?;
-    Ok(StoredDocument {
-        id,
-        schema_version: from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "hero schema version",
-        )?,
-        revision: from_i64(
-            row.try_get("revision").map_err(RepositoryError::Database)?,
-            "hero revision",
-        )?,
-        value,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
-    })
-}
-
-fn stored_audit_from_row(row: PgRow) -> Result<StoredHeroAudit, RepositoryError> {
-    let id: String = row.try_get("id").map_err(RepositoryError::Database)?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(RepositoryError::Database)?;
-    let payload: HeroAuditPayload = serde_json::from_str(&payload_json).map_err(|source| {
-        RepositoryError::InvalidStoredData {
-            entity: "hero audit",
-            id: id.clone(),
-            source,
+pub(super) async fn commit_prepared_encounter_hero_update(
+    characters: &Collection<HeroInstanceDocument>,
+    client_session: &mut ClientSession,
+    campaign_session_id: &str,
+    now: DateTime,
+    update: PreparedEncounterHeroUpdate,
+) -> Result<SaveOutcome, PersistenceError> {
+    match update {
+        PreparedEncounterHeroUpdate::Unchanged(save) => Ok(save),
+        PreparedEncounterHeroUpdate::Update {
+            character_id,
+            expected_revision,
+            result_revision,
+            character,
+            progression,
+        } => {
+            let result = characters
+                .update_one(
+                    doc! {
+                        "_id": &character_id,
+                        "campaign_id": campaign_session_id,
+                        "runtime_kind": "hero_character",
+                        "state": "active",
+                        "revision": i64::try_from(expected_revision).map_err(|_| {
+                            PersistenceError::SchemaDrift {
+                                collection: CollectionName::CampaignCharacterInstances
+                                    .as_str()
+                                    .to_owned(),
+                                detail: "hero revision exceeds BSON range".to_owned(),
+                            }
+                        })?,
+                    },
+                    doc! {
+                        "$set": {
+                            "revision": i64::try_from(result_revision).map_err(|_| {
+                                PersistenceError::SchemaDrift {
+                                    collection: CollectionName::CampaignCharacterInstances
+                                        .as_str()
+                                        .to_owned(),
+                                    detail: "hero revision exceeds BSON range".to_owned(),
+                                }
+                            })?,
+                            "progression": progression,
+                            "runtime.hero_character": mongodb::bson::to_bson(&character)
+                                .map_err(PersistenceError::BsonEncoding)?,
+                            "updated_at": now,
+                        }
+                    },
+                )
+                .session(&mut *client_session)
+                .await
+                .map_err(|error| PersistenceError::mongo("commit encounter hero update", error))?;
+            if result.modified_count != 1 {
+                let current = characters
+                    .find_one(doc! {
+                        "_id": &character_id,
+                        "campaign_id": campaign_session_id,
+                        "runtime_kind": "hero_character",
+                        "state": "active",
+                    })
+                    .session(&mut *client_session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load conflicting encounter hero revision", error)
+                    })?
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "hero character",
+                        id: character_id.clone(),
+                    })?;
+                return Err(PersistenceError::RevisionConflict {
+                    entity: "hero character",
+                    id: character_id,
+                    expected: expected_revision.saturating_sub(1),
+                    actual: current.runtime.hero_character.revision,
+                });
+            }
+            Ok(SaveOutcome {
+                revision: result_revision,
+                updated_at: date_string(now),
+            })
         }
-    })?;
+    }
+}
+
+fn stored_draft(
+    stored: HeroDraftDocument,
+) -> Result<StoredDocument<HeroCreationDraft>, RepositoryError> {
+    validate_draft(&stored.draft)?;
+    if stored.schema_version != STORAGE_SCHEMA_VERSION
+        || stored.id != stored.draft.draft_id
+        || stored.revision != durable_revision(stored.draft.revision, "hero draft revision")?
+        || stored.campaign_id != stored.draft.campaign_id
+        || stored.owner_account_id != stored.draft.owner_id
+    {
+        return invalid(
+            "hero creation draft",
+            &stored.id,
+            "stored metadata and validated draft do not match",
+        );
+    }
+    Ok(StoredDocument {
+        id: stored.id,
+        schema_version: u32::from(HERO_DRAFT_SCHEMA_VERSION),
+        revision: stored.revision,
+        value: stored.draft,
+        created_at: date_string(stored.created_at),
+        updated_at: date_string(stored.updated_at),
+    })
+}
+
+fn stored_hero(
+    stored: HeroInstanceDocument,
+) -> Result<StoredDocument<HeroCharacter>, RepositoryError> {
+    validate_character(&stored.runtime.hero_character)?;
+    if stored.schema_version != STORAGE_SCHEMA_VERSION
+        || stored.id != stored.runtime.hero_character.character_id
+        || stored.revision
+            != durable_revision(
+                stored.runtime.hero_character.revision,
+                "hero character revision",
+            )?
+        || stored.campaign_id != stored.runtime.hero_character.campaign_id
+        || stored.account_id != stored.runtime.hero_character.owner_id
+    {
+        return invalid(
+            "hero character",
+            &stored.id,
+            "stored metadata and validated hero do not match",
+        );
+    }
+    Ok(StoredDocument {
+        id: stored.id,
+        schema_version: u32::from(HERO_CHARACTER_SCHEMA_VERSION),
+        revision: stored.revision,
+        value: stored.runtime.hero_character,
+        created_at: date_string(stored.created_at),
+        updated_at: date_string(stored.updated_at),
+    })
+}
+
+fn hero_audit_document(
+    campaign_session_id: &str,
+    audit: &HeroAuditPayload,
+    created_at: DateTime,
+) -> Result<AuditEventDocument, RepositoryError> {
+    audit.validate()?;
+    let payload =
+        mongodb::bson::to_bson(audit).map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "hero audit",
+            id: audit.audit_id().to_owned(),
+            reason: "hero audit could not be encoded as BSON",
+        })?;
+    Ok(AuditEventDocument {
+        id: audit.audit_id().to_owned(),
+        schema_version: STORAGE_SCHEMA_VERSION,
+        category: "hero".to_owned(),
+        action: audit.kind().to_owned(),
+        outcome: "committed".to_owned(),
+        actor_account_id: Some(audit_actor_id(audit).to_owned()),
+        scope_kind: audit.subject_kind().as_str().to_owned(),
+        scope_id: audit.subject_id().to_owned(),
+        correlation_id: Some(audit.audit_id().to_owned()),
+        metadata: doc! {
+            "campaign_session_id": campaign_session_id,
+            "subject_revision": i64::try_from(audit.subject_revision()).map_err(|_| {
+                RepositoryError::NumericRange {
+                    field: "hero audit revision",
+                }
+            })?,
+            "occurred_at_epoch_seconds": i64::try_from(
+                audit.occurred_at_epoch_seconds(),
+            )
+            .map_err(|_| RepositoryError::NumericRange {
+                field: "hero audit time",
+            })?,
+            "hero_audit": payload,
+        },
+        created_at,
+    })
+}
+
+fn encounter_claim_document(
+    actor_account_id: &str,
+    claim: &NewEncounterRewardClaim,
+    created_at: DateTime,
+) -> Result<AuditEventDocument, RepositoryError> {
+    let claim_bson =
+        mongodb::bson::to_bson(claim).map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "encounter reward claim",
+            id: claim.encounter_id.clone(),
+            reason: "encounter reward claim could not be encoded as BSON",
+        })?;
+    Ok(AuditEventDocument {
+        id: format!(
+            "audit:{}",
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!(
+                    "encounter-reward:{}:{}",
+                    claim.campaign_session_id, claim.encounter_id
+                )
+                .as_bytes(),
+            )
+            .simple()
+        ),
+        schema_version: STORAGE_SCHEMA_VERSION,
+        category: "encounter_reward_claim".to_owned(),
+        action: "reward_claimed".to_owned(),
+        outcome: "committed".to_owned(),
+        actor_account_id: Some(actor_account_id.to_owned()),
+        scope_kind: "encounter".to_owned(),
+        scope_id: claim.encounter_id.clone(),
+        correlation_id: Some(claim.hero_audit_id.clone()),
+        metadata: doc! {
+            "campaign_session_id": &claim.campaign_session_id,
+            "claim": claim_bson,
+        },
+        created_at,
+    })
+}
+
+fn stored_audit(stored: AuditEventDocument) -> Result<StoredHeroAudit, RepositoryError> {
+    let payload: HeroAuditPayload =
+        mongodb::bson::from_bson(stored.metadata.get("hero_audit").cloned().ok_or_else(|| {
+            RepositoryError::InvalidDomainState {
+                entity: "hero audit",
+                id: stored.id.clone(),
+                reason: "stored hero audit payload is missing",
+            }
+        })?)
+        .map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "hero audit",
+            id: stored.id.clone(),
+            reason: "stored hero audit payload is invalid",
+        })?;
     payload.validate()?;
-    let subject_kind: String = row
-        .try_get("subject_kind")
-        .map_err(RepositoryError::Database)?;
-    let audit_kind: String = row
-        .try_get("audit_kind")
-        .map_err(RepositoryError::Database)?;
-    let audit = StoredHeroAudit {
-        id: id.clone(),
-        campaign_session_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        subject_id: row
-            .try_get("subject_id")
-            .map_err(RepositoryError::Database)?,
-        subject_revision: from_i64(
-            row.try_get("subject_revision")
-                .map_err(RepositoryError::Database)?,
-            "hero audit revision",
-        )?,
-        schema_version: from_i64_u32(
-            row.try_get("schema_version")
-                .map_err(RepositoryError::Database)?,
-            "hero audit schema version",
-        )?,
-        occurred_at_epoch_seconds: from_i64(
-            row.try_get("occurred_at_epoch_seconds")
-                .map_err(RepositoryError::Database)?,
-            "hero audit time",
-        )?,
-        payload,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    };
-    if audit.id != audit.payload.audit_id()
-        || audit.subject_id != audit.payload.subject_id()
-        || subject_kind != audit.payload.subject_kind().as_str()
-        || audit_kind != audit.payload.kind()
-        || audit.subject_revision != audit.payload.subject_revision()
-        || audit.schema_version != u32::from(HERO_AUDIT_SCHEMA_VERSION)
-        || audit.occurred_at_epoch_seconds != audit.payload.occurred_at_epoch_seconds()
+    let campaign_session_id = stored
+        .metadata
+        .get_str("campaign_session_id")
+        .map(str::to_owned)
+        .map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "hero audit",
+            id: stored.id.clone(),
+            reason: "stored hero audit campaign is invalid",
+        })?;
+    if stored.id != payload.audit_id()
+        || stored.scope_id != payload.subject_id()
+        || stored.scope_kind != payload.subject_kind().as_str()
+        || stored.action != payload.kind()
     {
         return invalid(
             "hero audit",
-            &audit.id,
-            "row metadata and validated audit payload do not match",
+            &stored.id,
+            "stored hero audit metadata does not match its payload",
         );
     }
-    Ok(audit)
+    Ok(StoredHeroAudit {
+        id: stored.id,
+        campaign_session_id,
+        subject_id: payload.subject_id().to_owned(),
+        subject_revision: payload.subject_revision(),
+        schema_version: u32::from(HERO_AUDIT_SCHEMA_VERSION),
+        occurred_at_epoch_seconds: payload.occurred_at_epoch_seconds(),
+        payload,
+        created_at: date_string(stored.created_at),
+    })
 }
 
-fn stored_receipt_from_row(row: PgRow) -> Result<StoredHeroCommandReceipt, RepositoryError> {
-    let scope_value: String = row
-        .try_get("scope_kind")
-        .map_err(RepositoryError::Database)?;
-    let scope = match scope_value.as_str() {
-        "draft" => HeroReceiptScope::Draft,
-        "character" => HeroReceiptScope::Character,
+fn stored_encounter_claim(
+    stored: AuditEventDocument,
+) -> Result<StoredEncounterRewardClaim, RepositoryError> {
+    let claim: NewEncounterRewardClaim =
+        mongodb::bson::from_bson(stored.metadata.get("claim").cloned().ok_or_else(|| {
+            RepositoryError::InvalidDomainState {
+                entity: "encounter reward claim",
+                id: stored.scope_id.clone(),
+                reason: "stored encounter reward claim is missing",
+            }
+        })?)
+        .map_err(|_| RepositoryError::InvalidDomainState {
+            entity: "encounter reward claim",
+            id: stored.scope_id.clone(),
+            reason: "stored encounter reward claim is invalid",
+        })?;
+    validate_stored_encounter_claim(&claim)?;
+    Ok(StoredEncounterRewardClaim {
+        campaign_session_id: claim.campaign_session_id,
+        encounter_id: claim.encounter_id,
+        character_id: claim.character_id,
+        encounter_revision: claim.encounter_revision,
+        victory_event_sequence: claim.victory_event_sequence,
+        reward_tier: claim.reward_tier,
+        experience_awarded: claim.experience_awarded,
+        hero_audit_id: claim.hero_audit_id,
+        created_at: date_string(stored.created_at),
+    })
+}
+
+fn hero_receipt_document(
+    receipt: &NewHeroCommandReceipt,
+    created_at: DateTime,
+) -> Result<CommandReceiptDocument, RepositoryError> {
+    validate_receipt_fields(receipt)?;
+    Ok(CommandReceiptDocument {
+        id: format!("receipt:{}", Uuid::new_v4().simple()),
+        schema_version: STORAGE_SCHEMA_VERSION,
+        scope_kind: receipt.scope.as_str().to_owned(),
+        scope_id: receipt.scope_id.clone(),
+        campaign_id: Some(receipt.campaign_session_id.clone()),
+        actor_account_id: receipt.actor_account_id.clone(),
+        command_kind: receipt.command_kind.clone(),
+        idempotency_key: receipt.idempotency_key.clone(),
+        request_fingerprint: receipt.request_fingerprint.as_str().to_owned(),
+        state: "committed".to_owned(),
+        expected_revision: receipt.expected_revision,
+        result_revision: receipt.result_revision,
+        audit_id: receipt.audit_id.clone(),
+        response_json: receipt.response_json.clone(),
+        created_at,
+    })
+}
+
+fn stored_receipt(
+    stored: CommandReceiptDocument,
+) -> Result<StoredHeroCommandReceipt, RepositoryError> {
+    let scope = match stored.scope_kind.as_str() {
+        "hero_draft" => HeroReceiptScope::Draft,
+        "campaign_character_instance" => HeroReceiptScope::Character,
         _ => {
             return invalid(
                 "hero command receipt",
-                &scope_value,
-                "stored receipt scope is unsupported",
+                &stored.id,
+                "stored hero receipt scope is unsupported",
             );
         }
     };
-    let fingerprint: String = row
-        .try_get("request_fingerprint")
-        .map_err(RepositoryError::Database)?;
-    let receipt = StoredHeroCommandReceipt {
-        scope,
-        scope_id: row.try_get("scope_id").map_err(RepositoryError::Database)?,
-        campaign_session_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        idempotency_key: row
-            .try_get("idempotency_key")
-            .map_err(RepositoryError::Database)?,
-        command_kind: row
-            .try_get("command_kind")
-            .map_err(RepositoryError::Database)?,
-        request_fingerprint: Sha256Digest::new(fingerprint).map_err(|source| {
-            RepositoryError::CoreValidation {
+    let request_fingerprint = Sha256Digest::new(stored.request_fingerprint).map_err(|source| {
+        RepositoryError::CoreValidation {
+            entity: "hero command receipt",
+            id: stored.id.clone(),
+            source,
+        }
+    })?;
+    let campaign_session_id =
+        stored
+            .campaign_id
+            .clone()
+            .ok_or_else(|| RepositoryError::InvalidDomainState {
                 entity: "hero command receipt",
-                id: "stored-fingerprint".to_owned(),
-                source,
-            }
-        })?,
-        expected_revision: from_i64(
-            row.try_get("expected_revision")
-                .map_err(RepositoryError::Database)?,
-            "hero receipt expected revision",
-        )?,
-        result_revision: from_i64(
-            row.try_get("result_revision")
-                .map_err(RepositoryError::Database)?,
-            "hero receipt result revision",
-        )?,
-        audit_id: row.try_get("audit_id").map_err(RepositoryError::Database)?,
-        response_json: row
-            .try_get("response_json")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
+                id: stored.id.clone(),
+                reason: "stored hero receipt is missing its campaign scope",
+            })?;
+    let receipt = StoredHeroCommandReceipt {
+        actor_account_id: stored.actor_account_id,
+        scope,
+        scope_id: stored.scope_id,
+        campaign_session_id,
+        idempotency_key: stored.idempotency_key,
+        command_kind: stored.command_kind,
+        request_fingerprint,
+        expected_revision: stored.expected_revision,
+        result_revision: stored.result_revision,
+        audit_id: stored.audit_id,
+        response_json: stored.response_json,
+        created_at: date_string(stored.created_at),
     };
     validate_stored_receipt(&receipt)?;
     Ok(receipt)
 }
 
-fn stored_encounter_reward_claim_from_row(
-    row: PgRow,
-) -> Result<StoredEncounterRewardClaim, RepositoryError> {
-    let tier: String = row
-        .try_get("reward_tier")
-        .map_err(RepositoryError::Database)?;
-    let reward_tier = match tier.as_str() {
-        "minor" => RewardTier::Minor,
-        "major" => RewardTier::Major,
-        _ => {
-            return invalid(
-                "encounter reward claim",
-                &tier,
-                "stored reward tier is unsupported",
-            );
-        }
+async fn reject_conflicting_hero_receipt(
+    receipts: &Collection<CommandReceiptDocument>,
+    client_session: &mut ClientSession,
+    expected: &CommandReceiptDocument,
+) -> Result<(), PersistenceError> {
+    let existing = receipts
+        .find_one(doc! {
+            "scope_kind": &expected.scope_kind,
+            "scope_id": &expected.scope_id,
+            "idempotency_key": &expected.idempotency_key,
+        })
+        .session(&mut *client_session)
+        .await
+        .map_err(|error| PersistenceError::mongo("check hero receipt", error))?;
+    let Some(existing) = existing else {
+        return Ok(());
     };
-    let claim = StoredEncounterRewardClaim {
-        campaign_session_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        encounter_id: row
-            .try_get("encounter_id")
-            .map_err(RepositoryError::Database)?,
-        character_id: row
-            .try_get("character_id")
-            .map_err(RepositoryError::Database)?,
-        encounter_revision: from_i64(
-            row.try_get("encounter_revision")
-                .map_err(RepositoryError::Database)?,
-            "encounter reward revision",
-        )?,
-        victory_event_sequence: from_i64(
-            row.try_get("victory_event_sequence")
-                .map_err(RepositoryError::Database)?,
-            "encounter reward event sequence",
-        )?,
-        reward_tier,
-        experience_awarded: from_i64_u32(
-            row.try_get("experience_awarded")
-                .map_err(RepositoryError::Database)?,
-            "encounter reward experience",
-        )?,
-        hero_audit_id: row
-            .try_get("hero_audit_id")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-    };
-    if !is_valid_opaque_id(&claim.campaign_session_id)
-        || !is_valid_opaque_id(&claim.encounter_id)
-        || !is_valid_opaque_id(&claim.character_id)
-        || !is_valid_opaque_id(&claim.hero_audit_id)
-        || claim.encounter_revision == 0
-        || claim.victory_event_sequence == 0
-        || claim.experience_awarded
-            != TrustedRewardPolicy::MvpXpV1.experience_for(claim.reward_tier)
+    if existing.actor_account_id != expected.actor_account_id
+        || existing.command_kind != expected.command_kind
+        || existing.request_fingerprint != expected.request_fingerprint
     {
-        return invalid(
-            "encounter reward claim",
-            &claim.encounter_id,
-            "stored claim metadata is invalid",
-        );
+        return Err(PersistenceError::IdempotencyConflict {
+            scope_kind: expected.scope_kind.clone(),
+            scope_id: expected.scope_id.clone(),
+            idempotency_key: expected.idempotency_key.clone(),
+        });
     }
-    Ok(claim)
+    Err(PersistenceError::AlreadyExists {
+        entity: "hero command receipt",
+        id: expected.id.clone(),
+    })
+}
+
+async fn map_hero_commit_result<T>(
+    repository: &MongoRepository,
+    result: Result<T, PersistenceError>,
+    expected: &NewHeroCommandReceipt,
+) -> Result<T, RepositoryError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if error.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey) => {
+            match repository
+                .load_hero_command_receipt(
+                    &expected.actor_account_id,
+                    expected.scope,
+                    &expected.scope_id,
+                    &expected.idempotency_key,
+                )
+                .await?
+            {
+                Some(stored)
+                    if stored.command_kind == expected.command_kind
+                        && stored.request_fingerprint == expected.request_fingerprint =>
+                {
+                    Err(RepositoryError::AlreadyExists {
+                        entity: "hero command receipt",
+                        id: expected.idempotency_key.clone(),
+                    })
+                }
+                Some(_) => Err(RepositoryError::IdempotencyConflict {
+                    scope_kind: expected.scope.as_str().to_owned(),
+                    scope_id: expected.scope_id.clone(),
+                    idempotency_key: expected.idempotency_key.clone(),
+                }),
+                None => Err(map_persistence(error)),
+            }
+        }
+        Err(error) => Err(map_persistence(error)),
+    }
+}
+
+fn hero_progression(character: &HeroCharacter) -> Result<Document, RepositoryError> {
+    let level = mongodb::bson::to_bson(&character.level).map_err(|_| {
+        RepositoryError::InvalidDomainState {
+            entity: "hero character",
+            id: character.character_id.clone(),
+            reason: "hero level could not be encoded as BSON",
+        }
+    })?;
+    Ok(doc! {
+        "level": level,
+        "experience_points": i64::from(character.experience_points),
+        "advancement_choices": mongodb::bson::to_bson(&character.advancement_choices)
+            .map_err(|_| RepositoryError::InvalidDomainState {
+                entity: "hero character",
+                id: character.character_id.clone(),
+                reason: "hero advancement choices could not be encoded as BSON",
+            })?,
+    })
+}
+
+fn validate_owner_lookup(
+    campaign_session_id: &str,
+    owner_key: &str,
+) -> Result<(), RepositoryError> {
+    validate_account_id(owner_key)?;
+    validate_opaque("campaign", campaign_session_id)
 }
 
 fn validate_draft(draft: &HeroCreationDraft) -> Result<(), RepositoryError> {
@@ -1296,7 +1913,7 @@ fn validate_draft_successor(
         return invalid(
             "hero creation draft",
             &submitted.draft_id,
-            "locked draft replay does not equal the submitted state and audit",
+            "locked draft replay does not equal submitted state and audit",
         );
     }
     Ok(())
@@ -1392,7 +2009,7 @@ fn validate_character_successor(
         return invalid(
             "hero character",
             &submitted.character_id,
-            "successor, audit scope, and receipt must preserve identity and base choices",
+            "successor, audit scope, and receipt must preserve identity and choices",
         );
     }
     let expected_command_kind = command.command_kind();
@@ -1413,10 +2030,7 @@ fn validate_character_successor(
             && reward.experience_before == stored.value.experience_points
             && reward.experience_after == submitted.experience_points
             && stored.value.level == submitted.level
-            && stored.value.advancement_choices == submitted.advancement_choices =>
-        {
-            // Exact transition is replayed below.
-        }
+            && stored.value.advancement_choices == submitted.advancement_choices => {}
         (
             HeroCharacterMutationCommand::LevelUp(command),
             HeroAuditPayload::LevelUp { level_up },
@@ -1433,13 +2047,14 @@ fn validate_character_successor(
             && submitted.level == SupportedLevel::Two
             && submitted.advancement_choices.as_slice()
                 == std::slice::from_ref(&level_up.choice) => {}
-        _ => invalid(
-            "hero character",
-            &submitted.character_id,
-            "character successor does not match its immutable reward or level-up audit",
-        )?,
+        _ => {
+            return invalid(
+                "hero character",
+                &submitted.character_id,
+                "character successor does not match immutable reward or level-up audit",
+            );
+        }
     }
-
     let mut replayed = stored.value.clone();
     match (command, audit) {
         (
@@ -1466,7 +2081,7 @@ fn validate_character_successor(
                 return invalid(
                     "hero character",
                     &submitted.character_id,
-                    "trusted reward replay does not equal the immutable audit",
+                    "trusted reward replay does not equal immutable audit",
                 );
             }
         }
@@ -1490,17 +2105,23 @@ fn validate_character_successor(
                 return invalid(
                     "hero character",
                     &submitted.character_id,
-                    "level-up replay does not equal the immutable audit",
+                    "level-up replay does not equal immutable audit",
                 );
             }
         }
-        _ => unreachable!("command/audit pair was checked above"),
+        _ => {
+            return invalid(
+                "hero character",
+                &submitted.character_id,
+                "command and audit variants do not match",
+            );
+        }
     }
     if replayed != *submitted {
         return invalid(
             "hero character",
             &submitted.character_id,
-            "locked character replay does not equal the submitted successor",
+            "locked character replay does not equal submitted successor",
         );
     }
     Ok(())
@@ -1510,11 +2131,26 @@ fn validate_receipt(
     receipt: &NewHeroCommandReceipt,
     audit: &HeroAuditPayload,
 ) -> Result<(), RepositoryError> {
-    validate_receipt_lookup(&receipt.scope_id, &receipt.idempotency_key)?;
+    validate_receipt_fields(receipt)?;
+    if receipt.audit_id != audit.audit_id() {
+        return invalid(
+            "hero command receipt",
+            &receipt.scope_id,
+            "receipt audit id does not match hero audit",
+        );
+    }
+    Ok(())
+}
+
+fn validate_receipt_fields(receipt: &NewHeroCommandReceipt) -> Result<(), RepositoryError> {
+    validate_receipt_lookup(
+        &receipt.actor_account_id,
+        &receipt.scope_id,
+        &receipt.idempotency_key,
+    )?;
     if !is_valid_opaque_id(&receipt.campaign_session_id)
         || !is_valid_opaque_id(&receipt.command_kind)
         || !is_valid_opaque_id(&receipt.audit_id)
-        || receipt.audit_id != audit.audit_id()
         || receipt.result_revision
             != receipt
                 .expected_revision
@@ -1536,17 +2172,15 @@ fn validate_receipt(
 }
 
 fn validate_stored_receipt(receipt: &StoredHeroCommandReceipt) -> Result<(), RepositoryError> {
-    validate_receipt_lookup(&receipt.scope_id, &receipt.idempotency_key)?;
+    validate_receipt_lookup(
+        &receipt.actor_account_id,
+        &receipt.scope_id,
+        &receipt.idempotency_key,
+    )?;
     if !is_valid_opaque_id(&receipt.campaign_session_id)
         || !is_valid_opaque_id(&receipt.command_kind)
         || !is_valid_opaque_id(&receipt.audit_id)
-        || receipt.result_revision
-            != receipt
-                .expected_revision
-                .checked_add(1)
-                .ok_or(RepositoryError::NumericRange {
-                    field: "hero receipt revision",
-                })?
+        || receipt.result_revision != receipt.expected_revision.saturating_add(1)
         || receipt.response_json.is_empty()
         || receipt.response_json.len() > HERO_RECEIPT_RESPONSE_MAX_BYTES
         || serde_json::from_str::<serde_json::Value>(&receipt.response_json).is_err()
@@ -1560,16 +2194,20 @@ fn validate_stored_receipt(receipt: &StoredHeroCommandReceipt) -> Result<(), Rep
     Ok(())
 }
 
-fn validate_receipt_lookup(scope_id: &str, idempotency_key: &str) -> Result<(), RepositoryError> {
+fn validate_receipt_lookup(
+    actor_account_id: &str,
+    scope_id: &str,
+    idempotency_key: &str,
+) -> Result<(), RepositoryError> {
+    validate_account_id(actor_account_id)?;
     if !is_valid_opaque_id(scope_id) || !is_valid_opaque_id(idempotency_key) {
-        invalid(
+        return invalid(
             "hero command receipt",
             scope_id,
             "scope and idempotency ids must be valid opaque identifiers",
-        )
-    } else {
-        Ok(())
+        );
     }
+    Ok(())
 }
 
 fn validate_encounter_reward_claim(
@@ -1613,139 +2251,53 @@ fn validate_encounter_reward_claim(
     Ok(())
 }
 
-async fn insert_hero_audit(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    audit: &HeroAuditPayload,
-    payload: String,
-) -> Result<(), RepositoryError> {
-    sqlx::query(
-        "INSERT INTO hero_audits
-         (id, campaign_session_id, subject_kind, subject_id, audit_kind, schema_version,
-          subject_revision, occurred_at_epoch_seconds, payload_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)",
-    )
-    .bind(audit.audit_id())
-    .bind(campaign_session_id)
-    .bind(audit.subject_kind().as_str())
-    .bind(audit.subject_id())
-    .bind(audit.kind())
-    .bind(i64::from(HERO_AUDIT_SCHEMA_VERSION))
-    .bind(to_i64(audit.subject_revision(), "hero audit revision")?)
-    .bind(to_i64(
-        audit.occurred_at_epoch_seconds(),
-        "hero audit time",
-    )?)
-    .bind(payload)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| map_insert_error(error, "hero audit", audit.audit_id()))?;
-    Ok(())
-}
-
-async fn insert_encounter_reward_claim(
-    transaction: &mut Transaction<'_, Postgres>,
-    claim: &NewEncounterRewardClaim,
-) -> Result<(), RepositoryError> {
-    sqlx::query(
-        "INSERT INTO encounter_reward_claims
-         (campaign_session_id, encounter_id, character_id, encounter_revision,
-          victory_event_sequence, reward_tier, experience_awarded, hero_audit_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    )
-    .bind(&claim.campaign_session_id)
-    .bind(&claim.encounter_id)
-    .bind(&claim.character_id)
-    .bind(to_i64(
-        claim.encounter_revision,
-        "encounter reward revision",
-    )?)
-    .bind(to_i64(
-        claim.victory_event_sequence,
-        "encounter reward event sequence",
-    )?)
-    .bind(match claim.reward_tier {
-        RewardTier::Minor => "minor",
-        RewardTier::Major => "major",
-        RewardTier::Significant => "significant",
-    })
-    .bind(i64::from(claim.experience_awarded))
-    .bind(&claim.hero_audit_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| {
-        map_insert_error(
-            error,
+fn validate_stored_encounter_claim(claim: &NewEncounterRewardClaim) -> Result<(), RepositoryError> {
+    if !is_valid_opaque_id(&claim.campaign_session_id)
+        || !is_valid_opaque_id(&claim.encounter_id)
+        || !is_valid_opaque_id(&claim.character_id)
+        || !is_valid_opaque_id(&claim.hero_audit_id)
+        || claim.encounter_revision == 0
+        || claim.victory_event_sequence == 0
+        || claim.experience_awarded
+            != TrustedRewardPolicy::MvpXpV1.experience_for(claim.reward_tier)
+    {
+        return invalid(
             "encounter reward claim",
-            &format!("{}:{}", claim.campaign_session_id, claim.encounter_id),
-        )
-    })?;
+            &claim.encounter_id,
+            "stored claim metadata is invalid",
+        );
+    }
     Ok(())
 }
 
-async fn insert_hero_receipt(
-    transaction: &mut Transaction<'_, Postgres>,
-    receipt: &NewHeroCommandReceipt,
-) -> Result<(), RepositoryError> {
-    sqlx::query(
-        "INSERT INTO hero_command_receipts
-         (scope_kind, scope_id, campaign_session_id, idempotency_key, command_kind,
-          request_fingerprint, expected_revision, result_revision, audit_id, response_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-    )
-    .bind(receipt.scope.as_str())
-    .bind(&receipt.scope_id)
-    .bind(&receipt.campaign_session_id)
-    .bind(&receipt.idempotency_key)
-    .bind(&receipt.command_kind)
-    .bind(receipt.request_fingerprint.as_str())
-    .bind(to_i64(
-        receipt.expected_revision,
-        "hero receipt expected revision",
-    )?)
-    .bind(to_i64(
-        receipt.result_revision,
-        "hero receipt result revision",
-    )?)
-    .bind(&receipt.audit_id)
-    .bind(&receipt.response_json)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| {
-        map_insert_error(
-            error,
-            "hero command receipt",
-            &format!(
-                "{}:{}:{}",
-                receipt.scope.as_str(),
-                receipt.scope_id,
-                receipt.idempotency_key
-            ),
-        )
-    })?;
-    Ok(())
+fn audit_actor_id(audit: &HeroAuditPayload) -> &str {
+    match audit {
+        HeroAuditPayload::CreationTransition { transition, .. } => &transition.actor_id,
+        HeroAuditPayload::RewardAwarded { reward } => &reward.actor_id,
+        HeroAuditPayload::LevelUp { level_up } => &level_up.actor_id,
+    }
 }
 
-fn serialize<T: Serialize>(entity: &'static str, value: &T) -> Result<String, RepositoryError> {
-    serde_json::to_string(value).map_err(|source| RepositoryError::Serialize { entity, source })
+fn draft_state(draft: &HeroCreationDraft) -> &'static str {
+    if draft.committed_character_id.is_some() {
+        "committed"
+    } else {
+        "active"
+    }
 }
 
-fn to_i64(value: u64, field: &'static str) -> Result<i64, RepositoryError> {
-    i64::try_from(value).map_err(|_| RepositoryError::NumericRange { field })
+fn date_from_epoch_seconds(value: u64, field: &'static str) -> Result<DateTime, RepositoryError> {
+    let milliseconds = value
+        .checked_mul(1_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RepositoryError::NumericRange { field })?;
+    Ok(DateTime::from_millis(milliseconds))
 }
 
 fn durable_revision(domain_revision: u64, field: &'static str) -> Result<u64, RepositoryError> {
     domain_revision
         .checked_add(1)
         .ok_or(RepositoryError::NumericRange { field })
-}
-
-fn from_i64(value: i64, field: &'static str) -> Result<u64, RepositoryError> {
-    u64::try_from(value).map_err(|_| RepositoryError::NumericRange { field })
-}
-
-fn from_i64_u32(value: i64, field: &'static str) -> Result<u32, RepositoryError> {
-    u32::try_from(value).map_err(|_| RepositoryError::NumericRange { field })
 }
 
 fn hero_validation(
@@ -1766,4 +2318,18 @@ fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T,
         id: id.to_owned(),
         reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hero_receipt_scopes_match_generic_collection_contract() {
+        assert_eq!(HeroReceiptScope::Draft.as_str(), "hero_draft");
+        assert_eq!(
+            HeroReceiptScope::Character.as_str(),
+            "campaign_character_instance"
+        );
+    }
 }

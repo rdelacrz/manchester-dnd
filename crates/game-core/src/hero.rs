@@ -24,11 +24,11 @@ pub const RAINBOUND_THEME_PACK_ID: &str = "dev.manchester-arcana.rainbound-borou
 pub const EMBERLINE_THEME_PACK_ID: &str = "dev.manchester-arcana.emberline-archive";
 pub const MVP_PACK_VERSION: &str = "1.0.0";
 pub const CORE_CONTENT_PACK_DIGEST: &str =
-    "sha256:c62468355cc42f51b433fc19b8b32869b35cd308e9a937a6b8bea6df7dcfb7ca";
+    "sha256:ec42825e68316f286c027dbbc1a08d0dfa9f4f97c304d5685b178c933a5ca924";
 pub const RAINBOUND_THEME_PACK_DIGEST: &str =
-    "sha256:9b92fc08979605e05d2f3213e1c8e2df62cc24a55ee294f292418b00a94f7a61";
+    "sha256:40178f823a99cafebc469ff73e2d99d0598370f87c65fd19fd7a343188a51563";
 pub const EMBERLINE_THEME_PACK_DIGEST: &str =
-    "sha256:ce755fdef1521fbb4821cddc2d16ee0c1f7797bb58d9153bfe3a2e9afa695ac3";
+    "sha256:7b5111871e335835875e4df80d1fb7394e8321d7dd11b7a037aa5607e6c05b50";
 /// The creator-only pin set immediately preceding live encounter rules. It
 /// remains readable so existing local saves never silently change content.
 pub const LEGACY_PRE_LIVE_RULES_CORE_CONTENT_PACK_DIGEST: &str =

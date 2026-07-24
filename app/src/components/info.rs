@@ -24,7 +24,7 @@ pub(crate) fn GuidePage() -> impl IntoView {
                         <li>"Keep the server bound to 127.0.0.1 or ::1. Another process on the same computer is outside this build's trust boundary."</li>
                         <li>"Leave text, image, and private-inspiration providers disabled unless the private-test operator has approved their terms and configuration."</li>
                         <li>"Do not add real-life source material until every represented participant has been verified and has granted scoped consent out of band."</li>
-                        <li>"Back up the PostgreSQL database and protected RNG/image/source keys with the encrypted recovery procedure before relying on a campaign save."</li>
+                        <li>"Back up MongoDB and the protected RNG/image/source keys with the encrypted recovery procedure before relying on a campaign save. DragonflyDB is disposable and excluded from backups."</li>
                     </ul>
                 </article>
 
@@ -82,7 +82,7 @@ pub(crate) fn PrivacyAndSafetyPage() -> impl IntoView {
             <section class="info-grid">
                 <article class="panel info-card">
                     <h2>"What this build retains"</h2>
-                    <p>"PostgreSQL retains revisioned campaign and hero state, immutable mechanical audits, body-free command receipts, selected presentation artifacts, and bounded operational metadata. Raw provider prompts, credentials, RNG key material, and raw private-source bodies do not belong in ordinary game state or logs."</p>
+                    <p>"MongoDB retains revisioned campaign and hero state, immutable mechanical audits, body-free command receipts, selected presentation artifacts, and bounded operational metadata. DragonflyDB contains only short-lived reconstructable cache data. Raw provider prompts, credentials, RNG key material, and raw private-source bodies do not belong in ordinary game state or logs."</p>
                     <p>"Active campaigns and selected artifacts remain until owner deletion. Incomplete drafts, failed jobs, superseded presentations, diagnostics, exports, backups, and deletion tombstones use the bounded retention periods documented for the private test."</p>
                 </article>
 

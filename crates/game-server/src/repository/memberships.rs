@@ -1,40 +1,36 @@
-//! Account-scoped campaign membership, invitation, and runtime character
-//! instance storage (Task 13).
-//!
-//! Every public method takes a server-derived `account_id`. No method accepts
-//! a browser-supplied owner. Cross-account access — including a guessed
-//! campaign or invitation ID — returns the same `NotFound` result as a missing
-//! document. This is enforced at the SQL layer (`WHERE account_id = $1`) and
-//! maps to [`RepositoryError::NotFound`] at this layer.
-//!
-//! The runtime hero instance is created atomically with the
+//! MongoDB campaign membership, invitation, and character-instance storage.
+
 #![allow(dead_code)]
-//! `campaign_character_instances` row in a single transaction, so a crash
-//! never leaves a dangling hero_characters row without its binding membership
-//! link.
 
 use manchester_dnd_core::{
-    PlayerCharacter, SESSION_SCHEMA_VERSION, SessionDto, SessionStatus,
-    hero::{HERO_CHARACTER_SCHEMA_VERSION, HeroCharacter},
+    PlayerCharacter, SESSION_SCHEMA_VERSION, SessionDto, SessionStatus, hero::HeroCharacter,
     is_valid_opaque_id,
+};
+use mongodb::{
+    Collection,
+    bson::{DateTime, doc},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use uuid::Uuid;
 
-use super::{PostgresRepository, map_insert_error, serialize, to_i64};
-use crate::error::RepositoryError;
+use super::{
+    MongoRepository,
+    player_characters::{PlayerCharacterDocument, player_character_from_document},
+};
+use crate::{
+    error::{MongoFailureKind, PersistenceError, RepositoryError},
+    persistence::CollectionName,
+};
 
-/// Schema version for membership-related application documents.
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 1;
-/// Default invitation lifetime: 7 days.
 pub const INVITATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 const MAX_CAMPAIGN_TITLE_LEN: usize = 200;
 const MAX_EMAIL_LEN: usize = 320;
+const MAX_CAMPAIGN_MEMBERS: usize = 16;
+const INVITATION_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
-/// A campaign summary returned to a member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MembershipCampaignSummary {
@@ -47,7 +43,6 @@ pub struct MembershipCampaignSummary {
     pub updated_at: String,
 }
 
-/// A campaign membership row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignMembershipRow {
@@ -59,7 +54,6 @@ pub struct CampaignMembershipRow {
     pub updated_at: String,
 }
 
-/// A campaign invitation row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignInvitationRow {
@@ -71,7 +65,6 @@ pub struct CampaignInvitationRow {
     pub created_at: String,
 }
 
-/// A runtime character instance bound to a campaign.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignCharacterInstanceRow {
@@ -95,7 +88,7 @@ pub enum MembershipRole {
 }
 
 impl MembershipRole {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::GameMaster => "game_master",
             Self::Player => "player",
@@ -121,7 +114,7 @@ pub enum MembershipState {
 }
 
 impl MembershipState {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Invited => "invited",
             Self::Active => "active",
@@ -149,7 +142,7 @@ pub enum CharacterInstanceState {
 }
 
 impl CharacterInstanceState {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Retired => "retired",
@@ -169,7 +162,6 @@ impl CharacterInstanceState {
     }
 }
 
-/// Outcome of creating a campaign with its owner membership atomically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateCampaignWithOwnerOutcome {
     pub campaign_id: String,
@@ -177,17 +169,83 @@ pub struct CreateCampaignWithOwnerOutcome {
     pub theme_id: String,
 }
 
-/// Outcome of assigning a library character to a campaign.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignCharacterOutcome {
     pub instance_id: String,
     pub runtime_hero_character_id: String,
 }
 
-impl PostgresRepository {
-    /// Creates a new campaign session, its owner membership, and seeds the
-    /// title and theme — all in one transaction. The `campaign_id` is
-    /// generated server-side. The `account_id` becomes the game master.
+use super::{CampaignDocument, CampaignLifecycleDocument, CampaignMemberDocument};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInvitationDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    campaign_id: String,
+    inviter_account_id: String,
+    invitee_email_lookup_hmac: String,
+    state: String,
+    expires_at: DateTime,
+    purge_at: DateTime,
+    accepted_account_id: Option<String>,
+    accepted_at: Option<DateTime>,
+    revoked_at: Option<DateTime>,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceCharacterSnapshot {
+    pub(crate) source_revision: i64,
+    pub(crate) source_schema_version: i64,
+    pub(crate) source_digest: String,
+    pub(crate) captured_at: DateTime,
+    pub(crate) display_name: String,
+    pub(crate) player_character: PlayerCharacter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CampaignProgressionDocument {
+    pub(crate) level: i64,
+    pub(crate) experience_points: i64,
+    pub(crate) milestone_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CampaignRuntimeDocument {
+    pub(crate) hero: HeroCharacter,
+    pub(crate) current_hit_points: i64,
+    pub(crate) maximum_hit_points: i64,
+    pub(crate) temporary_hit_points: i64,
+    pub(crate) bde_balance: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CampaignCharacterInstanceDocument {
+    #[serde(rename = "_id")]
+    pub(crate) id: String,
+    pub(crate) schema_version: i64,
+    pub(crate) revision: i64,
+    pub(crate) campaign_id: String,
+    pub(crate) account_id: String,
+    pub(crate) source_player_character_id: String,
+    pub(crate) runtime_hero_character_id: String,
+    pub(crate) state: String,
+    pub(crate) source_snapshot: SourceCharacterSnapshot,
+    pub(crate) progression: CampaignProgressionDocument,
+    pub(crate) runtime: CampaignRuntimeDocument,
+    pub(crate) created_at: DateTime,
+    pub(crate) updated_at: DateTime,
+    pub(crate) retired_at: Option<DateTime>,
+}
+
+impl MongoRepository {
     pub async fn create_campaign_with_owner(
         &self,
         account_id: &str,
@@ -197,11 +255,35 @@ impl PostgresRepository {
         validate_account_id(account_id)?;
         validate_campaign_title(title)?;
         validate_theme_id(theme_id)?;
-        let campaign_id = format!("campaign:{}", Uuid::new_v4().simple());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        require_account(self, account_id).await?;
+        if let Some(existing) = self
+            .campaigns()
+            .find_one(doc! {
+                "owner_account_id": account_id,
+                "title_normalized": normalize_title(title),
+            })
+            .await
+            .map_err(|error| mongo_error("load campaign create replay", error))?
+        {
+            if existing.theme_id == theme_id {
+                return Ok(CreateCampaignWithOwnerOutcome {
+                    campaign_id: existing.id,
+                    title: existing.title,
+                    theme_id: existing.theme_id,
+                });
+            }
+            return Err(RepositoryError::AlreadyExists {
+                entity: "campaign title",
+                id: title.to_owned(),
+            });
+        }
+
+        let campaign_id = format!("campaign:{}", Uuid::new_v4());
+        let now = DateTime::now();
+        let now_ms =
+            u64::try_from(now.timestamp_millis()).map_err(|_| RepositoryError::NumericRange {
+                field: "campaign timestamp",
+            })?;
         let session = SessionDto {
             schema_version: SESSION_SCHEMA_VERSION,
             id: campaign_id.clone(),
@@ -209,8 +291,8 @@ impl PostgresRepository {
             title: title.to_owned(),
             status: SessionStatus::Active,
             character_ids: Vec::new(),
-            created_at_unix_ms: u64::try_from(now_ms).unwrap_or(0),
-            updated_at_unix_ms: u64::try_from(now_ms).unwrap_or(0),
+            created_at_unix_ms: now_ms,
+            updated_at_unix_ms: now_ms,
             last_event_sequence: 0,
         };
         session
@@ -220,36 +302,112 @@ impl PostgresRepository {
                 id: campaign_id.clone(),
                 source,
             })?;
-        let payload = serialize("campaign session", &session)?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        sqlx::query(
-            "INSERT INTO campaign_sessions
-             (id, schema_version, revision, payload_json, owner_key, owner_account_id, theme_id)
-             VALUES ($1, $2, 1, $3::jsonb, $4, $5, $6)",
-        )
-        .bind(&campaign_id)
-        .bind(i64::from(SESSION_SCHEMA_VERSION))
-        .bind(&payload)
-        .bind(account_id)
-        .bind(account_id)
-        .bind(theme_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| map_insert_error(error, "campaign session", &campaign_id))?;
-        sqlx::query(
-            "INSERT INTO campaign_memberships
-             (campaign_session_id, account_id, role, state, inviter_account_id, accepted_at)
-             VALUES ($1, $2, 'game_master', 'active', $2, CURRENT_TIMESTAMP)",
-        )
-        .bind(&campaign_id)
-        .bind(account_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| map_insert_error(error, "campaign_membership", &campaign_id))?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
+        let campaign = CampaignDocument {
+            id: campaign_id.clone(),
+            schema_version: 1,
+            revision: 1,
+            gameplay_revision: 1,
+            lifecycle_revision: 1,
+            owner_account_id: account_id.to_owned(),
+            title: title.to_owned(),
+            title_normalized: normalize_title(title),
+            theme_id: theme_id.to_owned(),
+            lifecycle: CampaignLifecycleDocument {
+                state: "open".to_owned(),
+                archived_at: None,
+            },
+            members: vec![CampaignMemberDocument {
+                account_id: account_id.to_owned(),
+                role: MembershipRole::GameMaster.as_str().to_owned(),
+                state: MembershipState::Active.as_str().to_owned(),
+                inviter_account_id: Some(account_id.to_owned()),
+                joined_at: now,
+                left_at: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            rules_snapshot: doc! {
+                "state": "unsealed",
+                "ruleset_id": "srd-5.1",
+                "theme_id": theme_id,
+            },
+            safety_policy_id: "safety:private-v1".to_owned(),
+            progression_policy_id: "progression:xp-v1".to_owned(),
+            retention_class: "campaign_lifetime".to_owned(),
+            retention_delete_after: None,
+            current_play_session_id: None,
+            session,
+            created_at: now,
+            updated_at: now,
+        };
+        let campaigns = self.campaigns();
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let audit_id = format!("audit:{}", Uuid::new_v4());
+        let account_id_owned = account_id.to_owned();
+        let campaign_id_owned = campaign_id.clone();
+        let result = self
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let audits = audits.clone();
+                let campaign = campaign.clone();
+                let audit_id = audit_id.clone();
+                let account_id = account_id_owned.clone();
+                let campaign_id = campaign_id_owned.clone();
+                Box::pin(async move {
+                    campaigns
+                        .insert_one(campaign)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("create owned campaign", error))?;
+                    audits
+                        .insert_one(doc! {
+                            "_id": audit_id,
+                            "schema_version": 1_i64,
+                            "category": "campaign_lifecycle",
+                            "action": "campaign_created",
+                            "outcome": "committed",
+                            "scope_kind": "campaign",
+                            "scope_id": campaign_id,
+                            "actor_account_id": account_id,
+                            "revision": 1_i64,
+                            "metadata": {},
+                            "created_at": DateTime::now(),
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("audit owned campaign creation", error)
+                        })?;
+                    Ok(())
+                })
+            })
+            .await;
+        if let Err(error) = result {
+            if error.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey)
+                && let Some(existing) = self
+                    .campaigns()
+                    .find_one(doc! {
+                        "owner_account_id": account_id,
+                        "title_normalized": normalize_title(title),
+                        "theme_id": theme_id,
+                    })
+                    .await
+                    .map_err(|source| mongo_error("resolve campaign create replay", source))?
+            {
+                return Ok(CreateCampaignWithOwnerOutcome {
+                    campaign_id: existing.id,
+                    title: existing.title,
+                    theme_id: existing.theme_id,
+                });
+            }
+            return Err(map_transaction_error(
+                error,
+                "campaign session",
+                &campaign_id,
+            ));
+        }
         Ok(CreateCampaignWithOwnerOutcome {
             campaign_id,
             title: title.to_owned(),
@@ -257,10 +415,6 @@ impl PostgresRepository {
         })
     }
 
-    /// Creates an invitation for `invitee_email` to join `campaign_id` as a
-    /// player. Only an active game_master of the campaign may invite. Returns
-    /// `NotFound` if the caller is not the GM (indistinguishable from a
-    /// missing campaign, per the security rule).
     pub async fn create_campaign_invitation(
         &self,
         gm_account_id: &str,
@@ -271,47 +425,123 @@ impl PostgresRepository {
         validate_account_id(gm_account_id)?;
         validate_campaign_id(campaign_id)?;
         validate_email(invitee_email)?;
-        // Verify GM membership before creating the invitation.
-        let gm_check: Option<String> = sqlx::query_scalar(
-            "SELECT account_id FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2
-               AND role = 'game_master' AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(gm_account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if gm_check.is_none() {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign_membership",
-                id: campaign_id.to_owned(),
-            });
+        let expires_at = epoch_seconds_to_date(expires_at_unix_seconds, "invitation expiry")?;
+        let now = DateTime::now();
+        let maximum_expiry = DateTime::from_millis(
+            now.timestamp_millis().saturating_add(
+                i64::try_from(INVITATION_TTL_SECONDS)
+                    .map_err(|_| RepositoryError::NumericRange {
+                        field: "invitation TTL",
+                    })?
+                    .saturating_mul(1_000),
+            ),
+        );
+        if expires_at <= now || expires_at > maximum_expiry {
+            return invalid(
+                "campaign_invitation",
+                campaign_id,
+                "invitation expiry must be in the future and within the configured TTL",
+            );
         }
-        let invitation_id = format!("invitation:{}", Uuid::new_v4().simple());
-        let email_digest = email_sha256(invitee_email);
-        let row = sqlx::query(
-            "INSERT INTO campaign_invitations
-             (id, campaign_session_id, inviter_account_id, invitee_email_digest,
-              expires_at)
-             VALUES ($1, $2, $3, $4, TO_TIMESTAMP($5))
-             RETURNING id, campaign_session_id, inviter_account_id,
-                       invitee_email_digest,
-                       expires_at::text AS expires_at,
-                       created_at::text AS created_at",
-        )
-        .bind(&invitation_id)
-        .bind(campaign_id)
-        .bind(gm_account_id)
-        .bind(&email_digest)
-        .bind(to_i64(expires_at_unix_seconds, "invitation expiry")?)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| map_insert_error(error, "campaign_invitation", &invitation_id))?;
-        invitation_from_row(&row)
+        let purge_at = DateTime::from_millis(
+            expires_at
+                .timestamp_millis()
+                .saturating_add(INVITATION_RETENTION_SECONDS.saturating_mul(1_000)),
+        );
+        let invitation = CampaignInvitationDocument {
+            id: format!("invitation:{}", Uuid::new_v4()),
+            schema_version: 1,
+            campaign_id: campaign_id.to_owned(),
+            inviter_account_id: gm_account_id.to_owned(),
+            invitee_email_lookup_hmac: invitation_email_digest(campaign_id, invitee_email),
+            state: "active".to_owned(),
+            expires_at,
+            purge_at,
+            accepted_account_id: None,
+            accepted_at: None,
+            revoked_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let campaigns = self.campaigns();
+        let invitations = self.campaign_invitations();
+        let invitation_for_result = invitation.clone();
+        let gm_account_id = gm_account_id.to_owned();
+        let campaign_id = campaign_id.to_owned();
+        let result = self
+            .with_transaction(move |session| {
+                let campaigns = campaigns.clone();
+                let invitations = invitations.clone();
+                let invitation = invitation.clone();
+                let gm_account_id = gm_account_id.clone();
+                let campaign_id = campaign_id.clone();
+                Box::pin(async move {
+                    let campaign = campaigns
+                        .find_one(doc! {
+                            "_id": &campaign_id,
+                            "owner_account_id": &gm_account_id,
+                            "lifecycle.state": "open",
+                            "members": {
+                                "$elemMatch": {
+                                    "account_id": &gm_account_id,
+                                    "role": "game_master",
+                                    "state": "active",
+                                }
+                            },
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("authorize campaign invitation", error)
+                        })?;
+                    if campaign.is_none() {
+                        return Err(PersistenceError::NotFound {
+                            entity: "campaign_membership",
+                            id: campaign_id,
+                        });
+                    }
+                    invitations
+                        .update_many(
+                            doc! {
+                                "campaign_id": &invitation.campaign_id,
+                                "invitee_email_lookup_hmac":
+                                    &invitation.invitee_email_lookup_hmac,
+                                "state": "active",
+                                "expires_at": { "$lte": DateTime::now() },
+                            },
+                            doc! {
+                                "$set": {
+                                    "state": "expired",
+                                    "updated_at": DateTime::now(),
+                                }
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("expire stale campaign invitations", error)
+                        })?;
+                    invitations
+                        .insert_one(invitation)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("create campaign invitation", error)
+                        })?;
+                    Ok(())
+                })
+            })
+            .await;
+        if let Err(error) = result {
+            return Err(map_transaction_error(
+                error,
+                "campaign_invitation",
+                &invitation_for_result.id,
+            ));
+        }
+        invitation_row(invitation_for_result)
     }
 
-    /// Revokes a pending invitation. Only the GM of the campaign may revoke.
     pub async fn revoke_campaign_invitation(
         &self,
         gm_account_id: &str,
@@ -319,87 +549,105 @@ impl PostgresRepository {
     ) -> Result<(), RepositoryError> {
         validate_account_id(gm_account_id)?;
         validate_invitation_id(invitation_id)?;
-        let row = sqlx::query("SELECT campaign_session_id FROM campaign_invitations WHERE id = $1")
-            .bind(invitation_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(RepositoryError::Database)?;
-        let campaign_id: String = row
-            .and_then(|r| r.try_get::<String, _>("campaign_session_id").ok())
-            .ok_or(RepositoryError::NotFound {
-                entity: "campaign_invitation",
-                id: invitation_id.to_owned(),
-            })?;
-        let gm_check: Option<String> = sqlx::query_scalar(
-            "SELECT account_id FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2
-               AND role = 'game_master' AND state = 'active'",
-        )
-        .bind(&campaign_id)
-        .bind(gm_account_id)
-        .fetch_optional(&self.pool)
+        let campaigns = self.campaigns();
+        let invitations = self.campaign_invitations();
+        let gm_account_id = gm_account_id.to_owned();
+        let invitation_id = invitation_id.to_owned();
+        let invitation_id_for_error = invitation_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let invitations = invitations.clone();
+            let gm_account_id = gm_account_id.clone();
+            let invitation_id = invitation_id.clone();
+            Box::pin(async move {
+                let invitation = invitations
+                    .find_one(doc! { "_id": &invitation_id, "state": "active" })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("load invitation for revoke", error))?
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "campaign_invitation",
+                        id: invitation_id.clone(),
+                    })?;
+                let campaign = campaigns
+                    .find_one(doc! {
+                        "_id": &invitation.campaign_id,
+                        "owner_account_id": &gm_account_id,
+                        "members": {
+                            "$elemMatch": {
+                                "account_id": &gm_account_id,
+                                "role": "game_master",
+                                "state": "active",
+                            }
+                        },
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("authorize invitation revoke", error)
+                    })?;
+                if campaign.is_none() {
+                    return Err(PersistenceError::NotFound {
+                        entity: "campaign_invitation",
+                        id: invitation_id.clone(),
+                    });
+                }
+                let updated = invitations
+                    .update_one(
+                        doc! { "_id": &invitation_id, "state": "active" },
+                        doc! {
+                            "$set": {
+                                "state": "revoked",
+                                "revoked_at": DateTime::now(),
+                                "updated_at": DateTime::now(),
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("revoke campaign invitation", error)
+                    })?;
+                if updated.modified_count != 1 {
+                    return Err(PersistenceError::NotFound {
+                        entity: "campaign_invitation",
+                        id: invitation_id,
+                    });
+                }
+                Ok(())
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?;
-        if gm_check.is_none() {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign_invitation",
-                id: invitation_id.to_owned(),
-            });
-        }
-        let result = sqlx::query(
-            "UPDATE campaign_invitations
-             SET revoked_at = CURRENT_TIMESTAMP
-             WHERE id = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
-        )
-        .bind(invitation_id)
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign_invitation",
-                id: invitation_id.to_owned(),
-            });
-        }
-        Ok(())
+        .map_err(|error| {
+            map_transaction_error(
+                error,
+                "campaign_invitation",
+                invitation_id_for_error.as_str(),
+            )
+        })
     }
 
-    /// Loads an invitation by ID. Returns `None` if not found.
+    /// Owner-scoped invitation lookup. Invitation IDs alone never authorize a read.
     pub async fn load_campaign_invitation(
         &self,
+        gm_account_id: &str,
         invitation_id: &str,
     ) -> Result<Option<CampaignInvitationRow>, RepositoryError> {
+        validate_account_id(gm_account_id)?;
         validate_invitation_id(invitation_id)?;
-        let row = sqlx::query(
-            "SELECT id, campaign_session_id, inviter_account_id,
-                    invitee_email_digest,
-                    expires_at::text AS expires_at,
-                    accepted_at IS NOT NULL AS accepted,
-                    revoked_at IS NOT NULL AS revoked,
-                    created_at::text AS created_at
-             FROM campaign_invitations WHERE id = $1",
-        )
-        .bind(invitation_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(|r| {
-            let accepted: bool = r.try_get("accepted").map_err(RepositoryError::Database)?;
-            let revoked: bool = r.try_get("revoked").map_err(RepositoryError::Database)?;
-            if accepted || revoked {
-                return Err(RepositoryError::NotFound {
-                    entity: "campaign_invitation",
-                    id: invitation_id.to_owned(),
-                });
-            }
-            invitation_from_row(&r)
-        })
-        .transpose()
+        let invitation = self
+            .campaign_invitations()
+            .find_one(doc! {
+                "_id": invitation_id,
+                "inviter_account_id": gm_account_id,
+                "state": "active",
+                "expires_at": { "$gt": DateTime::now() },
+            })
+            .await
+            .map_err(|error| mongo_error("load campaign invitation", error))?;
+        invitation.map(invitation_row).transpose()
     }
 
-    /// Accepts an invitation, creating an active player membership. The
-    /// invitation must not be expired, revoked, or already accepted.
-    /// `invitee_email` is re-hashed and compared to the stored digest.
     pub async fn accept_campaign_invitation(
         &self,
         account_id: &str,
@@ -410,67 +658,168 @@ impl PostgresRepository {
         validate_account_id(account_id)?;
         validate_invitation_id(invitation_id)?;
         validate_email(invitee_email)?;
-        let email_digest = email_sha256(invitee_email);
-        let _ = now_unix_seconds; // validated for API stability; DB is authoritative
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        // Atomically redeem the invitation: this UPDATE only affects a row that
-        // is not expired, not accepted, and not revoked. The email digest must
-        // match. If zero rows are affected, the invitation is not redeemable.
-        let redeemed = sqlx::query(
-            "UPDATE campaign_invitations
-             SET accepted_at = CURRENT_TIMESTAMP, accepted_account_id = $2
-             WHERE id = $1
-               AND invitee_email_digest = $3
-               AND accepted_at IS NULL
-               AND revoked_at IS NULL
-               AND expires_at > CURRENT_TIMESTAMP
-             RETURNING campaign_session_id, inviter_account_id",
-        )
-        .bind(invitation_id)
-        .bind(account_id)
-        .bind(&email_digest)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        let redeemed_row = redeemed.ok_or_else(|| {
-            // Distinguish not-found from consumed/expired by checking existence.
-            RepositoryError::NotFound {
-                entity: "campaign_invitation",
-                id: invitation_id.to_owned(),
-            }
-        })?;
-        let campaign_id: String = redeemed_row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?;
-        let inviter_account_id: String = redeemed_row
-            .try_get("inviter_account_id")
-            .map_err(RepositoryError::Database)?;
-        // Create the membership.
-        sqlx::query(
-            "INSERT INTO campaign_memberships
-             (campaign_session_id, account_id, role, state, inviter_account_id, accepted_at)
-             VALUES ($1, $2, 'player', 'active', $3, CURRENT_TIMESTAMP)",
-        )
-        .bind(&campaign_id)
-        .bind(account_id)
-        .bind(&inviter_account_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| map_insert_error(error, "campaign_membership", &campaign_id))?;
-        transaction
-            .commit()
+        require_account(self, account_id).await?;
+        let now = epoch_seconds_to_date(now_unix_seconds, "invitation acceptance time")?;
+        let campaigns = self.campaigns();
+        let invitations = self.campaign_invitations();
+        let account_id_owned = account_id.to_owned();
+        let invitation_id_owned = invitation_id.to_owned();
+        let normalized_email = invitee_email.to_owned();
+        let campaign_id = self
+            .with_transaction(move |session| {
+                let campaigns = campaigns.clone();
+                let invitations = invitations.clone();
+                let account_id = account_id_owned.clone();
+                let invitation_id = invitation_id_owned.clone();
+                let invitee_email = normalized_email.clone();
+                Box::pin(async move {
+                    let invitation = invitations
+                        .find_one(doc! {
+                            "_id": &invitation_id,
+                            "state": "active",
+                            "expires_at": { "$gt": now },
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load invitation for accept", error)
+                        })?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "campaign_invitation",
+                            id: invitation_id.clone(),
+                        })?;
+                    if invitation.invitee_email_lookup_hmac
+                        != invitation_email_digest(&invitation.campaign_id, &invitee_email)
+                    {
+                        return Err(PersistenceError::NotFound {
+                            entity: "campaign_invitation",
+                            id: invitation_id,
+                        });
+                    }
+                    let mut campaign = campaigns
+                        .find_one(doc! {
+                            "_id": &invitation.campaign_id,
+                            "owner_account_id": &invitation.inviter_account_id,
+                            "lifecycle.state": "open",
+                            "members": {
+                                "$elemMatch": {
+                                    "account_id": &invitation.inviter_account_id,
+                                    "role": "game_master",
+                                    "state": "active",
+                                }
+                            },
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load invitation campaign", error)
+                        })?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "campaign_invitation",
+                            id: invitation.id.clone(),
+                        })?;
+                    let now = DateTime::now();
+                    if let Some(member) = campaign
+                        .members
+                        .iter_mut()
+                        .find(|member| member.account_id == account_id)
+                    {
+                        if member.state == "active" {
+                            return Err(PersistenceError::AlreadyExists {
+                                entity: "campaign_membership",
+                                id: campaign.id,
+                            });
+                        }
+                        member.role = "player".to_owned();
+                        member.state = "active".to_owned();
+                        member.inviter_account_id = Some(invitation.inviter_account_id.clone());
+                        member.joined_at = now;
+                        member.left_at = None;
+                        member.updated_at = now;
+                    } else {
+                        if campaign.members.len() >= MAX_CAMPAIGN_MEMBERS {
+                            return Err(PersistenceError::AlreadyExists {
+                                entity: "campaign_membership_capacity",
+                                id: campaign.id,
+                            });
+                        }
+                        campaign.members.push(CampaignMemberDocument {
+                            account_id: account_id.clone(),
+                            role: "player".to_owned(),
+                            state: "active".to_owned(),
+                            inviter_account_id: Some(invitation.inviter_account_id.clone()),
+                            joined_at: now,
+                            left_at: None,
+                            created_at: now,
+                            updated_at: now,
+                        });
+                    }
+                    let members = mongodb::bson::to_bson(&campaign.members)
+                        .map_err(PersistenceError::BsonEncoding)?;
+                    let campaign_update = campaigns
+                        .update_one(
+                            doc! { "_id": &campaign.id, "revision": campaign.revision },
+                            doc! {
+                                "$set": {
+                                    "members": members,
+                                    "updated_at": now,
+                                },
+                                "$inc": { "revision": 1_i64 },
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("accept campaign membership", error)
+                        })?;
+                    if campaign_update.modified_count != 1 {
+                        return Err(PersistenceError::RevisionConflict {
+                            entity: "campaign",
+                            id: campaign.id,
+                            expected: nonnegative_u64(campaign.revision),
+                            actual: nonnegative_u64(campaign.revision).saturating_add(1),
+                        });
+                    }
+                    let invitation_update = invitations
+                        .update_one(
+                            doc! {
+                                "_id": &invitation.id,
+                                "state": "active",
+                                "expires_at": { "$gt": now },
+                            },
+                            doc! {
+                                "$set": {
+                                    "state": "accepted",
+                                    "accepted_account_id": &account_id,
+                                    "accepted_at": now,
+                                    "updated_at": now,
+                                }
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("consume campaign invitation", error)
+                        })?;
+                    if invitation_update.modified_count != 1 {
+                        return Err(PersistenceError::NotFound {
+                            entity: "campaign_invitation",
+                            id: invitation.id,
+                        });
+                    }
+                    Ok(campaign.id)
+                })
+            })
             .await
-            .map_err(RepositoryError::Database)?;
+            .map_err(|error| map_transaction_error(error, "campaign_invitation", invitation_id))?;
         self.load_membership(&campaign_id, account_id)
             .await?
-            .ok_or(RepositoryError::NotFound {
+            .ok_or_else(|| RepositoryError::NotFound {
                 entity: "campaign_membership",
-                id: campaign_id.to_owned(),
+                id: campaign_id,
             })
     }
 
-    /// Loads a membership scoped to `(campaign_id, account_id)`. Returns
-    /// `None` if the membership does not exist or the account is not a member.
     pub async fn load_membership(
         &self,
         campaign_id: &str,
@@ -478,22 +827,25 @@ impl PostgresRepository {
     ) -> Result<Option<CampaignMembershipRow>, RepositoryError> {
         validate_campaign_id(campaign_id)?;
         validate_account_id(account_id)?;
-        let row = sqlx::query(
-            "SELECT campaign_session_id, account_id, role, state,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(membership_from_row).transpose()
+        let campaign = self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_id,
+                "members.account_id": account_id,
+            })
+            .await
+            .map_err(|error| mongo_error("load campaign membership", error))?;
+        campaign
+            .and_then(|campaign| {
+                campaign
+                    .members
+                    .into_iter()
+                    .find(|member| member.account_id == account_id)
+                    .map(|member| membership_row(campaign_id, member))
+            })
+            .transpose()
     }
 
-    /// Returns `true` if `account_id` is an active member of `campaign_id`.
-    /// This is the membership guard used by all member-scoped loaders.
     pub async fn is_active_member(
         &self,
         account_id: &str,
@@ -501,21 +853,23 @@ impl PostgresRepository {
     ) -> Result<bool, RepositoryError> {
         validate_account_id(account_id)?;
         validate_campaign_id(campaign_id)?;
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT account_id FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2 AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        Ok(row.is_some())
+        let campaign = self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_id,
+                "members": {
+                    "$elemMatch": {
+                        "account_id": account_id,
+                        "state": "active",
+                    }
+                },
+            })
+            .projection(doc! { "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("check active campaign membership", error))?;
+        Ok(campaign.is_some())
     }
 
-    /// Loads a campaign summary after verifying the caller is an active member.
-    /// Returns `None` if the campaign does not exist or the caller is not a member.
-    /// Non-members and non-existent campaigns are indistinguishable (anti-enumeration).
     pub async fn load_member_campaign_summary(
         &self,
         account_id: &str,
@@ -523,35 +877,22 @@ impl PostgresRepository {
     ) -> Result<Option<crate::repository::lifecycle::CampaignSummary>, RepositoryError> {
         validate_account_id(account_id)?;
         validate_campaign_id(campaign_id)?;
-        let is_member = self.is_active_member(account_id, campaign_id).await?;
-        if !is_member {
-            return Ok(None);
-        }
-        // Delegate to the lifecycle repository's existing summary loader,
-        // bypassing the owner_key check since membership is already verified.
-        let row = sqlx::query(
-            "SELECT c.id, c.owner_key, c.revision, c.lifecycle_revision, c.lifecycle_state,
-                    c.archived_at::text AS archived_at, c.safety_policy_id,
-                    c.progression_policy_id, c.retention_class,
-                    c.retention_delete_after::text AS retention_delete_after,
-                    c.payload_json->>'title' AS title,
-                    c.created_at::text AS created_at, c.updated_at::text AS updated_at,
-                    p.id AS open_play_session_id
-             FROM campaign_sessions c
-             LEFT JOIN campaign_play_sessions p
-               ON p.campaign_session_id = c.id AND p.state IN ('waiting', 'active')
-             WHERE c.id = $1",
-        )
-        .bind(campaign_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(crate::repository::lifecycle::summary_from_row)
+        self.campaigns()
+            .find_one(doc! {
+                "_id": campaign_id,
+                "members": {
+                    "$elemMatch": {
+                        "account_id": account_id,
+                        "state": "active",
+                    }
+                },
+            })
+            .await
+            .map_err(|error| mongo_error("load member campaign summary", error))?
+            .map(crate::repository::lifecycle::campaign_summary_from_document)
             .transpose()
     }
 
-    /// Lists all members of a campaign. The caller must be an active member;
-    /// otherwise returns `NotFound`.
     pub async fn list_campaign_members(
         &self,
         account_id: &str,
@@ -559,93 +900,77 @@ impl PostgresRepository {
     ) -> Result<Vec<CampaignMembershipRow>, RepositoryError> {
         validate_account_id(account_id)?;
         validate_campaign_id(campaign_id)?;
-        // Verify caller is a member.
-        let membership_check: Option<String> = sqlx::query_scalar(
-            "SELECT account_id FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2 AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if membership_check.is_none() {
-            return Err(RepositoryError::NotFound {
+        let campaign = self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_id,
+                "members": {
+                    "$elemMatch": {
+                        "account_id": account_id,
+                        "state": "active",
+                    }
+                },
+            })
+            .await
+            .map_err(|error| mongo_error("list campaign members", error))?
+            .ok_or_else(|| RepositoryError::NotFound {
                 entity: "campaign_membership",
                 id: campaign_id.to_owned(),
-            });
-        }
-        let rows = sqlx::query(
-            "SELECT campaign_session_id, account_id, role, state,
-                    created_at::text AS created_at, updated_at::text AS updated_at
-             FROM campaign_memberships
-             WHERE campaign_session_id = $1
-             ORDER BY created_at, account_id",
-        )
-        .bind(campaign_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        rows.into_iter().map(membership_from_row).collect()
+            })?;
+        campaign
+            .members
+            .into_iter()
+            .map(|member| membership_row(campaign_id, member))
+            .collect()
     }
 
-    /// Lists all campaigns an account is a member of (owned + accepted).
     pub async fn list_account_campaigns(
         &self,
         account_id: &str,
     ) -> Result<Vec<MembershipCampaignSummary>, RepositoryError> {
         validate_account_id(account_id)?;
-        let rows = sqlx::query(
-            "SELECT m.campaign_session_id, m.role, m.state,
-                    m.created_at::text AS created_at,
-                    m.updated_at::text AS updated_at,
-                    cs.payload_json->>'title' AS title,
-                    cs.theme_id
-             FROM campaign_memberships m
-             JOIN campaign_sessions cs ON cs.id = m.campaign_session_id
-             WHERE m.account_id = $1 AND m.state = 'active'
-             ORDER BY m.updated_at DESC, m.campaign_session_id",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        rows.into_iter()
-            .map(|row| {
-                let title: String = row
-                    .try_get("title")
-                    .unwrap_or_else(|_| "Untitled Campaign".to_owned());
-                let theme_id: String = row
-                    .try_get("theme_id")
-                    .unwrap_or_else(|_| "dev.manchester-arcana.rainbound-borough".to_owned());
-                Ok(MembershipCampaignSummary {
-                    campaign_id: row
-                        .try_get("campaign_session_id")
-                        .map_err(RepositoryError::Database)?,
-                    title,
-                    theme_id,
-                    role: MembershipRole::try_from_str(
-                        &row.try_get::<String, _>("role")
-                            .map_err(RepositoryError::Database)?,
-                    )?,
-                    state: MembershipState::try_from_str(
-                        &row.try_get::<String, _>("state")
-                            .map_err(RepositoryError::Database)?,
-                    )?,
-                    created_at: row
-                        .try_get("created_at")
-                        .map_err(RepositoryError::Database)?,
-                    updated_at: row
-                        .try_get("updated_at")
-                        .map_err(RepositoryError::Database)?,
-                })
+        let mut cursor = self
+            .campaigns()
+            .find(doc! {
+                "members": {
+                    "$elemMatch": {
+                        "account_id": account_id,
+                        "state": "active",
+                    }
+                },
             })
-            .collect()
+            .sort(doc! { "updated_at": -1, "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("list account campaigns", error))?;
+        let mut output = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|error| mongo_error("read account campaigns", error))?
+        {
+            let campaign = cursor
+                .deserialize_current()
+                .map_err(|error| mongo_error("decode account campaigns", error))?;
+            let member =
+                campaign
+                    .active_member(account_id)
+                    .ok_or_else(|| RepositoryError::NotFound {
+                        entity: "campaign_membership",
+                        id: campaign.id.clone(),
+                    })?;
+            output.push(MembershipCampaignSummary {
+                campaign_id: campaign.id.clone(),
+                title: campaign.title.clone(),
+                theme_id: campaign.theme_id.clone(),
+                role: MembershipRole::try_from_str(&member.role)?,
+                state: MembershipState::try_from_str(&member.state)?,
+                created_at: date_string(member.created_at, "campaigns")?,
+                updated_at: date_string(member.updated_at, "campaigns")?,
+            });
+        }
+        Ok(output)
     }
 
-    /// Removes a member from a campaign. Only the GM may remove. The GM cannot
-    /// remove themselves (use delete campaign instead). Returns `NotFound` if
-    /// the target is not a member or the caller is not the GM.
     pub async fn remove_campaign_member(
         &self,
         gm_account_id: &str,
@@ -656,50 +981,112 @@ impl PostgresRepository {
         validate_campaign_id(campaign_id)?;
         validate_account_id(member_account_id)?;
         if gm_account_id == member_account_id {
-            return Err(RepositoryError::InvalidDomainState {
-                entity: "campaign_membership",
-                id: campaign_id.to_owned(),
-                reason: "a game master cannot remove their own ownership membership",
-            });
+            return invalid(
+                "campaign_membership",
+                campaign_id,
+                "a game master cannot remove their own ownership membership",
+            );
         }
-        let gm_check: Option<String> = sqlx::query_scalar(
-            "SELECT account_id FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2
-               AND role = 'game_master' AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(gm_account_id)
-        .fetch_optional(&self.pool)
+        let campaigns = self.campaigns();
+        let instances = self.campaign_character_instances();
+        let gm_account_id = gm_account_id.to_owned();
+        let campaign_id = campaign_id.to_owned();
+        let member_account_id = member_account_id.to_owned();
+        let campaign_id_for_error = campaign_id.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let instances = instances.clone();
+            let gm_account_id = gm_account_id.clone();
+            let campaign_id = campaign_id.clone();
+            let member_account_id = member_account_id.clone();
+            Box::pin(async move {
+                let mut campaign = campaigns
+                    .find_one(doc! {
+                        "_id": &campaign_id,
+                        "owner_account_id": &gm_account_id,
+                        "members": {
+                            "$elemMatch": {
+                                "account_id": &gm_account_id,
+                                "role": "game_master",
+                                "state": "active",
+                            }
+                        },
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("authorize member removal", error))?
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "campaign_membership",
+                        id: campaign_id.clone(),
+                    })?;
+                let now = DateTime::now();
+                let target = campaign
+                    .members
+                    .iter_mut()
+                    .find(|member| {
+                        member.account_id == member_account_id && member.state == "active"
+                    })
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "campaign_membership",
+                        id: member_account_id.clone(),
+                    })?;
+                target.state = "removed".to_owned();
+                target.left_at = Some(now);
+                target.updated_at = now;
+                let members = mongodb::bson::to_bson(&campaign.members)
+                    .map_err(PersistenceError::BsonEncoding)?;
+                let update = campaigns
+                    .update_one(
+                        doc! { "_id": &campaign_id, "revision": campaign.revision },
+                        doc! {
+                            "$set": {
+                                "members": members,
+                                "updated_at": now,
+                            },
+                            "$inc": { "revision": 1_i64 },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("remove campaign member", error))?;
+                if update.modified_count != 1 {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "campaign",
+                        id: campaign_id.clone(),
+                        expected: nonnegative_u64(campaign.revision),
+                        actual: nonnegative_u64(campaign.revision).saturating_add(1),
+                    });
+                }
+                instances
+                    .update_many(
+                        doc! {
+                            "campaign_id": &campaign_id,
+                            "account_id": &member_account_id,
+                            "state": "active",
+                        },
+                        doc! {
+                            "$set": {
+                                "state": "retired",
+                                "retired_at": now,
+                                "updated_at": now,
+                            },
+                            "$inc": { "revision": 1_i64 },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("retire removed member character", error)
+                    })?;
+                Ok(())
+            })
+        })
         .await
-        .map_err(RepositoryError::Database)?;
-        if gm_check.is_none() {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign_membership",
-                id: campaign_id.to_owned(),
-            });
-        }
-        let result = sqlx::query(
-            "UPDATE campaign_memberships
-             SET state = 'removed', left_at = CURRENT_TIMESTAMP, accepted_at = NULL
-             WHERE campaign_session_id = $1 AND account_id = $2
-               AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(member_account_id)
-        .execute(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound {
-                entity: "campaign_membership",
-                id: member_account_id.to_owned(),
-            });
-        }
-        Ok(())
+        .map_err(|error| {
+            map_transaction_error(error, "campaign_membership", campaign_id_for_error.as_str())
+        })
     }
 
-    /// Loads the theme_id for a campaign. Returns `None` if the campaign does
-    /// not exist or the caller is not a member.
     pub async fn load_campaign_theme_for_member(
         &self,
         account_id: &str,
@@ -707,33 +1094,22 @@ impl PostgresRepository {
     ) -> Result<Option<String>, RepositoryError> {
         validate_account_id(account_id)?;
         validate_campaign_id(campaign_id)?;
-        let row = sqlx::query(
-            "SELECT cs.theme_id
-             FROM campaign_sessions cs
-             JOIN campaign_memberships m
-               ON m.campaign_session_id = cs.id AND m.account_id = $2
-             WHERE cs.id = $1 AND m.state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        Ok(row
-            .and_then(|r| r.try_get::<Option<String>, _>("theme_id").ok())
-            .flatten())
+        Ok(self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_id,
+                "members": {
+                    "$elemMatch": {
+                        "account_id": account_id,
+                        "state": "active",
+                    }
+                },
+            })
+            .await
+            .map_err(|error| mongo_error("load campaign theme", error))?
+            .map(|campaign| campaign.theme_id))
     }
 
-    /// Assigns a library character to a campaign, creating a runtime hero
-    /// instance atomically. Validates:
-    /// - The caller owns the source player character.
-    /// - The caller is an active member of the campaign.
-    /// - The campaign's theme matches the character's theme.
-    /// - No existing active instance for this account in this campaign.
-    ///
-    /// The runtime `HeroCharacter` is created via
-    /// `PlayerCharacter::instantiate_for_campaign` and inserted into
-    /// `hero_characters` in the same transaction as the instance row.
     pub async fn assign_character_to_campaign(
         &self,
         account_id: &str,
@@ -744,7 +1120,6 @@ impl PostgresRepository {
         validate_account_id(account_id)?;
         validate_campaign_id(campaign_id)?;
         validate_character_id(player_character_id)?;
-        // The source character must be owned by the caller.
         if source_character.owner_account_id != account_id
             || source_character.character_id != player_character_id
         {
@@ -760,117 +1135,174 @@ impl PostgresRepository {
                 id: player_character_id.to_owned(),
                 source,
             })?;
-        let mut transaction = self.pool.begin().await.map_err(RepositoryError::Database)?;
-        // Verify the caller is an active member of the campaign.
-        let membership_check: Option<String> = sqlx::query_scalar(
-            "SELECT account_id FROM campaign_memberships
-             WHERE campaign_session_id = $1 AND account_id = $2 AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if membership_check.is_none() {
-            return Err(RepositoryError::NotFound {
+
+        let authoritative = self
+            .store()
+            .collection::<PlayerCharacterDocument>(CollectionName::PlayerCharacters)
+            .find_one(doc! {
+                "_id": player_character_id,
+                "owner_account_id": account_id,
+            })
+            .await
+            .map_err(|error| mongo_error("load source player character", error))?
+            .map(player_character_from_document)
+            .transpose()?
+            .ok_or_else(|| RepositoryError::NotFound {
+                entity: "player_character",
+                id: player_character_id.to_owned(),
+            })?;
+        if &authoritative != source_character {
+            return Err(RepositoryError::RevisionConflict {
+                entity: "player_character",
+                id: player_character_id.to_owned(),
+                expected: source_character.revision,
+                actual: authoritative.revision,
+            });
+        }
+        let campaign_theme = self
+            .load_campaign_theme_for_member(account_id, campaign_id)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound {
                 entity: "campaign_membership",
                 id: campaign_id.to_owned(),
-            });
+            })?;
+        if campaign_theme != theme_id_str(authoritative.theme_id()) {
+            return invalid(
+                "campaign_character_instance",
+                campaign_id,
+                "character theme does not match campaign theme",
+            );
         }
-        // Check for an existing active instance (no duplicate slot).
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT instance_id FROM campaign_character_instances
-             WHERE campaign_session_id = $1 AND account_id = $2 AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(RepositoryError::Database)?;
-        if existing.is_some() {
-            return Err(RepositoryError::AlreadyExists {
-                entity: "campaign_character_instance",
-                id: campaign_id.to_owned(),
-            });
-        }
-        // Load the campaign theme to validate compatibility.
-        let campaign_theme: Option<String> =
-            sqlx::query_scalar("SELECT theme_id FROM campaign_sessions WHERE id = $1")
-                .bind(campaign_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(RepositoryError::Database)?;
-        let campaign_theme = campaign_theme.ok_or(RepositoryError::NotFound {
-            entity: "campaign_session",
-            id: campaign_id.to_owned(),
-        })?;
-        let character_theme = theme_id_str(source_character.theme_id());
-        if campaign_theme != character_theme {
-            return Err(RepositoryError::InvalidDomainState {
-                entity: "campaign_character_instance",
-                id: campaign_id.to_owned(),
-                reason: "character theme does not match campaign theme",
-            });
-        }
-        // Instantiate the runtime hero.
-        let instance_id = format!("instance:{}", Uuid::new_v4().simple());
-        let runtime_hero_id = format!("character:runtime-{}", Uuid::new_v4().simple());
-        let hero = source_character
+
+        let instance_id = format!("campaign-character:{}", Uuid::new_v4());
+        let runtime_hero_id = format!("campaign-character-runtime:{}", Uuid::new_v4());
+        let hero = authoritative
             .instantiate_for_campaign(campaign_id.to_owned(), runtime_hero_id.clone())
             .map_err(|source| RepositoryError::HeroValidation {
-                entity: "hero_character",
-                id: runtime_hero_id.clone(),
+                entity: "campaign_character_instance",
+                id: instance_id.clone(),
                 source,
             })?;
-        let hero_payload = serialize("hero character", &hero)?;
-        // Insert the runtime hero_character row.
-        sqlx::query(
-            "INSERT INTO hero_characters
-             (id, campaign_session_id, owner_key, schema_version, revision, payload_json)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
-        )
-        .bind(&hero.character_id)
-        .bind(&hero.campaign_id)
-        .bind(&hero.owner_id)
-        .bind(i64::from(HERO_CHARACTER_SCHEMA_VERSION))
-        .bind(to_i64(
-            hero.revision.saturating_add(1),
-            "hero character revision",
-        )?)
-        .bind(&hero_payload)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| map_insert_error(error, "hero character", &hero.character_id))?;
-        // Insert the campaign_character_instances row.
-        let choices_digest = choices_sha256(source_character);
-        sqlx::query(
-            "INSERT INTO campaign_character_instances
-             (campaign_session_id, account_id, instance_id,
-              source_player_character_id, runtime_hero_character_id,
-              source_display_name, source_choices_digest, state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .bind(&instance_id)
-        .bind(player_character_id)
-        .bind(&runtime_hero_id)
-        .bind(&source_character.display_name)
-        .bind(&choices_digest)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| map_insert_error(error, "campaign_character_instance", &instance_id))?;
-        transaction
-            .commit()
-            .await
-            .map_err(RepositoryError::Database)?;
+        let source_digest = player_character_digest(&authoritative)?;
+        let captured_at = DateTime::now();
+        let instance = CampaignCharacterInstanceDocument {
+            id: instance_id.clone(),
+            schema_version: 1,
+            revision: 1,
+            campaign_id: campaign_id.to_owned(),
+            account_id: account_id.to_owned(),
+            source_player_character_id: player_character_id.to_owned(),
+            runtime_hero_character_id: runtime_hero_id.clone(),
+            state: "active".to_owned(),
+            source_snapshot: SourceCharacterSnapshot {
+                source_revision: to_i64(authoritative.revision, "source revision")?,
+                source_schema_version: i64::from(authoritative.schema_version),
+                source_digest,
+                captured_at,
+                display_name: authoritative.display_name.clone(),
+                player_character: authoritative.clone(),
+            },
+            progression: CampaignProgressionDocument {
+                level: i64::from(hero.level.value()),
+                experience_points: i64::from(hero.experience_points),
+                milestone_count: 0,
+            },
+            runtime: CampaignRuntimeDocument {
+                current_hit_points: i64::from(hero.sheet.current_hit_points),
+                maximum_hit_points: i64::from(hero.sheet.maximum_hit_points),
+                temporary_hit_points: 0,
+                bde_balance: 3,
+                hero,
+            },
+            created_at: captured_at,
+            updated_at: captured_at,
+            retired_at: None,
+        };
+        let campaigns = self.campaigns();
+        let characters = self
+            .store()
+            .collection::<PlayerCharacterDocument>(CollectionName::PlayerCharacters);
+        let instances = self.campaign_character_instances();
+        let account_id_owned = account_id.to_owned();
+        let campaign_id_owned = campaign_id.to_owned();
+        let character_id_owned = player_character_id.to_owned();
+        let source_revision = to_i64(authoritative.revision, "source revision")?;
+        let result = self
+            .with_transaction(move |session| {
+                let campaigns = campaigns.clone();
+                let characters = characters.clone();
+                let instances = instances.clone();
+                let instance = instance.clone();
+                let account_id = account_id_owned.clone();
+                let campaign_id = campaign_id_owned.clone();
+                let character_id = character_id_owned.clone();
+                Box::pin(async move {
+                    let campaign = campaigns
+                        .find_one(doc! {
+                            "_id": &campaign_id,
+                            "lifecycle.state": "open",
+                            "theme_id": theme_id_str(
+                                instance.source_snapshot.player_character.theme_id()
+                            ),
+                            "members": {
+                                "$elemMatch": {
+                                    "account_id": &account_id,
+                                    "state": "active",
+                                }
+                            },
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("authorize character assignment", error)
+                        })?;
+                    if campaign.is_none() {
+                        return Err(PersistenceError::NotFound {
+                            entity: "campaign_membership",
+                            id: campaign_id,
+                        });
+                    }
+                    let source = characters
+                        .find_one(doc! {
+                            "_id": &character_id,
+                            "owner_account_id": &account_id,
+                            "revision": source_revision,
+                        })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("recheck source character", error)
+                        })?;
+                    if source.is_none() {
+                        return Err(PersistenceError::NotFound {
+                            entity: "player_character",
+                            id: character_id,
+                        });
+                    }
+                    instances
+                        .insert_one(instance)
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("assign campaign character", error)
+                        })?;
+                    Ok(())
+                })
+            })
+            .await;
+        if let Err(error) = result {
+            return Err(map_transaction_error(
+                error,
+                "campaign_character_instance",
+                campaign_id,
+            ));
+        }
         Ok(AssignCharacterOutcome {
             instance_id,
             runtime_hero_character_id: runtime_hero_id,
         })
     }
 
-    /// Loads the active character instance for an account in a campaign, if any.
     pub async fn load_active_character_instance(
         &self,
         account_id: &str,
@@ -878,150 +1310,161 @@ impl PostgresRepository {
     ) -> Result<Option<CampaignCharacterInstanceRow>, RepositoryError> {
         validate_account_id(account_id)?;
         validate_campaign_id(campaign_id)?;
-        let row = sqlx::query(
-            "SELECT campaign_session_id, account_id, instance_id,
-                    source_player_character_id, runtime_hero_character_id,
-                    source_display_name, source_choices_digest, state,
-                    created_at::text AS created_at,
-                    retired_at::text AS retired_at
-             FROM campaign_character_instances
-             WHERE campaign_session_id = $1 AND account_id = $2 AND state = 'active'",
-        )
-        .bind(campaign_id)
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(|row| character_instance_from_row(&row)).transpose()
+        self.campaign_character_instances()
+            .find_one(doc! {
+                "campaign_id": campaign_id,
+                "account_id": account_id,
+                "state": "active",
+            })
+            .await
+            .map_err(|error| mongo_error("load active campaign character", error))?
+            .map(character_instance_row)
+            .transpose()
     }
 
-    /// Loads a runtime hero character by ID (unscoped — the caller must
-    /// have already verified membership).
+    /// Loads runtime state only through an active same-campaign membership.
     pub async fn load_runtime_hero_character(
         &self,
+        account_id: &str,
+        campaign_id: &str,
         hero_character_id: &str,
     ) -> Result<Option<HeroCharacter>, RepositoryError> {
-        if !is_valid_opaque_id(hero_character_id) {
+        validate_account_id(account_id)?;
+        validate_campaign_id(campaign_id)?;
+        if !hero_character_id.starts_with("campaign-character-runtime:")
+            || !is_valid_opaque_id(hero_character_id)
+        {
             return invalid(
-                "hero character",
+                "campaign_character_instance",
                 hero_character_id,
-                "character id must be a valid opaque identifier",
+                "runtime character id must be a prefixed opaque identifier",
             );
         }
-        let row = sqlx::query(
-            "SELECT payload_json::text AS payload_json FROM hero_characters WHERE id = $1",
-        )
-        .bind(hero_character_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepositoryError::Database)?;
-        row.map(|r| {
-            let payload: String = r
-                .try_get("payload_json")
-                .map_err(RepositoryError::Database)?;
-            serde_json::from_str::<HeroCharacter>(&payload).map_err(|source| {
-                RepositoryError::InvalidStoredData {
-                    entity: "hero character",
-                    id: hero_character_id.to_owned(),
-                    source,
-                }
+        if !self.is_active_member(account_id, campaign_id).await? {
+            return Ok(None);
+        }
+        let stored = self
+            .campaign_character_instances()
+            .find_one(doc! {
+                "campaign_id": campaign_id,
+                "runtime_hero_character_id": hero_character_id,
+                "state": "active",
             })
-        })
-        .transpose()
+            .await
+            .map_err(|error| mongo_error("load authorized runtime character", error))?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let caller_is_owner = stored.account_id == account_id;
+        let caller_is_gm = self
+            .campaigns()
+            .find_one(doc! {
+                "_id": campaign_id,
+                "members": {
+                    "$elemMatch": {
+                        "account_id": account_id,
+                        "role": "game_master",
+                        "state": "active",
+                    }
+                },
+            })
+            .projection(doc! { "_id": 1 })
+            .await
+            .map_err(|error| mongo_error("authorize runtime character", error))?
+            .is_some();
+        if !caller_is_owner && !caller_is_gm {
+            return Ok(None);
+        }
+        stored
+            .runtime
+            .hero
+            .validate()
+            .map_err(|source| RepositoryError::HeroValidation {
+                entity: "campaign_character_instance",
+                id: stored.id,
+                source,
+            })?;
+        Ok(Some(stored.runtime.hero))
+    }
+
+    pub(crate) fn campaign_character_instances(
+        &self,
+    ) -> Collection<CampaignCharacterInstanceDocument> {
+        self.store()
+            .collection(CollectionName::CampaignCharacterInstances)
+    }
+
+    fn campaign_invitations(&self) -> Collection<CampaignInvitationDocument> {
+        self.store().collection(CollectionName::CampaignInvitations)
     }
 }
 
-// ── Row mappers ──
+async fn require_account(
+    repository: &MongoRepository,
+    account_id: &str,
+) -> Result<(), RepositoryError> {
+    let exists = repository
+        .store()
+        .document_collection(CollectionName::Accounts)
+        .find_one(doc! { "_id": account_id })
+        .projection(doc! { "_id": 1 })
+        .await
+        .map_err(|error| mongo_error("load campaign account", error))?;
+    if exists.is_none() {
+        return Err(RepositoryError::NotFound {
+            entity: "account",
+            id: account_id.to_owned(),
+        });
+    }
+    Ok(())
+}
 
-fn membership_from_row(
-    row: sqlx::postgres::PgRow,
+fn membership_row(
+    campaign_id: &str,
+    member: CampaignMemberDocument,
 ) -> Result<CampaignMembershipRow, RepositoryError> {
     Ok(CampaignMembershipRow {
-        campaign_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        account_id: row
-            .try_get("account_id")
-            .map_err(RepositoryError::Database)?,
-        role: MembershipRole::try_from_str(
-            &row.try_get::<String, _>("role")
-                .map_err(RepositoryError::Database)?,
-        )?,
-        state: MembershipState::try_from_str(
-            &row.try_get::<String, _>("state")
-                .map_err(RepositoryError::Database)?,
-        )?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        updated_at: row
-            .try_get("updated_at")
-            .map_err(RepositoryError::Database)?,
+        campaign_id: campaign_id.to_owned(),
+        account_id: member.account_id,
+        role: MembershipRole::try_from_str(&member.role)?,
+        state: MembershipState::try_from_str(&member.state)?,
+        created_at: date_string(member.created_at, "campaigns")?,
+        updated_at: date_string(member.updated_at, "campaigns")?,
     })
 }
 
-fn invitation_from_row(
-    row: &sqlx::postgres::PgRow,
+fn invitation_row(
+    invitation: CampaignInvitationDocument,
 ) -> Result<CampaignInvitationRow, RepositoryError> {
     Ok(CampaignInvitationRow {
-        id: row.try_get("id").map_err(RepositoryError::Database)?,
-        campaign_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        inviter_account_id: row
-            .try_get("inviter_account_id")
-            .map_err(RepositoryError::Database)?,
-        invitee_email_digest: row
-            .try_get("invitee_email_digest")
-            .map_err(RepositoryError::Database)?,
-        expires_at: row
-            .try_get("expires_at")
-            .map_err(RepositoryError::Database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
+        id: invitation.id,
+        campaign_id: invitation.campaign_id,
+        inviter_account_id: invitation.inviter_account_id,
+        invitee_email_digest: invitation.invitee_email_lookup_hmac,
+        expires_at: date_string(invitation.expires_at, "campaign_invitations")?,
+        created_at: date_string(invitation.created_at, "campaign_invitations")?,
     })
 }
 
-fn character_instance_from_row(
-    row: &sqlx::postgres::PgRow,
+fn character_instance_row(
+    stored: CampaignCharacterInstanceDocument,
 ) -> Result<CampaignCharacterInstanceRow, RepositoryError> {
     Ok(CampaignCharacterInstanceRow {
-        campaign_id: row
-            .try_get("campaign_session_id")
-            .map_err(RepositoryError::Database)?,
-        account_id: row
-            .try_get("account_id")
-            .map_err(RepositoryError::Database)?,
-        instance_id: row
-            .try_get("instance_id")
-            .map_err(RepositoryError::Database)?,
-        source_player_character_id: row
-            .try_get("source_player_character_id")
-            .map_err(RepositoryError::Database)?,
-        runtime_hero_character_id: row
-            .try_get("runtime_hero_character_id")
-            .map_err(RepositoryError::Database)?,
-        source_display_name: row
-            .try_get("source_display_name")
-            .map_err(RepositoryError::Database)?,
-        source_choices_digest: row
-            .try_get("source_choices_digest")
-            .map_err(RepositoryError::Database)?,
-        state: CharacterInstanceState::try_from_str(
-            &row.try_get::<String, _>("state")
-                .map_err(RepositoryError::Database)?,
-        )?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(RepositoryError::Database)?,
-        retired_at: row
-            .try_get("retired_at")
-            .map_err(RepositoryError::Database)?,
+        campaign_id: stored.campaign_id,
+        account_id: stored.account_id,
+        instance_id: stored.id,
+        source_player_character_id: stored.source_player_character_id,
+        runtime_hero_character_id: stored.runtime_hero_character_id,
+        source_display_name: stored.source_snapshot.display_name,
+        source_choices_digest: stored.source_snapshot.source_digest,
+        state: CharacterInstanceState::try_from_str(&stored.state)?,
+        created_at: date_string(stored.created_at, "campaign_character_instances")?,
+        retired_at: stored
+            .retired_at
+            .map(|date| date_string(date, "campaign_character_instances"))
+            .transpose()?,
     })
 }
-
-// ── Validators ──
 
 fn validate_account_id(account_id: &str) -> Result<(), RepositoryError> {
     if account_id == "account:local" {
@@ -1067,8 +1510,7 @@ fn validate_invitation_id(invitation_id: &str) -> Result<(), RepositoryError> {
 }
 
 fn validate_campaign_title(title: &str) -> Result<(), RepositoryError> {
-    let trimmed = title.trim();
-    if trimmed.is_empty()
+    if title.trim().is_empty()
         || title.chars().count() > MAX_CAMPAIGN_TITLE_LEN
         || title.chars().any(char::is_control)
     {
@@ -1117,28 +1559,103 @@ fn theme_id_str(theme: manchester_dnd_core::hero::ThemeId) -> &'static str {
     }
 }
 
-fn email_sha256(email: &str) -> String {
+fn invitation_email_digest(campaign_id: &str, email: &str) -> String {
     let normalized = email.trim().to_ascii_lowercase();
-    let digest: [u8; 32] = Sha256::digest(normalized.as_bytes()).into();
-    let mut value = String::with_capacity(71);
-    value.push_str("sha256:");
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    value
+    let mut hasher = Sha256::new();
+    hasher.update(b"campaign-invitation-email/v1\0");
+    hasher.update(campaign_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(normalized.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
-fn choices_sha256(character: &PlayerCharacter) -> String {
-    let serialized = serde_json::to_vec(&character.choices).unwrap_or_default();
-    let digest: [u8; 32] = Sha256::digest(serialized).into();
-    let mut value = String::with_capacity(71);
-    value.push_str("sha256:");
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+fn player_character_digest(character: &PlayerCharacter) -> Result<String, RepositoryError> {
+    let encoded = serde_json::to_vec(character).map_err(|source| RepositoryError::Serialize {
+        entity: "player character source snapshot",
+        source,
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
+fn normalize_title(title: &str) -> String {
+    title.trim().to_lowercase()
+}
+
+fn epoch_seconds_to_date(value: u64, field: &'static str) -> Result<DateTime, RepositoryError> {
+    let milliseconds = value
+        .checked_mul(1_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RepositoryError::NumericRange { field })?;
+    Ok(DateTime::from_millis(milliseconds))
+}
+
+fn to_i64(value: u64, field: &'static str) -> Result<i64, RepositoryError> {
+    i64::try_from(value).map_err(|_| RepositoryError::NumericRange { field })
+}
+
+fn nonnegative_u64(value: i64) -> u64 {
+    if value < 0 { 0 } else { value as u64 }
+}
+
+fn date_string(value: DateTime, collection: &str) -> Result<String, RepositoryError> {
+    value.try_to_rfc3339_string().map_err(|_| {
+        RepositoryError::Persistence(PersistenceError::SchemaDrift {
+            collection: collection.to_owned(),
+            detail: "stored BSON date is outside RFC 3339 range".to_owned(),
+        })
+    })
+}
+
+fn mongo_error(operation: &'static str, error: mongodb::error::Error) -> RepositoryError {
+    RepositoryError::Persistence(PersistenceError::mongo(operation, error))
+}
+
+fn map_transaction_error(
+    error: PersistenceError,
+    entity: &'static str,
+    id: &str,
+) -> RepositoryError {
+    match error {
+        PersistenceError::NotFound {
+            entity: stored_entity,
+            id,
+        } => RepositoryError::NotFound {
+            entity: stored_entity,
+            id,
+        },
+        PersistenceError::AlreadyExists {
+            entity: stored_entity,
+            id,
+        } => RepositoryError::AlreadyExists {
+            entity: stored_entity,
+            id,
+        },
+        PersistenceError::RevisionConflict {
+            entity: stored_entity,
+            id,
+            expected,
+            actual,
+        } => RepositoryError::RevisionConflict {
+            entity: stored_entity,
+            id,
+            expected,
+            actual,
+        },
+        other if other.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey) => {
+            RepositoryError::AlreadyExists {
+                entity,
+                id: id.to_owned(),
+            }
+        }
+        other if other.mongo_failure_kind() == Some(MongoFailureKind::DocumentValidation) => {
+            RepositoryError::InvalidDomainState {
+                entity,
+                id: id.to_owned(),
+                reason: "document failed MongoDB schema validation",
+            }
+        }
+        other => RepositoryError::Persistence(other),
     }
-    value
 }
 
 fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T, RepositoryError> {
@@ -1151,23 +1668,72 @@ fn invalid<T>(entity: &'static str, id: &str, reason: &'static str) -> Result<T,
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use manchester_dnd_core::{
-        PLAYER_CHARACTER_SCHEMA_VERSION, PlayerCharacter,
-        hero::{
-            AncestryId, BackgroundId, BackgroundSelection, ClassSelection, EquipmentId,
-            EquipmentSelection, FightingStyleId, HeroChoices, HeroConceptId, HeroPins,
-            HeroPresentation, SkillId, StandardArrayAssignment, ThemeId,
-        },
+    use std::time::Duration;
+
+    use manchester_dnd_core::hero::{
+        AncestryId, BackgroundId, BackgroundSelection, ClassSelection, EquipmentId,
+        EquipmentSelection, FightingStyleId, HeroChoices, HeroConceptId, HeroPins,
+        HeroPresentation, SkillId, StandardArrayAssignment, ThemeId,
     };
-    use sqlx::PgPool;
-    use uuid::Uuid;
+    use mongodb::bson::doc;
 
-    const THEME_ID: &str = "dev.manchester-arcana.rainbound-borough";
+    use super::*;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::SchemaReconciler,
+    };
 
-    fn test_choices(theme: ThemeId) -> HeroChoices {
+    async fn test_repository() -> Option<(MongoRepository, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping MongoDB contract: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(!uri.trim().is_empty());
+        let database = format!("mdnd_test_memberships_{}", Uuid::new_v4().simple());
+        let store = crate::persistence::MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 4,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 2,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("schema must apply");
+        Some((MongoRepository::new(store), database))
+    }
+
+    async fn insert_account(repository: &MongoRepository, account_id: &str) {
+        repository
+            .store()
+            .document_collection(CollectionName::Accounts)
+            .insert_one(doc! {
+                "_id": account_id,
+                "schema_version": 1_i64,
+                "revision": 1_i64,
+                "role": "user",
+                "username_normalized": format!("user-{}", Uuid::new_v4()),
+                "email_lookup_hmac": format!("hmac-sha256:{}", Uuid::new_v4().simple()),
+                "password_phc": "$argon2id$test",
+                "login_enabled": false,
+                "created_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            })
+            .await
+            .expect("account fixture must insert");
+    }
+
+    fn choices() -> HeroChoices {
         HeroChoices {
-            pins: HeroPins::mvp(theme),
+            pins: HeroPins::mvp(ThemeId::RainboundBorough),
             concept: HeroConceptId::CanalGuardian,
             ancestry: AncestryId::Human,
             class: ClassSelection::Fighter {
@@ -1198,575 +1764,194 @@ mod tests {
             },
             wizard_spells: None,
             presentation: HeroPresentation {
-                name: "Test Hero".to_owned(),
+                name: "Mara".to_owned(),
                 pronouns: "they/them".to_owned(),
-                appearance: "A weathered adventurer".to_owned(),
-                ideal: "Justice for all".to_owned(),
-                bond: "Owes a life debt".to_owned(),
+                appearance: "Weathered".to_owned(),
+                ideal: "Justice".to_owned(),
+                bond: "The canal".to_owned(),
                 flaw: "Too trusting".to_owned(),
                 tone_limits: Vec::new(),
             },
         }
     }
 
-    fn new_character(account_id: &str, name: &str) -> PlayerCharacter {
-        PlayerCharacter::new(
-            format!("character:{}", Uuid::new_v4()),
-            account_id.to_owned(),
-            name.to_owned(),
-            test_choices(ThemeId::RainboundBorough),
-        )
-        .expect("test character should be valid")
-    }
+    #[tokio::test]
+    async fn mongo_membership_contract_covers_auth_invites_and_immutable_instances() {
+        let Some((repository, database)) = test_repository().await else {
+            return;
+        };
+        let gm = format!("account:{}", Uuid::new_v4());
+        let player = format!("account:{}", Uuid::new_v4());
+        let outsider = format!("account:{}", Uuid::new_v4());
+        insert_account(&repository, &gm).await;
+        insert_account(&repository, &player).await;
+        insert_account(&repository, &outsider).await;
 
-    async fn insert_test_account(pool: &PgPool, account_id: &str) {
-        sqlx::query(
-            "INSERT INTO accounts (id, display_name, login_enabled) VALUES ($1, $2, FALSE)
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(account_id)
-        .bind("Test Account")
-        .execute(pool)
-        .await
-        .expect("test account should insert");
-    }
-
-    /// Inserts a minimal `player_characters` row directly. The `choices_json`
-    /// is a valid MVP `HeroChoices` payload so the FK row is consistent, but
-    /// callers that need the in-memory `PlayerCharacter` object (e.g. for
-    /// `assign_character_to_campaign`) should build one via `new_character`
-    /// using the same id and choices.
-    async fn insert_test_player_character(pool: &PgPool, account_id: &str, character_id: &str) {
-        let choices = test_choices(ThemeId::RainboundBorough);
-        let choices_json = serde_json::to_value(&choices).expect("test choices should serialize");
-        // Derive a unique display name from the character id to satisfy the
-        // unique (owner_account_id, lower(display_name)) constraint when a
-        // single test inserts multiple characters for the same account.
-        let display_name = format!("Hero {}", &character_id[..character_id.len().min(20)]);
-        sqlx::query(
-            "INSERT INTO player_characters
-             (id, owner_account_id, revision, display_name, choices_json, schema_version)
-             VALUES ($1, $2, 0, $3, $4, $5)",
-        )
-        .bind(character_id)
-        .bind(account_id)
-        .bind(&display_name)
-        .bind(&choices_json)
-        .bind(PLAYER_CHARACTER_SCHEMA_VERSION as i32)
-        .execute(pool)
-        .await
-        .expect("test player character should insert");
-    }
-
-    // ── 1. create_campaign_with_owner ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn create_campaign_with_owner_creates_campaign_and_gm_membership(pool: PgPool) {
-        let account = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, account).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(account, "Test Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-        assert_eq!(outcome.title, "Test Campaign");
-        assert_eq!(outcome.theme_id, THEME_ID);
-        assert!(outcome.campaign_id.starts_with("campaign:"));
-
-        // The campaign_sessions row exists with the owner backfilled.
-        let owner: String =
-            sqlx::query_scalar("SELECT owner_account_id FROM campaign_sessions WHERE id = $1")
-                .bind(&outcome.campaign_id)
-                .fetch_one(&repo.pool)
-                .await
-                .expect("session row should exist");
-        assert_eq!(owner, account);
-
-        // The GM membership is active.
-        let membership = repo
-            .load_membership(&outcome.campaign_id, account)
-            .await
-            .expect("load should succeed")
-            .expect("membership should exist");
-        assert_eq!(membership.role, MembershipRole::GameMaster);
-        assert_eq!(membership.state, MembershipState::Active);
-    }
-
-    // ── 2. list_account_campaigns ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn list_account_campaigns_returns_owned_and_member_campaigns(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Shared Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        // GM creates an invitation and the player accepts it.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
-            .await
-            .expect("invitation should be created");
-        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await
-            .expect("accept should succeed");
-
-        // GM sees the campaign.
-        let gm_campaigns = repo
-            .list_account_campaigns(gm)
-            .await
-            .expect("list should succeed");
-        assert_eq!(gm_campaigns.len(), 1);
-        assert_eq!(gm_campaigns[0].campaign_id, outcome.campaign_id);
-        assert_eq!(gm_campaigns[0].role, MembershipRole::GameMaster);
-
-        // Player also sees the campaign.
-        let player_campaigns = repo
-            .list_account_campaigns(player)
-            .await
-            .expect("list should succeed");
-        assert_eq!(player_campaigns.len(), 1);
-        assert_eq!(player_campaigns[0].campaign_id, outcome.campaign_id);
-        assert_eq!(player_campaigns[0].role, MembershipRole::Player);
-    }
-
-    // ── 3. cross-account access ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn cross_account_campaign_access_returns_not_found(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let outsider = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, outsider).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Private Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        // The outsider is not a member — listing members returns NotFound.
-        let result = repo
-            .list_campaign_members(outsider, &outcome.campaign_id)
-            .await;
-        assert!(
-            matches!(result, Err(RepositoryError::NotFound { .. })),
-            "non-member should get NotFound, got {result:?}"
-        );
-
-        // The outsider's own campaign list does not include this campaign.
-        let outsider_campaigns = repo
-            .list_account_campaigns(outsider)
-            .await
-            .expect("list should succeed");
-        assert!(
-            outsider_campaigns.is_empty(),
-            "non-member should not see the campaign"
-        );
-    }
-
-    // ── 4. invitation accept ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn invitation_accept_creates_active_membership(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Invite Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
-            .await
-            .expect("invitation should be created");
-
-        let membership = repo
-            .accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await
-            .expect("accept should succeed");
-        assert_eq!(membership.account_id, player);
-        assert_eq!(membership.role, MembershipRole::Player);
-        assert_eq!(membership.state, MembershipState::Active);
-        assert_eq!(membership.campaign_id, outcome.campaign_id);
-    }
-
-    // ── 5. invitation revocation ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn invitation_revocation_prevents_acceptance(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Revoke Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
-            .await
-            .expect("invitation should be created");
-
-        repo.revoke_campaign_invitation(gm, &invitation.id)
-            .await
-            .expect("revoke should succeed");
-
-        let result = repo
-            .accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await;
-        assert!(
-            matches!(result, Err(RepositoryError::NotFound { .. })),
-            "revoked invitation should not be acceptable, got {result:?}"
-        );
-
-        // The player is not a member.
-        let membership = repo
-            .load_membership(&outcome.campaign_id, player)
-            .await
-            .expect("load should succeed");
-        assert!(membership.is_none(), "player should not be a member");
-    }
-
-    // ── 6. invitation expiry ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn invitation_expiry_prevents_acceptance(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Expiry Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        // Create an invitation that is already expired (expiry in the past).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now - 1)
-            .await
-            .expect("invitation should be created");
-
-        let result = repo
-            .accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await;
-        assert!(
-            matches!(result, Err(RepositoryError::NotFound { .. })),
-            "expired invitation should not be acceptable, got {result:?}"
-        );
-
-        let membership = repo
-            .load_membership(&outcome.campaign_id, player)
-            .await
-            .expect("load should succeed");
-        assert!(membership.is_none(), "player should not be a member");
-    }
-
-    // ── 7. non-GM cannot invite ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn non_gm_cannot_invite(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "GM Only", THEME_ID)
-            .await
-            .expect("create should succeed");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
-            .await
-            .expect("invitation should be created");
-        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await
-            .expect("accept should succeed");
-
-        // The player (now an active member, but not the GM) cannot invite.
-        let result = repo
-            .create_campaign_invitation(
-                player,
-                &outcome.campaign_id,
-                "other@example.com",
-                now + 3600,
-            )
-            .await;
-        assert!(
-            matches!(result, Err(RepositoryError::NotFound { .. })),
-            "non-GM should not be able to invite, got {result:?}"
-        );
-    }
-
-    // ── 8. remove member ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn remove_campaign_member_sets_state_removed(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Removal Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
-            .await
-            .expect("invitation should be created");
-        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await
-            .expect("accept should succeed");
-
-        repo.remove_campaign_member(gm, &outcome.campaign_id, player)
-            .await
-            .expect("remove should succeed");
-
-        let membership = repo
-            .load_membership(&outcome.campaign_id, player)
-            .await
-            .expect("load should succeed")
-            .expect("membership row should still exist");
-        assert_eq!(membership.state, MembershipState::Removed);
-        assert_eq!(membership.role, MembershipRole::Player);
-    }
-
-    // ── 9. GM cannot remove self ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn gm_cannot_remove_self(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, gm).await;
-        let repo = PostgresRepository::from_pool(pool);
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "No Self Removal", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        let result = repo
-            .remove_campaign_member(gm, &outcome.campaign_id, gm)
-            .await;
-        assert!(
-            matches!(result, Err(RepositoryError::InvalidDomainState { .. })),
-            "GM should not be able to remove self, got {result:?}"
-        );
-
-        // GM membership is still active.
-        let membership = repo
-            .load_membership(&outcome.campaign_id, gm)
-            .await
-            .expect("load should succeed")
-            .expect("membership should exist");
-        assert_eq!(membership.state, MembershipState::Active);
-    }
-
-    // ── 10. assign character creates runtime hero ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn assign_character_creates_runtime_hero_instance(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, gm).await;
-        let repo = PostgresRepository::from_pool(pool.clone());
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Hero Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        let character = new_character(gm, "Library Hero");
-        insert_test_player_character(&pool, gm, &character.character_id).await;
-
-        let assigned = repo
-            .assign_character_to_campaign(
-                gm,
-                &outcome.campaign_id,
-                &character.character_id,
-                &character,
+        let campaign = repository
+            .create_campaign_with_owner(
+                &gm,
+                "Rain over Ancoats",
+                "dev.manchester-arcana.rainbound-borough",
             )
             .await
-            .expect("assign should succeed");
-        assert!(!assigned.instance_id.is_empty());
-        assert!(
-            assigned
-                .runtime_hero_character_id
-                .starts_with("character:runtime-")
-        );
-
-        // The campaign_character_instances row exists and is active.
-        let instance = repo
-            .load_active_character_instance(gm, &outcome.campaign_id)
-            .await
-            .expect("load should succeed")
-            .expect("instance should exist");
-        assert_eq!(instance.account_id, gm);
-        assert_eq!(instance.source_player_character_id, character.character_id);
+            .expect("campaign creation must work");
         assert_eq!(
-            instance.runtime_hero_character_id,
-            assigned.runtime_hero_character_id
+            repository
+                .create_campaign_with_owner(
+                    &gm,
+                    "Rain over Ancoats",
+                    "dev.manchester-arcana.rainbound-borough",
+                )
+                .await
+                .expect("campaign create replay must work"),
+            campaign
         );
-        assert_eq!(instance.state, CharacterInstanceState::Active);
-        assert_eq!(instance.source_display_name, "Library Hero");
-
-        // The runtime hero_characters row exists and deserializes.
-        let hero = repo
-            .load_runtime_hero_character(&assigned.runtime_hero_character_id)
-            .await
-            .expect("load should succeed")
-            .expect("hero should exist");
-        assert_eq!(hero.campaign_id, outcome.campaign_id);
-        assert_eq!(hero.owner_id, gm);
-    }
-
-    // ── 11. duplicate active character slot ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn duplicate_active_character_slot_rejected(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        insert_test_account(&pool, gm).await;
-        let repo = PostgresRepository::from_pool(pool.clone());
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Duplicate Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        let first = new_character(gm, "First Hero");
-        insert_test_player_character(&pool, gm, &first.character_id).await;
-        repo.assign_character_to_campaign(gm, &outcome.campaign_id, &first.character_id, &first)
-            .await
-            .expect("first assign should succeed");
-
-        // A second character from the same account cannot be assigned — the
-        // active slot is already taken.
-        let second = new_character(gm, "Second Hero");
-        insert_test_player_character(&pool, gm, &second.character_id).await;
-        let result = repo
-            .assign_character_to_campaign(gm, &outcome.campaign_id, &second.character_id, &second)
-            .await;
         assert!(
-            matches!(result, Err(RepositoryError::AlreadyExists { .. })),
-            "duplicate active slot should be rejected, got {result:?}"
+            repository
+                .list_campaign_members(&outsider, &campaign.campaign_id)
+                .await
+                .is_err()
         );
-    }
+        assert!(matches!(
+            repository
+                .remove_campaign_member(&gm, &campaign.campaign_id, &gm)
+                .await,
+            Err(RepositoryError::InvalidDomainState { .. })
+        ));
 
-    // ── 12. cross-account character assignment ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn cross_account_character_assignment_rejected(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let player = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, player).await;
-        let repo = PostgresRepository::from_pool(pool.clone());
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Cross Account Campaign", THEME_ID)
-            .await
-            .expect("create should succeed");
-
-        // GM owns the character; the player tries to assign it.
-        let character = new_character(gm, "GM Hero");
-        insert_test_player_character(&pool, gm, &character.character_id).await;
-
-        // Make the player a member first so the membership check passes and we
-        // reach the ownership check.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let invitation = repo
-            .create_campaign_invitation(gm, &outcome.campaign_id, "player@example.com", now + 3600)
-            .await
-            .expect("invitation should be created");
-        repo.accept_campaign_invitation(player, &invitation.id, "player@example.com", now)
-            .await
-            .expect("accept should succeed");
-
-        let result = repo
-            .assign_character_to_campaign(
-                player,
-                &outcome.campaign_id,
-                &character.character_id,
-                &character,
+        let now = u64::try_from(DateTime::now().timestamp_millis())
+            .expect("test clock must be positive")
+            / 1_000;
+        let invitation = repository
+            .create_campaign_invitation(
+                &gm,
+                &campaign.campaign_id,
+                "player@example.com",
+                now + 3_600,
             )
-            .await;
-        assert!(
-            matches!(result, Err(RepositoryError::NotFound { .. })),
-            "cross-account character assignment should be rejected, got {result:?}"
-        );
-    }
-
-    // ── 13. foreign campaign character assignment ──
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn foreign_campaign_character_assignment_rejected(pool: PgPool) {
-        let gm = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let outsider = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        insert_test_account(&pool, gm).await;
-        insert_test_account(&pool, outsider).await;
-        let repo = PostgresRepository::from_pool(pool.clone());
-
-        let outcome = repo
-            .create_campaign_with_owner(gm, "Foreign Campaign", THEME_ID)
             .await
-            .expect("create should succeed");
-
-        let character = new_character(outsider, "Outsider Hero");
-        insert_test_player_character(&pool, outsider, &character.character_id).await;
-
-        // The outsider is not a member of the campaign.
-        let result = repo
-            .assign_character_to_campaign(
-                outsider,
-                &outcome.campaign_id,
-                &character.character_id,
-                &character,
-            )
-            .await;
+            .expect("invitation creation must work");
+        assert!(matches!(
+            repository
+                .create_campaign_invitation(
+                    &gm,
+                    &campaign.campaign_id,
+                    "player@example.com",
+                    now + 3_600,
+                )
+                .await,
+            Err(RepositoryError::AlreadyExists { .. })
+        ));
+        let raw_invitation = repository
+            .store()
+            .document_collection(CollectionName::CampaignInvitations)
+            .find_one(doc! { "_id": &invitation.id })
+            .await
+            .expect("invitation read must work")
+            .expect("invitation must exist");
         assert!(
-            matches!(result, Err(RepositoryError::NotFound { .. })),
-            "non-member character assignment should be rejected, got {result:?}"
+            !raw_invitation
+                .values()
+                .any(|value| value.as_str() == Some("player@example.com"))
         );
+        assert!(!raw_invitation.contains_key("invitee_email"));
+        assert!(!raw_invitation.contains_key("invite_token"));
+        let revoked = repository
+            .create_campaign_invitation(
+                &gm,
+                &campaign.campaign_id,
+                "revoked@example.com",
+                now + 3_600,
+            )
+            .await
+            .expect("second invitation must work");
+        repository
+            .revoke_campaign_invitation(&gm, &revoked.id)
+            .await
+            .expect("revocation must work");
+        assert!(
+            repository
+                .accept_campaign_invitation(&outsider, &revoked.id, "revoked@example.com", now,)
+                .await
+                .is_err()
+        );
+        repository
+            .accept_campaign_invitation(&player, &invitation.id, "player@example.com", now)
+            .await
+            .expect("invitation acceptance must work");
+        assert!(
+            repository
+                .accept_campaign_invitation(&outsider, &invitation.id, "player@example.com", now,)
+                .await
+                .is_err()
+        );
+
+        let character_id = format!("character:{}", Uuid::new_v4());
+        let character = PlayerCharacter::new(
+            character_id.clone(),
+            player.clone(),
+            "Mara".to_owned(),
+            choices(),
+        )
+        .expect("character fixture must validate");
+        repository
+            .create_player_character(&player, &character)
+            .await
+            .expect("library character must save");
+        let assigned = repository
+            .assign_character_to_campaign(&player, &campaign.campaign_id, &character_id, &character)
+            .await
+            .expect("assignment must work");
+        assert!(matches!(
+            repository
+                .assign_character_to_campaign(
+                    &player,
+                    &campaign.campaign_id,
+                    &character_id,
+                    &character,
+                )
+                .await,
+            Err(RepositoryError::AlreadyExists { .. })
+        ));
+        let raw_library = repository
+            .store()
+            .document_collection(CollectionName::PlayerCharacters)
+            .find_one(doc! { "_id": &character_id })
+            .await
+            .expect("library read must work")
+            .expect("library character must exist");
+        assert!(!raw_library.contains_key("level"));
+        let raw_instance = repository
+            .store()
+            .document_collection(CollectionName::CampaignCharacterInstances)
+            .find_one(doc! { "_id": &assigned.instance_id })
+            .await
+            .expect("instance read must work")
+            .expect("instance must exist");
+        assert!(raw_instance.get_document("progression").is_ok());
+        assert!(raw_instance.get_document("runtime").is_ok());
+        assert!(raw_instance.get_document("source_snapshot").is_ok());
+        assert!(
+            repository
+                .load_runtime_hero_character(
+                    &outsider,
+                    &campaign.campaign_id,
+                    &assigned.runtime_hero_character_id,
+                )
+                .await
+                .expect("foreign runtime read must be safe")
+                .is_none()
+        );
+
+        assert!(
+            database.starts_with("mdnd_test_memberships_"),
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
+            .await
+            .expect("test database must drop");
     }
 }

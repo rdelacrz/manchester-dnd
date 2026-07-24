@@ -8,7 +8,7 @@ use crate::components::layout::PublicLayout;
 
 #[component]
 pub fn LoginPage() -> impl IntoView {
-    let email = RwSignal::new(String::new());
+    let identifier = RwSignal::new(String::new());
     let password = RwSignal::new(String::new());
     let error_message = RwSignal::new(None::<String>);
     let pending = RwSignal::new(false);
@@ -24,10 +24,12 @@ pub fn LoginPage() -> impl IntoView {
         .map(|s| s.to_owned());
 
     let submit = move || {
-        let email_val = email.get();
+        let identifier_value = identifier.get();
         let password_val = password.get();
-        if email_val.trim().is_empty() || password_val.is_empty() {
-            error_message.set(Some("Enter your email and password.".to_owned()));
+        if identifier_value.trim().is_empty() || password_val.is_empty() {
+            error_message.set(Some(
+                "Enter your username or email and password.".to_owned(),
+            ));
             return;
         }
         pending.set(true);
@@ -35,7 +37,7 @@ pub fn LoginPage() -> impl IntoView {
         let next = redirect_to.clone();
         spawn_local(async move {
             match login(LoginInput {
-                email: email_val,
+                identifier: identifier_value,
                 password: password_val,
                 next,
             })
@@ -46,13 +48,13 @@ pub fn LoginPage() -> impl IntoView {
                     redirect_to,
                     csrf_token,
                 }) => {
-                    // Store CSRF token in localStorage for the session.
-                    // It is sent back in the x-csrf-token header for mutations.
+                    // Session storage avoids retaining the CSRF token after the
+                    // browser session closes.
                     if !csrf_token.is_empty() {
                         #[cfg(target_arch = "wasm32")]
                         {
                             if let Some(win) = web_sys::window() {
-                                if let Ok(Some(storage)) = win.local_storage() {
+                                if let Ok(Some(storage)) = win.session_storage() {
                                     let _ = storage.set_item("csrf", &csrf_token);
                                 }
                             }
@@ -86,7 +88,7 @@ pub fn LoginPage() -> impl IntoView {
                     <p class="eyebrow">"WELCOME BACK"</p>
                     <h1 id="login-heading">"Log in to your account"</h1>
                     <p class="auth-subtitle">
-                        "Enter your email and password to return to your campaigns."
+                        "Enter your username or email and password to return to your campaigns."
                     </p>
 
                     <form
@@ -98,17 +100,17 @@ pub fn LoginPage() -> impl IntoView {
                         novalidate
                     >
                         <div class="form-field">
-                            <label for="login-email">"Email"</label>
+                            <label for="login-identifier">"Username or email"</label>
                             <input
-                                id="login-email"
-                                type="email"
-                                autocomplete="email"
+                                id="login-identifier"
+                                type="text"
+                                autocomplete="username"
                                 required
-                                bind:value=email
-                                aria-describedby="login-email-hint"
+                                bind:value=identifier
+                                aria-describedby="login-identifier-hint"
                             />
-                            <p id="login-email-hint" class="form-hint">
-                                "Use the email address you signed up with."
+                            <p id="login-identifier-hint" class="form-hint">
+                                "Either identifier works."
                             </p>
                         </div>
 
@@ -177,10 +179,10 @@ mod tests {
             .to_html()
         });
         assert!(html.contains(r#"id="login-heading""#));
-        assert!(html.contains(r#"for="login-email""#));
-        assert!(html.contains(r#"autocomplete="email""#));
+        assert!(html.contains(r#"for="login-identifier""#));
+        assert!(html.contains(r#"autocomplete="username""#));
         assert!(html.contains(r#"autocomplete="current-password""#));
-        assert!(html.contains(r#"type="email""#));
+        assert!(html.contains(r#"type="text""#));
         assert!(html.contains(r#"type="password""#));
         assert!(html.contains(r#"type="submit""#));
         assert!(html.contains("/signup"));

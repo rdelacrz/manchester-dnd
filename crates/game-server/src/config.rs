@@ -16,12 +16,24 @@ use url::Url;
 
 use crate::error::ConfigError;
 
-const DEFAULT_DATABASE_URL: &str = "postgresql://127.0.0.1/manchester_arcana";
-const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
-const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS: u64 = 5_000;
-const DEFAULT_DATABASE_STATEMENT_TIMEOUT_MILLISECONDS: u64 = 30_000;
-const DEFAULT_DATABASE_LOCK_TIMEOUT_MILLISECONDS: u64 = 5_000;
-const DEFAULT_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS: u64 = 15_000;
+const DEFAULT_MONGODB_URI: &str = "mongodb://manchester_app:***@127.0.0.1:27017/?authSource=admin&replicaSet=rs0&directConnection=true";
+const DEFAULT_MONGODB_DATABASE: &str = "manchester_dnd";
+const DEFAULT_MONGODB_MAX_POOL_SIZE: u32 = 10;
+const DEFAULT_MONGODB_MIN_POOL_SIZE: u32 = 0;
+const DEFAULT_MONGODB_CONNECT_TIMEOUT_MILLISECONDS: u64 = 5_000;
+const DEFAULT_MONGODB_SERVER_SELECTION_TIMEOUT_MILLISECONDS: u64 = 5_000;
+const DEFAULT_MONGODB_OPERATION_TIMEOUT_MILLISECONDS: u64 = 30_000;
+const DEFAULT_MONGODB_TRANSACTION_TIMEOUT_MILLISECONDS: u64 = 10_000;
+const DEFAULT_MONGODB_TRANSACTION_MAX_RETRIES: u32 = 3;
+const DEFAULT_DRAGONFLY_URL: &str = "redis://default:dev-cache-password@127.0.0.1:6379/0";
+const DEFAULT_DRAGONFLY_POOL_SIZE: usize = 8;
+const DEFAULT_DRAGONFLY_TIMEOUT_MILLISECONDS: u64 = 2_000;
+const DEFAULT_AUTH_EMAIL_ENCRYPTION_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+const DEFAULT_AUTH_EMAIL_ENCRYPTION_KEY_ID: &str = "email-key:dev-only-v1";
+const DEFAULT_AUTH_EMAIL_LOOKUP_HMAC_KEY: &str =
+    "dev-only-email-lookup-hmac-key-change-before-hosting";
+const DEFAULT_AUTH_THROTTLE_HMAC_KEY: &str =
+    "dev-only-auth-throttle-hmac-key-change-before-hosting";
 const DEFAULT_CONTENT_PACK_ROOT: &str = "content/packs";
 const DEFAULT_CONTENT_THEME_PACK_ID: &str = RAINBOUND_THEME_PACK_ID;
 const DEFAULT_EVENT_PROMPTS_DIR: &str = "prompts/events/private";
@@ -165,30 +177,39 @@ pub struct GenerationConfigFingerprints {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DatabaseRuntimeConfig {
-    pub max_connections: u32,
-    pub acquire_timeout: Duration,
-    pub statement_timeout: Duration,
-    pub lock_timeout: Duration,
-    pub idle_transaction_timeout: Duration,
-    pub migrate_on_start: bool,
+pub enum MongoSchemaPolicy {
+    ApplyAndVerify,
+    VerifyOnly,
 }
 
-impl Default for DatabaseRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            max_connections: DEFAULT_DATABASE_MAX_CONNECTIONS,
-            acquire_timeout: Duration::from_millis(DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS),
-            statement_timeout: Duration::from_millis(
-                DEFAULT_DATABASE_STATEMENT_TIMEOUT_MILLISECONDS,
-            ),
-            lock_timeout: Duration::from_millis(DEFAULT_DATABASE_LOCK_TIMEOUT_MILLISECONDS),
-            idle_transaction_timeout: Duration::from_millis(
-                DEFAULT_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS,
-            ),
-            migrate_on_start: true,
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct MongoConfig {
+    pub uri: SecretString,
+    pub database: String,
+    pub max_pool_size: u32,
+    pub min_pool_size: u32,
+    pub connect_timeout: Duration,
+    pub server_selection_timeout: Duration,
+    /// Application-level timeout wrapped around MongoDB operations. The Rust
+    /// driver intentionally does not support the legacy `socketTimeoutMS`
+    /// option, so callers use this explicit deadline instead.
+    pub operation_timeout: Duration,
+    pub transaction_timeout: Duration,
+    pub transaction_max_retries: u32,
+    pub schema_policy: MongoSchemaPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistenceConfig {
+    pub mongodb: MongoConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DragonflyConfig {
+    pub enabled: bool,
+    pub url: SecretString,
+    pub pool_size: usize,
+    pub command_timeout: Duration,
 }
 
 /// Authentication, session, and throttling configuration.
@@ -205,6 +226,9 @@ pub struct AuthenticationConfig {
     pub throttle_block_after_attempts: u32,
     pub throttle_block_seconds: u64,
     pub throttle_hmac_key: SecretString,
+    pub email_encryption_key: SecretString,
+    pub email_encryption_key_id: String,
+    pub email_lookup_hmac_key: SecretString,
     pub cookie_secure: bool,
     pub canonical_origin: Option<String>,
     pub argon2_memory_kib: u32,
@@ -222,7 +246,10 @@ impl Default for AuthenticationConfig {
             throttle_window_seconds: 300,
             throttle_block_after_attempts: 5,
             throttle_block_seconds: 60,
-            throttle_hmac_key: SecretString::new("change-me-throttle-hmac-key"),
+            throttle_hmac_key: SecretString::new(DEFAULT_AUTH_THROTTLE_HMAC_KEY),
+            email_encryption_key: SecretString::new(DEFAULT_AUTH_EMAIL_ENCRYPTION_KEY),
+            email_encryption_key_id: DEFAULT_AUTH_EMAIL_ENCRYPTION_KEY_ID.to_owned(),
+            email_lookup_hmac_key: SecretString::new(DEFAULT_AUTH_EMAIL_LOOKUP_HMAC_KEY),
             cookie_secure: false,
             canonical_origin: None,
             argon2_memory_kib: 19_456,
@@ -457,8 +484,8 @@ impl LlmProfile {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub access_mode: AccessMode,
-    pub database_url: SecretString,
-    pub database: DatabaseRuntimeConfig,
+    pub persistence: PersistenceConfig,
+    pub dragonfly: DragonflyConfig,
     pub content_packs: ContentPackConfig,
     /// Deployment-wide private-inspiration gate. Campaign policy is an
     /// independent, narrower gate and may never override this value.
@@ -519,83 +546,76 @@ impl AppConfig {
                 name: "APP_ACCESS_MODE",
                 reason,
             })?;
-        let database_url = get("DATABASE_URL")
+        let mongodb_uri = get("MONGODB_URI")
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_DATABASE_URL.to_owned());
-        if !matches!(
-            Url::parse(&database_url).ok().map(|url| url.scheme().to_owned()),
-            Some(scheme) if matches!(scheme.as_str(), "postgres" | "postgresql")
-        ) {
+            .unwrap_or_else(|| DEFAULT_MONGODB_URI.to_owned());
+        validate_mongodb_uri(&mongodb_uri, access_mode)?;
+        let mongodb_database = get("MONGODB_DATABASE")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MONGODB_DATABASE.to_owned());
+        validate_mongodb_database_name(&mongodb_database)?;
+        let mongodb_max_pool_size = parse_generation_limit(
+            &mut get,
+            "MONGODB_MAX_POOL_SIZE",
+            DEFAULT_MONGODB_MAX_POOL_SIZE,
+        )?;
+        let mongodb_min_pool_size = parse_generation_limit(
+            &mut get,
+            "MONGODB_MIN_POOL_SIZE",
+            DEFAULT_MONGODB_MIN_POOL_SIZE,
+        )?;
+        if !(1..=100).contains(&mongodb_max_pool_size) {
             return Err(ConfigError::InvalidValue {
-                name: "DATABASE_URL",
-                reason: "must be a valid postgres:// or postgresql:// URL".to_owned(),
+                name: "MONGODB_MAX_POOL_SIZE",
+                reason: "must be between 1 and 100".to_owned(),
             });
         }
-        let database = DatabaseRuntimeConfig {
-            max_connections: parse_generation_limit(
-                &mut get,
-                "DATABASE_MAX_CONNECTIONS",
-                DEFAULT_DATABASE_MAX_CONNECTIONS,
-            )?,
-            acquire_timeout: Duration::from_millis(parse_generation_limit(
-                &mut get,
-                "DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS",
-                DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS,
-            )?),
-            statement_timeout: Duration::from_millis(parse_generation_limit(
-                &mut get,
-                "DATABASE_STATEMENT_TIMEOUT_MILLISECONDS",
-                DEFAULT_DATABASE_STATEMENT_TIMEOUT_MILLISECONDS,
-            )?),
-            lock_timeout: Duration::from_millis(parse_generation_limit(
-                &mut get,
-                "DATABASE_LOCK_TIMEOUT_MILLISECONDS",
-                DEFAULT_DATABASE_LOCK_TIMEOUT_MILLISECONDS,
-            )?),
-            idle_transaction_timeout: Duration::from_millis(parse_generation_limit(
-                &mut get,
-                "DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS",
-                DEFAULT_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS,
-            )?),
-            migrate_on_start: get("DATABASE_MIGRATE_ON_START")
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| {
-                    value
-                        .parse::<bool>()
-                        .map_err(|_| ConfigError::InvalidValue {
-                            name: "DATABASE_MIGRATE_ON_START",
-                            reason: "must be true or false".to_owned(),
-                        })
-                })
-                .transpose()?
-                .unwrap_or(true),
-        };
-        if !(1..=50).contains(&database.max_connections) {
+        if mongodb_min_pool_size > mongodb_max_pool_size {
             return Err(ConfigError::InvalidValue {
-                name: "DATABASE_MAX_CONNECTIONS",
-                reason: "must be between 1 and 50".to_owned(),
+                name: "MONGODB_MIN_POOL_SIZE",
+                reason: "must not exceed MONGODB_MAX_POOL_SIZE".to_owned(),
             });
         }
+        let mongodb_connect_timeout = Duration::from_millis(parse_generation_limit(
+            &mut get,
+            "MONGODB_CONNECT_TIMEOUT_MS",
+            DEFAULT_MONGODB_CONNECT_TIMEOUT_MILLISECONDS,
+        )?);
+        let mongodb_server_selection_timeout = Duration::from_millis(parse_generation_limit(
+            &mut get,
+            "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
+            DEFAULT_MONGODB_SERVER_SELECTION_TIMEOUT_MILLISECONDS,
+        )?);
+        let mongodb_operation_timeout = Duration::from_millis(parse_generation_limit(
+            &mut get,
+            "MONGODB_OPERATION_TIMEOUT_MS",
+            DEFAULT_MONGODB_OPERATION_TIMEOUT_MILLISECONDS,
+        )?);
+        let mongodb_transaction_timeout = Duration::from_millis(parse_generation_limit(
+            &mut get,
+            "MONGODB_TRANSACTION_TIMEOUT_MS",
+            DEFAULT_MONGODB_TRANSACTION_TIMEOUT_MILLISECONDS,
+        )?);
         for (name, value, maximum) in [
             (
-                "DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS",
-                database.acquire_timeout,
+                "MONGODB_CONNECT_TIMEOUT_MS",
+                mongodb_connect_timeout,
                 Duration::from_secs(60),
             ),
             (
-                "DATABASE_STATEMENT_TIMEOUT_MILLISECONDS",
-                database.statement_timeout,
-                Duration::from_secs(300),
-            ),
-            (
-                "DATABASE_LOCK_TIMEOUT_MILLISECONDS",
-                database.lock_timeout,
+                "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
+                mongodb_server_selection_timeout,
                 Duration::from_secs(60),
             ),
             (
-                "DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS",
-                database.idle_transaction_timeout,
+                "MONGODB_OPERATION_TIMEOUT_MS",
+                mongodb_operation_timeout,
                 Duration::from_secs(300),
+            ),
+            (
+                "MONGODB_TRANSACTION_TIMEOUT_MS",
+                mongodb_transaction_timeout,
+                Duration::from_secs(60),
             ),
         ] {
             if value.is_zero() || value > maximum {
@@ -605,6 +625,60 @@ impl AppConfig {
                 });
             }
         }
+        let mongodb_transaction_max_retries = parse_generation_limit(
+            &mut get,
+            "MONGODB_TRANSACTION_MAX_RETRIES",
+            DEFAULT_MONGODB_TRANSACTION_MAX_RETRIES,
+        )?;
+        if mongodb_transaction_max_retries > 5 {
+            return Err(ConfigError::InvalidValue {
+                name: "MONGODB_TRANSACTION_MAX_RETRIES",
+                reason: "must be between 0 and 5".to_owned(),
+            });
+        }
+        let schema_apply_on_start = parse_optional_bool(
+            get("MONGO_SCHEMA_APPLY_ON_START"),
+            "MONGO_SCHEMA_APPLY_ON_START",
+        )?
+        .unwrap_or(access_mode == AccessMode::LocalSingleUser);
+        if access_mode == AccessMode::Hosted && schema_apply_on_start {
+            return Err(ConfigError::InvalidValue {
+                name: "MONGO_SCHEMA_APPLY_ON_START",
+                reason: "hosted mode is verify-only; apply schema with mongo-admin".to_owned(),
+            });
+        }
+        let schema_policy = if schema_apply_on_start {
+            MongoSchemaPolicy::ApplyAndVerify
+        } else {
+            MongoSchemaPolicy::VerifyOnly
+        };
+
+        let dragonfly_enabled =
+            parse_optional_bool(get("DRAGONFLY_ENABLED"), "DRAGONFLY_ENABLED")?.unwrap_or(false);
+        let dragonfly_url = get("DRAGONFLY_URL")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_DRAGONFLY_URL.to_owned());
+        validate_dragonfly_url(&dragonfly_url, dragonfly_enabled)?;
+        let dragonfly_pool_size =
+            parse_generation_limit(&mut get, "DRAGONFLY_POOL_SIZE", DEFAULT_DRAGONFLY_POOL_SIZE)?;
+        if !(1..=64).contains(&dragonfly_pool_size) {
+            return Err(ConfigError::InvalidValue {
+                name: "DRAGONFLY_POOL_SIZE",
+                reason: "must be between 1 and 64".to_owned(),
+            });
+        }
+        let dragonfly_timeout = Duration::from_millis(parse_generation_limit(
+            &mut get,
+            "DRAGONFLY_TIMEOUT_MS",
+            DEFAULT_DRAGONFLY_TIMEOUT_MILLISECONDS,
+        )?);
+        if dragonfly_timeout.is_zero() || dragonfly_timeout > Duration::from_secs(30) {
+            return Err(ConfigError::InvalidValue {
+                name: "DRAGONFLY_TIMEOUT_MS",
+                reason: "must be between 1 and 30000 milliseconds".to_owned(),
+            });
+        }
+        let authentication = authentication_from_lookup(access_mode, &mut get)?;
 
         let event_prompts_dir = get("EVENT_PROMPT_DIR")
             .filter(|value| !value.trim().is_empty())
@@ -764,8 +838,26 @@ impl AppConfig {
 
         Ok(Self {
             access_mode,
-            database_url: SecretString::new(database_url),
-            database,
+            persistence: PersistenceConfig {
+                mongodb: MongoConfig {
+                    uri: SecretString::new(mongodb_uri),
+                    database: mongodb_database,
+                    max_pool_size: mongodb_max_pool_size,
+                    min_pool_size: mongodb_min_pool_size,
+                    connect_timeout: mongodb_connect_timeout,
+                    server_selection_timeout: mongodb_server_selection_timeout,
+                    operation_timeout: mongodb_operation_timeout,
+                    transaction_timeout: mongodb_transaction_timeout,
+                    transaction_max_retries: mongodb_transaction_max_retries,
+                    schema_policy,
+                },
+            },
+            dragonfly: DragonflyConfig {
+                enabled: dragonfly_enabled,
+                url: SecretString::new(dragonfly_url),
+                pool_size: dragonfly_pool_size,
+                command_timeout: dragonfly_timeout,
+            },
             content_packs: ContentPackConfig {
                 root: content_pack_root,
                 default_theme_pack_id,
@@ -777,7 +869,7 @@ impl AppConfig {
             text_llm,
             image_llm,
             generation_governance,
-            authentication: AuthenticationConfig::default(),
+            authentication,
         })
     }
 
@@ -815,6 +907,134 @@ impl AppConfig {
             image: self.image_llm.non_secret_fingerprint("image"),
         }
     }
+}
+
+pub fn validate_mongodb_database_name(name: &str) -> Result<(), ConfigError> {
+    let valid = (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "admin" | "config" | "local"
+        );
+    if !valid {
+        return Err(ConfigError::InvalidValue {
+            name: "MONGODB_DATABASE",
+            reason: "must be 1-63 ASCII letters, digits, underscores, or hyphens, start with a letter or digit, and not name a MongoDB system database".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_mongodb_uri(raw: &str, access_mode: AccessMode) -> Result<(), ConfigError> {
+    let (scheme, remainder) = if let Some(remainder) = raw.strip_prefix("mongodb://") {
+        ("mongodb", remainder)
+    } else if let Some(remainder) = raw.strip_prefix("mongodb+srv://") {
+        ("mongodb+srv", remainder)
+    } else {
+        return Err(ConfigError::InvalidValue {
+            name: "MONGODB_URI",
+            reason: "must use mongodb:// or mongodb+srv://".to_owned(),
+        });
+    };
+    if remainder.is_empty()
+        || raw.trim() != raw
+        || raw.chars().any(char::is_control)
+        || raw.contains('#')
+    {
+        return Err(ConfigError::InvalidValue {
+            name: "MONGODB_URI",
+            reason: "must be a normalized MongoDB connection URL without fragments".to_owned(),
+        });
+    }
+
+    let authority = remainder
+        .split(['/', '?'])
+        .next()
+        .filter(|authority| !authority.is_empty())
+        .ok_or_else(|| ConfigError::InvalidValue {
+            name: "MONGODB_URI",
+            reason: "must include at least one host".to_owned(),
+        })?;
+    let (credentials, hosts) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(credentials, hosts)| {
+            (Some(credentials), hosts)
+        });
+    if hosts.split(',').any(|host| host.trim().is_empty()) {
+        return Err(ConfigError::InvalidValue {
+            name: "MONGODB_URI",
+            reason: "must include only non-empty hosts".to_owned(),
+        });
+    }
+
+    let query_value = |wanted: &str| {
+        raw.split_once('?').and_then(|(_, query)| {
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                key.eq_ignore_ascii_case(wanted).then_some(value)
+            })
+        })
+    };
+    if scheme == "mongodb" && query_value("replicaSet").is_none() {
+        return Err(ConfigError::InvalidValue {
+            name: "MONGODB_URI",
+            reason: "mongodb:// URLs must select a replica set".to_owned(),
+        });
+    }
+
+    if access_mode == AccessMode::Hosted {
+        let has_password = credentials
+            .and_then(|credentials| credentials.split_once(':'))
+            .is_some_and(|(username, password)| !username.is_empty() && !password.is_empty());
+        if !has_password {
+            return Err(ConfigError::InvalidValue {
+                name: "MONGODB_URI",
+                reason: "hosted mode requires authenticated MongoDB credentials".to_owned(),
+            });
+        }
+        let tls_enabled = scheme == "mongodb+srv"
+            || query_value("tls").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            || query_value("ssl").is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let insecure_tls = ["tlsInsecure", "tlsAllowInvalidCertificates"]
+            .into_iter()
+            .any(|key| query_value(key).is_some_and(|value| value.eq_ignore_ascii_case("true")));
+        if !tls_enabled || insecure_tls {
+            return Err(ConfigError::InvalidValue {
+                name: "MONGODB_URI",
+                reason: "hosted mode requires certificate-validated TLS".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_dragonfly_url(raw: &str, enabled: bool) -> Result<(), ConfigError> {
+    let url = Url::parse(raw).map_err(|_| ConfigError::InvalidValue {
+        name: "DRAGONFLY_URL",
+        reason: "must be a valid redis:// or rediss:// URL".to_owned(),
+    })?;
+    if !matches!(url.scheme(), "redis" | "rediss")
+        || url.host().is_none()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidValue {
+            name: "DRAGONFLY_URL",
+            reason: "must be a valid redis:// or rediss:// URL without a fragment".to_owned(),
+        });
+    }
+    if enabled && url.password().is_none_or(str::is_empty) {
+        return Err(ConfigError::InvalidValue {
+            name: "DRAGONFLY_URL",
+            reason: "enabled DragonflyDB requires password authentication".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_content_pack_root(raw: &str) -> Result<PathBuf, ConfigError> {
@@ -931,6 +1151,235 @@ where
         .transpose()
 }
 
+fn parse_optional_bool(
+    value: Option<String>,
+    name: &'static str,
+) -> Result<Option<bool>, ConfigError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<bool>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    name,
+                    reason: "must be true or false".to_owned(),
+                })
+        })
+        .transpose()
+}
+
+fn authentication_from_lookup(
+    access_mode: AccessMode,
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<AuthenticationConfig, ConfigError> {
+    let defaults = AuthenticationConfig::default();
+    let session_idle_lifetime = Duration::from_secs(parse_generation_limit(
+        get,
+        "AUTH_SESSION_IDLE_LIFETIME_SECONDS",
+        defaults.session_idle_lifetime.as_secs(),
+    )?);
+    let session_absolute_lifetime = Duration::from_secs(parse_generation_limit(
+        get,
+        "AUTH_SESSION_ABSOLUTE_LIFETIME_SECONDS",
+        defaults.session_absolute_lifetime.as_secs(),
+    )?);
+    if session_idle_lifetime.is_zero()
+        || session_absolute_lifetime.is_zero()
+        || session_idle_lifetime > session_absolute_lifetime
+        || session_absolute_lifetime > Duration::from_secs(60 * 60 * 24 * 365)
+    {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_SESSION_*_LIFETIME_SECONDS",
+            reason: "idle and absolute lifetimes must be positive, idle must not exceed absolute, and absolute must not exceed one year".to_owned(),
+        });
+    }
+    let max_active_sessions = parse_generation_limit(
+        get,
+        "AUTH_MAX_ACTIVE_SESSIONS",
+        defaults.max_active_sessions,
+    )?;
+    if !(1..=100).contains(&max_active_sessions) {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_MAX_ACTIVE_SESSIONS",
+            reason: "must be between 1 and 100".to_owned(),
+        });
+    }
+    let max_hash_concurrency = parse_generation_limit(
+        get,
+        "AUTH_MAX_HASH_CONCURRENCY",
+        defaults.max_hash_concurrency,
+    )?;
+    if !(1..=64).contains(&max_hash_concurrency) {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_MAX_HASH_CONCURRENCY",
+            reason: "must be between 1 and 64".to_owned(),
+        });
+    }
+    let throttle_window_seconds = parse_generation_limit(
+        get,
+        "AUTH_THROTTLE_WINDOW_SECONDS",
+        defaults.throttle_window_seconds,
+    )?;
+    let throttle_block_after_attempts = parse_generation_limit(
+        get,
+        "AUTH_THROTTLE_BLOCK_AFTER_ATTEMPTS",
+        defaults.throttle_block_after_attempts,
+    )?;
+    let throttle_block_seconds = parse_generation_limit(
+        get,
+        "AUTH_THROTTLE_BLOCK_SECONDS",
+        defaults.throttle_block_seconds,
+    )?;
+    if throttle_window_seconds == 0
+        || throttle_window_seconds > 86_400
+        || throttle_block_after_attempts == 0
+        || throttle_block_after_attempts > 10_000
+        || throttle_block_seconds == 0
+        || throttle_block_seconds > 86_400
+    {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_THROTTLE_*",
+            reason: "throttle window, threshold, and block duration are outside supported bounds"
+                .to_owned(),
+        });
+    }
+
+    let required_secret = |name: &'static str,
+                           local_default: &'static str,
+                           get: &mut dyn FnMut(&str) -> Option<String>|
+     -> Result<String, ConfigError> {
+        match get(name).filter(|value| !value.is_empty()) {
+            Some(value) => Ok(value),
+            None if access_mode == AccessMode::LocalSingleUser => Ok(local_default.to_owned()),
+            None => Err(ConfigError::InvalidValue {
+                name,
+                reason: "must be explicitly set in hosted mode".to_owned(),
+            }),
+        }
+    };
+    let throttle_hmac_key = required_secret(
+        "AUTH_THROTTLE_HMAC_KEY",
+        DEFAULT_AUTH_THROTTLE_HMAC_KEY,
+        get,
+    )?;
+    if throttle_hmac_key.len() < 32 {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_THROTTLE_HMAC_KEY",
+            reason: "must contain at least 32 bytes".to_owned(),
+        });
+    }
+    let email_encryption_key = required_secret(
+        "AUTH_EMAIL_ENCRYPTION_KEY_B64",
+        DEFAULT_AUTH_EMAIL_ENCRYPTION_KEY,
+        get,
+    )?;
+    crate::persistence::email_crypto::validate_encryption_key_b64(&email_encryption_key).map_err(
+        |_| ConfigError::InvalidValue {
+            name: "AUTH_EMAIL_ENCRYPTION_KEY_B64",
+            reason: "must be standard base64 encoding of exactly 32 bytes".to_owned(),
+        },
+    )?;
+    let email_lookup_hmac_key = required_secret(
+        "AUTH_EMAIL_LOOKUP_HMAC_KEY",
+        DEFAULT_AUTH_EMAIL_LOOKUP_HMAC_KEY,
+        get,
+    )?;
+    crate::persistence::email_crypto::validate_lookup_key(email_lookup_hmac_key.as_bytes())
+        .map_err(|_| ConfigError::InvalidValue {
+            name: "AUTH_EMAIL_LOOKUP_HMAC_KEY",
+            reason: "must contain at least 32 bytes".to_owned(),
+        })?;
+    let email_encryption_key_id =
+        match get("AUTH_EMAIL_ENCRYPTION_KEY_ID").filter(|value| !value.is_empty()) {
+            Some(value) => value,
+            None if access_mode == AccessMode::LocalSingleUser => {
+                DEFAULT_AUTH_EMAIL_ENCRYPTION_KEY_ID.to_owned()
+            }
+            None => {
+                return Err(ConfigError::InvalidValue {
+                    name: "AUTH_EMAIL_ENCRYPTION_KEY_ID",
+                    reason: "must be explicitly set in hosted mode".to_owned(),
+                });
+            }
+        };
+    let key_id_valid = (1..=128).contains(&email_encryption_key_id.len())
+        && email_encryption_key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'));
+    if !key_id_valid {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_EMAIL_ENCRYPTION_KEY_ID",
+            reason: "must be a bounded opaque key identifier".to_owned(),
+        });
+    }
+
+    let cookie_secure =
+        parse_optional_bool(get("AUTH_COOKIE_SECURE"), "AUTH_COOKIE_SECURE")?.unwrap_or(false);
+    let canonical_origin = get("AUTH_CANONICAL_ORIGIN").filter(|value| !value.trim().is_empty());
+    if let Some(origin) = canonical_origin.as_deref() {
+        let parsed = Url::parse(origin).map_err(|_| ConfigError::InvalidValue {
+            name: "AUTH_CANONICAL_ORIGIN",
+            reason: "must be an absolute normalized origin URL".to_owned(),
+        })?;
+        if parsed.scheme() != "https"
+            || parsed.host().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "AUTH_CANONICAL_ORIGIN",
+                reason: "must be an HTTPS origin without credentials, path, query, or fragment"
+                    .to_owned(),
+            });
+        }
+    }
+    if access_mode == AccessMode::Hosted && (!cookie_secure || canonical_origin.is_none()) {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_COOKIE_SECURE/AUTH_CANONICAL_ORIGIN",
+            reason: "hosted mode requires secure cookies and an explicit canonical HTTPS origin"
+                .to_owned(),
+        });
+    }
+
+    let argon2_memory_kib =
+        parse_generation_limit(get, "AUTH_ARGON2_MEMORY_KIB", defaults.argon2_memory_kib)?;
+    let argon2_iterations =
+        parse_generation_limit(get, "AUTH_ARGON2_ITERATIONS", defaults.argon2_iterations)?;
+    let argon2_parallelism =
+        parse_generation_limit(get, "AUTH_ARGON2_PARALLELISM", defaults.argon2_parallelism)?;
+    if !(8_192..=1_048_576).contains(&argon2_memory_kib)
+        || !(1..=20).contains(&argon2_iterations)
+        || !(1..=32).contains(&argon2_parallelism)
+    {
+        return Err(ConfigError::InvalidValue {
+            name: "AUTH_ARGON2_*",
+            reason: "Argon2id parameters are outside supported bounds".to_owned(),
+        });
+    }
+
+    Ok(AuthenticationConfig {
+        session_idle_lifetime,
+        session_absolute_lifetime,
+        max_active_sessions,
+        max_hash_concurrency,
+        throttle_window_seconds,
+        throttle_block_after_attempts,
+        throttle_block_seconds,
+        throttle_hmac_key: SecretString::new(throttle_hmac_key),
+        email_encryption_key: SecretString::new(email_encryption_key),
+        email_encryption_key_id,
+        email_lookup_hmac_key: SecretString::new(email_lookup_hmac_key),
+        cookie_secure,
+        canonical_origin,
+        argon2_memory_kib,
+        argon2_iterations,
+        argon2_parallelism,
+    })
+}
+
 fn parse_generation_limit<T>(
     get: &mut impl FnMut(&str) -> Option<String>,
     name: &'static str,
@@ -996,41 +1445,163 @@ mod tests {
     }
 
     #[test]
-    fn database_pool_and_timeout_controls_are_bounded_and_field_specific() {
+    fn mongo_pool_timeout_schema_and_database_controls_are_bounded() {
         let configured = HashMap::from([
-            ("DATABASE_MIGRATE_ON_START", "false"),
-            ("DATABASE_MAX_CONNECTIONS", "7"),
-            ("DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "4000"),
-            ("DATABASE_STATEMENT_TIMEOUT_MILLISECONDS", "25000"),
-            ("DATABASE_LOCK_TIMEOUT_MILLISECONDS", "3000"),
-            ("DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS", "12000"),
+            ("MONGODB_DATABASE", "contract_test-01"),
+            ("MONGODB_MAX_POOL_SIZE", "16"),
+            ("MONGODB_MIN_POOL_SIZE", "2"),
+            ("MONGODB_CONNECT_TIMEOUT_MS", "4000"),
+            ("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "4500"),
+            ("MONGODB_OPERATION_TIMEOUT_MS", "25000"),
+            ("MONGODB_TRANSACTION_TIMEOUT_MS", "9000"),
+            ("MONGODB_TRANSACTION_MAX_RETRIES", "2"),
+            ("MONGO_SCHEMA_APPLY_ON_START", "false"),
         ]);
         let config = AppConfig::from_lookup(|name| configured.get(name).map(ToString::to_string))
-            .expect("bounded database controls should parse");
-        assert!(!config.database.migrate_on_start);
-        assert_eq!(config.database.max_connections, 7);
-        assert_eq!(config.database.acquire_timeout, Duration::from_secs(4));
-        assert_eq!(config.database.statement_timeout, Duration::from_secs(25));
-        assert_eq!(config.database.lock_timeout, Duration::from_secs(3));
-        assert_eq!(
-            config.database.idle_transaction_timeout,
-            Duration::from_secs(12)
-        );
+            .expect("bounded MongoDB controls should parse");
+        let mongo = &config.persistence.mongodb;
+
+        assert_eq!(mongo.database, "contract_test-01");
+        assert_eq!(mongo.max_pool_size, 16);
+        assert_eq!(mongo.min_pool_size, 2);
+        assert_eq!(mongo.connect_timeout, Duration::from_secs(4));
+        assert_eq!(mongo.server_selection_timeout, Duration::from_millis(4_500));
+        assert_eq!(mongo.operation_timeout, Duration::from_secs(25));
+        assert_eq!(mongo.transaction_timeout, Duration::from_secs(9));
+        assert_eq!(mongo.transaction_max_retries, 2);
+        assert_eq!(mongo.schema_policy, MongoSchemaPolicy::VerifyOnly);
 
         for (name, value) in [
-            ("DATABASE_MAX_CONNECTIONS", "0"),
-            ("DATABASE_MAX_CONNECTIONS", "51"),
-            ("DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "0"),
-            ("DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "60001"),
-            ("DATABASE_STATEMENT_TIMEOUT_MILLISECONDS", "300001"),
-            ("DATABASE_LOCK_TIMEOUT_MILLISECONDS", "60001"),
-            ("DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS", "300001"),
-            ("DATABASE_MIGRATE_ON_START", "yes"),
+            ("MONGODB_MAX_POOL_SIZE", "0"),
+            ("MONGODB_MAX_POOL_SIZE", "101"),
+            ("MONGODB_MIN_POOL_SIZE", "11"),
+            ("MONGODB_CONNECT_TIMEOUT_MS", "0"),
+            ("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "60001"),
+            ("MONGODB_OPERATION_TIMEOUT_MS", "300001"),
+            ("MONGODB_TRANSACTION_TIMEOUT_MS", "60001"),
+            ("MONGODB_TRANSACTION_MAX_RETRIES", "6"),
+            ("MONGO_SCHEMA_APPLY_ON_START", "yes"),
         ] {
             let values = HashMap::from([(name, value)]);
             let error = AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
-                .expect_err("out-of-range database control must fail closed");
+                .expect_err("out-of-range MongoDB control must fail closed");
             assert!(error.to_string().contains(name), "{name} must be named");
+        }
+    }
+
+    #[test]
+    fn mongo_database_name_uses_a_narrow_non_system_allowlist() {
+        for valid in ["manchester_dnd", "test-01", "A1"] {
+            assert!(validate_mongodb_database_name(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "_hidden",
+            "has.dot",
+            "has space",
+            "admin",
+            "CONFIG",
+            "local",
+            &"a".repeat(64),
+        ] {
+            assert!(
+                validate_mongodb_database_name(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_mongo_requires_auth_replica_set_and_valid_tls() {
+        for invalid in [
+            "mongodb://db.example.test:27017/?replicaSet=rs0&tls=true",
+            "mongodb://user:pass@db.example.test:27017/?replicaSet=rs0",
+            "mongodb://user:pass@db.example.test:27017/?tls=true",
+            "mongodb://user:pass@db.example.test:27017/?replicaSet=rs0&tls=true&tlsInsecure=true",
+        ] {
+            assert!(
+                validate_mongodb_uri(invalid, AccessMode::Hosted).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            validate_mongodb_uri(
+                "mongodb://user:pass@db.example.test:27017/?replicaSet=rs0&tls=true",
+                AccessMode::Hosted
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mongodb_uri(
+                "mongodb+srv://user:pass@cluster.example.test/?retryWrites=true",
+                AccessMode::Hosted
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn malformed_mongo_urls_and_hosted_missing_configuration_fail_closed() {
+        for invalid in [
+            "https://db.example.test/game",
+            "mongodb:///?replicaSet=rs0",
+            "mongodb://user:pass@db.example.test/",
+            "mongodb://user:pass@db.example.test/?replicaSet=rs0#fragment",
+        ] {
+            let values = HashMap::from([("MONGODB_URI", invalid)]);
+            assert!(
+                AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string)).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let hosted = HashMap::from([("APP_ACCESS_MODE", "hosted")]);
+        assert!(
+            AppConfig::from_lookup(|name| hosted.get(name).map(ToString::to_string)).is_err(),
+            "hosted mode must not inherit the plaintext local MongoDB default"
+        );
+    }
+
+    #[test]
+    fn dragonfly_is_disabled_by_default_and_enabled_urls_require_auth() {
+        let defaults = AppConfig::from_lookup(|_| None).unwrap();
+        assert!(!defaults.dragonfly.enabled);
+        assert_eq!(defaults.dragonfly.pool_size, 8);
+        assert_eq!(defaults.dragonfly.command_timeout, Duration::from_secs(2));
+
+        let unauthenticated = HashMap::from([
+            ("DRAGONFLY_ENABLED", "true"),
+            ("DRAGONFLY_URL", "redis://127.0.0.1:6379/0"),
+        ]);
+        assert!(
+            AppConfig::from_lookup(|name| unauthenticated.get(name).map(ToString::to_string))
+                .is_err()
+        );
+        let authenticated = HashMap::from([
+            ("DRAGONFLY_ENABLED", "true"),
+            ("DRAGONFLY_URL", "redis://:cache-secret@127.0.0.1:6379/0"),
+            ("DRAGONFLY_POOL_SIZE", "4"),
+            ("DRAGONFLY_TIMEOUT_MS", "750"),
+        ]);
+        let config =
+            AppConfig::from_lookup(|name| authenticated.get(name).map(ToString::to_string))
+                .unwrap();
+        assert!(config.dragonfly.enabled);
+        assert_eq!(config.dragonfly.pool_size, 4);
+        assert_eq!(config.dragonfly.command_timeout, Duration::from_millis(750));
+        assert!(!format!("{config:?}").contains("cache-secret"));
+
+        for (name, value) in [
+            ("DRAGONFLY_POOL_SIZE", "0"),
+            ("DRAGONFLY_POOL_SIZE", "65"),
+            ("DRAGONFLY_TIMEOUT_MS", "0"),
+            ("DRAGONFLY_TIMEOUT_MS", "30001"),
+            ("DRAGONFLY_ENABLED", "yes"),
+        ] {
+            let values = HashMap::from([(name, value)]);
+            let error = AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+                .expect_err("out-of-range Dragonfly control must fail closed");
+            assert!(error.to_string().contains(name));
         }
     }
 
@@ -1101,7 +1672,28 @@ mod tests {
 
     #[test]
     fn hosted_mode_fails_closed_until_authentication_exists() {
-        let values = HashMap::from([("APP_ACCESS_MODE", "hosted")]);
+        let values = HashMap::from([
+            ("APP_ACCESS_MODE", "hosted"),
+            (
+                "MONGODB_URI",
+                "mongodb://user:pass@db.example.test:27017/?replicaSet=rs0&tls=true",
+            ),
+            ("AUTH_COOKIE_SECURE", "true"),
+            ("AUTH_CANONICAL_ORIGIN", "https://game.example.test"),
+            (
+                "AUTH_THROTTLE_HMAC_KEY",
+                "hosted-throttle-hmac-key-with-at-least-32-bytes",
+            ),
+            (
+                "AUTH_EMAIL_ENCRYPTION_KEY_B64",
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            ),
+            ("AUTH_EMAIL_ENCRYPTION_KEY_ID", "email-key:hosted-v1"),
+            (
+                "AUTH_EMAIL_LOOKUP_HMAC_KEY",
+                "hosted-email-lookup-key-with-at-least-32-bytes",
+            ),
+        ]);
         let config = AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string))
             .expect("hosted mode should parse");
 
@@ -1119,11 +1711,107 @@ mod tests {
     }
 
     #[test]
+    fn authentication_email_keys_are_separate_bounded_and_redacted() {
+        let values = HashMap::from([
+            (
+                "AUTH_EMAIL_ENCRYPTION_KEY_B64",
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            ),
+            ("AUTH_EMAIL_ENCRYPTION_KEY_ID", "email-key:test-v1"),
+            (
+                "AUTH_EMAIL_LOOKUP_HMAC_KEY",
+                "email-lookup-super-secret-at-least-32-bytes",
+            ),
+            (
+                "AUTH_THROTTLE_HMAC_KEY",
+                "throttle-super-secret-at-least-32-bytes",
+            ),
+        ]);
+        let config = AppConfig::from_lookup(|name| values.get(name).map(ToString::to_string))
+            .expect("valid independent auth keys should parse");
+        let debug = format!("{config:?}");
+        assert_eq!(
+            config.authentication.email_encryption_key_id,
+            "email-key:test-v1"
+        );
+        assert!(!debug.contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="));
+        assert!(!debug.contains("email-lookup-super-secret"));
+        assert!(!debug.contains("throttle-super-secret"));
+
+        for (name, value) in [
+            ("AUTH_EMAIL_ENCRYPTION_KEY_B64", "not-base64"),
+            ("AUTH_EMAIL_ENCRYPTION_KEY_B64", "YWJj"),
+            ("AUTH_EMAIL_LOOKUP_HMAC_KEY", "too-short"),
+            ("AUTH_THROTTLE_HMAC_KEY", "too-short"),
+            ("AUTH_EMAIL_ENCRYPTION_KEY_ID", "key id with spaces"),
+        ] {
+            let invalid = HashMap::from([(name, value)]);
+            let error = AppConfig::from_lookup(|key| invalid.get(key).map(ToString::to_string))
+                .expect_err("invalid auth key material must fail closed");
+            assert!(error.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn hosted_authentication_requires_explicit_crypto_and_cookie_values() {
+        let values = HashMap::from([
+            ("APP_ACCESS_MODE", "hosted"),
+            (
+                "MONGODB_URI",
+                "mongodb://user:pass@db.example.test:27017/?replicaSet=rs0&tls=true",
+            ),
+            ("AUTH_COOKIE_SECURE", "true"),
+            ("AUTH_CANONICAL_ORIGIN", "https://game.example.test"),
+            (
+                "AUTH_THROTTLE_HMAC_KEY",
+                "hosted-throttle-hmac-key-with-at-least-32-bytes",
+            ),
+            (
+                "AUTH_EMAIL_ENCRYPTION_KEY_B64",
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            ),
+            ("AUTH_EMAIL_ENCRYPTION_KEY_ID", "email-key:hosted-v1"),
+            (
+                "AUTH_EMAIL_LOOKUP_HMAC_KEY",
+                "hosted-email-lookup-key-with-at-least-32-bytes",
+            ),
+        ]);
+        for missing in [
+            "AUTH_COOKIE_SECURE",
+            "AUTH_CANONICAL_ORIGIN",
+            "AUTH_THROTTLE_HMAC_KEY",
+            "AUTH_EMAIL_ENCRYPTION_KEY_B64",
+            "AUTH_EMAIL_ENCRYPTION_KEY_ID",
+            "AUTH_EMAIL_LOOKUP_HMAC_KEY",
+        ] {
+            let error = AppConfig::from_lookup(|name| {
+                if name == missing {
+                    None
+                } else {
+                    values.get(name).map(ToString::to_string)
+                }
+            })
+            .expect_err("hosted authentication value must be explicit");
+            assert!(
+                error.to_string().contains(missing)
+                    || error
+                        .to_string()
+                        .contains("AUTH_COOKIE_SECURE/AUTH_CANONICAL_ORIGIN"),
+                "{missing}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn profiles_are_independently_configurable_and_secrets_are_redacted() {
         let values = HashMap::from([
             (
-                "DATABASE_URL",
-                "postgresql://db-user:database-super-secret@db.example.test/game",
+                "MONGODB_URI",
+                "mongodb://mongo-user:mongo-super-secret@127.0.0.1:27017/?replicaSet=rs0",
+            ),
+            (
+                "DRAGONFLY_URL",
+                "redis://:dragonfly-super-secret@127.0.0.1:6379/0",
             ),
             ("TEXT_LLM_BACKEND", "openai-compatible"),
             ("TEXT_LLM_BASE_URL", "https://text.example.test/v1/"),
@@ -1143,14 +1831,16 @@ mod tests {
 
         assert_eq!(config.text_llm.model.as_deref(), Some("narrator"));
         assert_eq!(config.image_llm.model.as_deref(), Some("illustrator"));
-        assert!(!debug.contains("database-super-secret"));
+        assert!(!debug.contains("mongo-super-secret"));
+        assert!(!debug.contains("dragonfly-super-secret"));
         assert!(!debug.contains("text-super-secret"));
         assert!(!debug.contains("image-super-secret"));
         assert!(debug.contains("[REDACTED]"));
 
         let fingerprints = config.generation_config_fingerprints();
         let encoded = serde_json::to_string(&fingerprints).unwrap();
-        assert!(!encoded.contains("database-super-secret"));
+        assert!(!encoded.contains("mongo-super-secret"));
+        assert!(!encoded.contains("dragonfly-super-secret"));
         assert!(!encoded.contains("text-super-secret"));
         assert!(!encoded.contains("image-super-secret"));
         assert_ne!(fingerprints.text, fingerprints.image);

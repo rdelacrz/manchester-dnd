@@ -7,7 +7,7 @@ runbooks. Commands apply only to the loopback private-evaluation profile.
 ## Safe operating rules
 
 1. Never expose the current binary through a reverse proxy or non-loopback bind.
-2. Treat `DATABASE_URL`, provider tokens, RNG/source/recovery keys, canonical
+2. Treat `MONGODB_URI`, `MONGODB_SCHEMA_URI`, `DRAGONFLY_URL`, provider tokens, RNG/source/recovery keys, canonical
    exports, image files, and source mounts as secrets or private data.
 3. Stop optional generation before invasive diagnosis. Deterministic play with
    authored fallback is the preferred degraded state.
@@ -85,7 +85,7 @@ evidence report. Start only when:
    filenames. Check database, WAL, protected image/quarantine, and backup volumes
    separately.
 3. Free only expired, policy-authorized artifacts/backups through bounded cleanup.
-   Never delete PostgreSQL files, WAL, selected artifacts, RNG keys, or active vaults.
+   Never delete MongoDB data/journal files, selected artifacts, RNG keys, or active vaults.
 4. Take an encrypted logical backup when the database can still read, provision a
    larger private volume, restore into an isolated database, and compare the complete
    recovery manifest before cutover.

@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     error::PrivateInspirationError,
     events::{EventPrompt, EventSelectionAudit, RuntimeEventPrompt, privacy_source_id},
-    repository::PostgresRepository,
+    repository::MongoRepository,
     seed::SeedVault,
 };
 
@@ -152,6 +152,7 @@ impl InspirationMedia {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "text" => Ok(Self::Text),
@@ -193,6 +194,7 @@ impl SourceReviewState {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "pending" => Ok(Self::Pending),
@@ -219,6 +221,7 @@ impl ParticipantVerificationMethod {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "participant_signed_confirmation" => Ok(Self::ParticipantSignedConfirmation),
@@ -247,6 +250,7 @@ impl DerivedArtifactPolicy {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "delete_derived" => Ok(Self::DeleteDerived),
@@ -276,6 +280,7 @@ pub enum ConsentGrantState {
 }
 
 impl ConsentGrantState {
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "active" => Ok(Self::Active),
@@ -371,6 +376,7 @@ impl DurableNoSelectionReason {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "deployment_disabled" => Ok(Self::DeploymentDisabled),
@@ -424,6 +430,7 @@ impl RestrictedDiagnosticAccessKind {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "source_plaintext" => Ok(Self::SourcePlaintext),
@@ -456,6 +463,7 @@ impl RestrictedDiagnosticPurpose {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "source_review" => Ok(Self::SourceReview),
@@ -483,6 +491,7 @@ impl RestrictedDiagnosticDecision {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "allowed" => Ok(Self::Allowed),
@@ -501,6 +510,7 @@ impl CampaignInspirationTone {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parse(value: &str) -> Result<Self, PrivateInspirationError> {
         match value {
             "gothic_adventure" => Ok(Self::GothicAdventure),
@@ -967,7 +977,7 @@ impl TrustedEpochTime for SystemTrustedEpochTime {
 
 #[derive(Clone)]
 pub struct PrivateInspirationApplicationService {
-    repository: PostgresRepository,
+    repository: MongoRepository,
     deployment_enabled: bool,
     seed_vault: Arc<SeedVault>,
     clock: Arc<dyn TrustedEpochTime>,
@@ -975,7 +985,7 @@ pub struct PrivateInspirationApplicationService {
 
 impl PrivateInspirationApplicationService {
     pub fn new(
-        repository: PostgresRepository,
+        repository: MongoRepository,
         deployment_enabled: bool,
         seed_vault: Arc<SeedVault>,
     ) -> Self {
@@ -988,8 +998,9 @@ impl PrivateInspirationApplicationService {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_clock(
-        repository: PostgresRepository,
+        repository: MongoRepository,
         deployment_enabled: bool,
         seed_vault: Arc<SeedVault>,
         clock: impl TrustedEpochTime + 'static,
@@ -1460,10 +1471,12 @@ pub(crate) fn internal_id(prefix: &str) -> Result<OpaqueInspirationId, PrivateIn
     OpaqueInspirationId::new(format!("{prefix}:{}", Uuid::new_v4().simple()))
 }
 
+#[allow(dead_code)]
 pub(crate) fn to_i64(value: u64) -> Result<i64, PrivateInspirationError> {
     i64::try_from(value).map_err(|_| invalid("numeric_range"))
 }
 
+#[allow(dead_code)]
 pub(crate) fn to_u64(value: i64) -> Result<u64, PrivateInspirationError> {
     u64::try_from(value).map_err(|_| invalid("stored_numeric_range"))
 }

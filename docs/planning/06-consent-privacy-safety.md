@@ -74,7 +74,7 @@ Before enabling a reviewed private source, use the body-free operator pipeline:
 
 1. Verify source-owner and human-review decisions in the independent durable source registry.
 2. Verify pseudonymous participants and exact campaign/media/expiry consent before activation.
-3. Register source digest/version, provenance, themes, media, participants, sensitivities, and review without copying the raw body into PostgreSQL.
+3. Register source digest/version, provenance, themes, media, participants, sensitivities, and review without copying the raw body into MongoDB or DragonflyDB.
 4. Re-run registration, human review, and consent whenever a changed file produces a new exact-byte digest.
 5. Exercise revocation, deletion, global quarantine, and backup-expiry paths using the [private-inspiration runbook](../operations/private-inspiration-runbook.md).
 
@@ -82,7 +82,7 @@ Changing a file creates a new source digest/version and requires revalidation. C
 
 ## Random event selection
 
-The `game-server` selector—not the model—controls whether and which inspiration source may be selected. The PostgreSQL transaction derives the trusted safe trigger, party level, campaign pins, safety exclusions, verified participants, exact grants, vetoes, cooldown, and deterministic random authority. It persists the canonical eligible-set digest, selected opaque source/version digest, rational draw, algorithm, cursor interval, cooldown, and no-selection reason before source-derived presentation is used. An ineligible set consumes no cursor, and exact request replay returns the same receipt.
+The `game-server` selector—not the model—controls whether and which inspiration source may be selected. A MongoDB transaction derives the trusted safe trigger, party level, campaign pins, safety exclusions, verified participants, exact grants, vetoes, cooldown, and deterministic random authority. It persists the canonical eligible-set digest, selected opaque source/version digest, rational draw, algorithm, cursor interval, cooldown, and no-selection reason before source-derived presentation can be generated. The model receives only minimized approved facts after durable selection; Dragonfly is never authoritative.
 
 1. An authored trigger window opens only at appropriate narrative boundaries, never mid-safety flow or during an incompatible combat state.
 2. Filter by campaign opt-in, all participant consents, audience/media, safety settings, expiry, active source version, cooldown, theme compatibility, recent use, and campaign-specific vetoes.

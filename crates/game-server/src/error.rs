@@ -43,20 +43,163 @@ pub enum GenerationError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MongoFailureKind {
+    DuplicateKey,
+    DocumentValidation,
+    Timeout,
+    Authentication,
+    Topology,
+    TransactionUnsupported,
+    TransientTransaction,
+    UnknownCommitResult,
+    Database,
+}
+
+#[derive(Debug, Error)]
+pub enum PersistenceError {
+    #[error("MongoDB database name failed the configured allowlist")]
+    InvalidDatabaseName,
+    #[error("MongoDB connection URL could not be parsed")]
+    InvalidMongoUri,
+    #[error("MongoDB {operation} failed ({kind:?})")]
+    Mongo {
+        operation: &'static str,
+        kind: MongoFailureKind,
+        #[source]
+        source: mongodb::error::Error,
+    },
+    #[error("MongoDB schema drift in {collection}: {detail}")]
+    SchemaDrift { collection: String, detail: String },
+    #[error("MongoDB schema bundle metadata is missing or incompatible")]
+    SchemaBundleMismatch,
+    #[error("MongoDB operation {operation} exceeded its configured deadline")]
+    OperationTimeout { operation: &'static str },
+    #[error("MongoDB transaction exceeded its configured deadline")]
+    TransactionDeadline,
+    #[error("MongoDB transaction retry budget exhausted after {attempts} attempt(s)")]
+    TransactionRetriesExhausted {
+        attempts: u32,
+        #[source]
+        last: Box<PersistenceError>,
+    },
+    #[error("{entity} {id} was not found")]
+    NotFound { entity: &'static str, id: String },
+    #[error("{entity} {id} already exists")]
+    AlreadyExists { entity: &'static str, id: String },
+    #[error("{entity} {id} revision conflict: expected {expected}, actual {actual}")]
+    RevisionConflict {
+        entity: &'static str,
+        id: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("idempotency key {idempotency_key} conflicts in {scope_kind} {scope_id}")]
+    IdempotencyConflict {
+        scope_kind: String,
+        scope_id: String,
+        idempotency_key: String,
+    },
+    #[error("could not encode the MongoDB schema bundle")]
+    BsonEncoding(#[source] mongodb::bson::ser::Error),
+}
+
+impl PersistenceError {
+    pub fn mongo(operation: &'static str, source: mongodb::error::Error) -> Self {
+        let kind = classify_mongo_error(&source);
+        Self::Mongo {
+            operation,
+            kind,
+            source,
+        }
+    }
+
+    pub const fn mongo_failure_kind(&self) -> Option<MongoFailureKind> {
+        match self {
+            Self::Mongo { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
+pub fn classify_mongo_error(error: &mongodb::error::Error) -> MongoFailureKind {
+    use mongodb::error::{
+        ErrorKind, TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT, WriteFailure,
+    };
+
+    if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) {
+        return MongoFailureKind::UnknownCommitResult;
+    }
+    if error.contains_label(TRANSIENT_TRANSACTION_ERROR) {
+        return MongoFailureKind::TransientTransaction;
+    }
+
+    let code = match error.kind.as_ref() {
+        ErrorKind::Command(error) => Some(error.code),
+        ErrorKind::Write(WriteFailure::WriteError(error)) => Some(error.code),
+        ErrorKind::Write(WriteFailure::WriteConcernError(error)) => Some(error.code),
+        ErrorKind::InsertMany(error) => error
+            .write_errors
+            .as_ref()
+            .and_then(|errors| errors.first())
+            .map(|error| error.code)
+            .or_else(|| error.write_concern_error.as_ref().map(|error| error.code)),
+        _ => None,
+    };
+    match code {
+        Some(11000 | 11001 | 12582) => MongoFailureKind::DuplicateKey,
+        Some(121) => MongoFailureKind::DocumentValidation,
+        Some(18) => MongoFailureKind::Authentication,
+        Some(20 | 263 | 303) => MongoFailureKind::TransactionUnsupported,
+        Some(50 | 262) => MongoFailureKind::Timeout,
+        _ => match error.kind.as_ref() {
+            ErrorKind::Authentication { .. } => MongoFailureKind::Authentication,
+            ErrorKind::ServerSelection { .. }
+            | ErrorKind::DnsResolve { .. }
+            | ErrorKind::ConnectionPoolCleared { .. } => MongoFailureKind::Topology,
+            ErrorKind::Io(source) if source.kind() == std::io::ErrorKind::TimedOut => {
+                MongoFailureKind::Timeout
+            }
+            ErrorKind::Transaction { message, .. }
+                if message.contains("not supported") || message.contains("not support") =>
+            {
+                MongoFailureKind::TransactionUnsupported
+            }
+            _ => MongoFailureKind::Database,
+        },
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("DragonflyDB cache key material is invalid")]
+    InvalidKey,
+    #[error("DragonflyDB pool configuration is invalid")]
+    InvalidPoolConfiguration,
+    #[error("DragonflyDB connection pool is unavailable")]
+    Pool(#[source] deadpool_redis::PoolError),
+    #[error("DragonflyDB command failed")]
+    Command(#[source] redis::RedisError),
+    #[error("DragonflyDB command timed out")]
+    Timeout,
+    #[error("DragonflyDB cache value serialization failed")]
+    Serialization(#[source] serde_json::Error),
+}
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
-    #[error("invalid PostgreSQL database URL")]
-    InvalidDatabaseUrl(#[source] sqlx::Error),
-    #[error("database operation failed")]
-    Database(#[source] sqlx::Error),
-    #[error("database migration failed")]
-    Migration(#[source] sqlx::migrate::MigrateError),
+    #[error("MongoDB persistence operation failed")]
+    Persistence(#[from] PersistenceError),
     #[error("could not serialize {entity}")]
     Serialize {
         entity: &'static str,
         #[source]
         source: serde_json::Error,
     },
+    #[error("could not encode MongoDB BSON document")]
+    BsonEncoding(#[from] mongodb::bson::ser::Error),
+    #[error("could not decode MongoDB BSON document")]
+    BsonDecoding(#[from] mongodb::bson::de::Error),
     #[error("stored {entity} {id} contains invalid JSON")]
     InvalidStoredData {
         entity: &'static str,
@@ -75,7 +218,13 @@ pub enum RepositoryError {
         expected: u64,
         actual: u64,
     },
-    #[error("numeric value for {field} is outside PostgreSQL BIGINT's supported range")]
+    #[error("idempotency key {idempotency_key} conflicts in {scope_kind} {scope_id}")]
+    IdempotencyConflict {
+        scope_kind: String,
+        scope_id: String,
+        idempotency_key: String,
+    },
+    #[error("numeric value for {field} is outside the persistence format's supported range")]
     NumericRange { field: &'static str },
     #[error("unsupported {entity} schema version {found}; this server supports {supported}")]
     UnsupportedSchemaVersion {
@@ -122,6 +271,12 @@ pub enum AuthenticationError {
     InvalidCredentials,
     #[error("account is unavailable")]
     AccountUnavailable,
+    #[error("signup access token is invalid or expired")]
+    InvalidSignupAccess,
+    #[error("signup session is invalid or expired")]
+    InvalidSignupSession,
+    #[error("authentication attempt is throttled")]
+    Throttled,
     #[error("session is invalid or expired")]
     InvalidSession,
     #[error("password hash operation failed")]
@@ -132,32 +287,10 @@ pub enum AuthenticationError {
     InvalidInput(#[from] crate::auth::AuthenticationInputError),
     #[error("repository error during authentication")]
     Repository(#[from] RepositoryError),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransientPostgresFailure {
-    SerializationFailure,
-    DeadlockDetected,
-}
-
-/// Closed SQLSTATE allowlist for future transaction-level retry. The private
-/// MVP deliberately performs zero automatic retries; a caller must preserve
-/// the original expected revision and idempotency key before using this signal.
-pub const fn classify_postgres_sqlstate(code: &str) -> Option<TransientPostgresFailure> {
-    match code.as_bytes() {
-        b"40001" => Some(TransientPostgresFailure::SerializationFailure),
-        b"40P01" => Some(TransientPostgresFailure::DeadlockDetected),
-        _ => None,
-    }
-}
-
-impl RepositoryError {
-    pub fn transient_postgres_failure(&self) -> Option<TransientPostgresFailure> {
-        let Self::Database(sqlx::Error::Database(error)) = self else {
-            return None;
-        };
-        error.code().as_deref().and_then(classify_postgres_sqlstate)
-    }
+    #[error("MongoDB persistence failed during authentication")]
+    Persistence(#[from] PersistenceError),
+    #[error("email protection failed")]
+    EmailCrypto(#[from] crate::persistence::EmailCryptoError),
 }
 
 #[derive(Debug, Error)]
@@ -374,8 +507,8 @@ impl ApplicationError {
     pub const fn retryable(&self) -> bool {
         // Revision conflicts have a defined recovery path: reload the current
         // view. Internal validation/corruption failures are deterministic, and
-        // repository errors are not retryable until their PostgreSQL SQLSTATE
-        // has been explicitly classified as transient.
+        // repository errors are not retryable until the MongoDB driver has
+        // explicitly classified them as transient.
         matches!(
             self,
             Self::LifecycleRevisionConflict { .. }
@@ -493,21 +626,6 @@ mod application_error_tests {
         );
         assert!(!error.to_string().contains("seed"));
     }
-
-    #[test]
-    fn transient_postgres_allowlist_excludes_ambiguous_and_integrity_failures() {
-        assert_eq!(
-            classify_postgres_sqlstate("40001"),
-            Some(TransientPostgresFailure::SerializationFailure)
-        );
-        assert_eq!(
-            classify_postgres_sqlstate("40P01"),
-            Some(TransientPostgresFailure::DeadlockDetected)
-        );
-        for code in ["55P03", "57014", "23503", "23505", "08006", "XX000"] {
-            assert_eq!(classify_postgres_sqlstate(code), None, "{code}");
-        }
-    }
 }
 
 #[derive(Error)]
@@ -585,6 +703,8 @@ pub enum PrivateInspirationError {
     InvalidCommand { code: &'static str },
     #[error("private inspiration is disabled for this deployment")]
     DeploymentDisabled,
+    #[error("private inspiration persistence has not been migrated to MongoDB")]
+    NotImplemented,
     #[error("private inspiration authorization or scope validation failed")]
     ScopeDenied,
     #[error("private inspiration state was not found")]
@@ -606,6 +726,7 @@ impl PrivateInspirationError {
         match self {
             Self::InvalidCommand { .. } => "invalid_inspiration_command",
             Self::DeploymentDisabled => "inspiration_deployment_disabled",
+            Self::NotImplemented => "internal_error",
             Self::ScopeDenied => "inspiration_scope_denied",
             Self::NotFound => "inspiration_not_configured",
             Self::RevisionConflict { .. } => "inspiration_revision_conflict",
@@ -618,6 +739,7 @@ impl PrivateInspirationError {
         match self {
             Self::InvalidCommand { .. } => "That inspiration control is invalid.",
             Self::DeploymentDisabled => "Private inspiration is disabled for this installation.",
+            Self::NotImplemented => "The private inspiration service is temporarily unavailable.",
             Self::ScopeDenied => "That private inspiration action is not available.",
             Self::NotFound => "Private inspiration has not been configured for this campaign.",
             Self::RevisionConflict { .. } => {
@@ -666,6 +788,10 @@ pub enum BootstrapError {
     Content(#[from] crate::content::ContentCatalogError),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
     #[error(transparent)]
     Generation(#[from] GenerationError),
     #[error(transparent)]

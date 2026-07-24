@@ -175,7 +175,7 @@ async fn run() -> Result<Value, String> {
     .map_err(|_| "command file does not match the closed admin schema".to_owned())?;
     let config = AppConfig::load().map_err(|error| error.to_string())?;
     // Only this offline operator process reads the protected source mount. The
-    // ordinary server reconstructs minimized runtime prompts from PostgreSQL
+    // ordinary server reconstructs minimized runtime prompts from MongoDB
     // and therefore needs neither this mount nor its decryption key.
     let event_review = if config.inspiration_enabled {
         EventPromptLoader

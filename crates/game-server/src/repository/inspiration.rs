@@ -1,25 +1,29 @@
-//! Transactional persistence for consented private inspiration.
+//! Transactional MongoDB persistence for consented private inspiration.
 //!
-//! The repository accepts only the body-free DTOs from `crate::inspiration`.
-//! Every mutating operation locks the campaign row first, checks an exact
-//! idempotency receipt, and writes its state, receipt, and redacted audit in a
-//! single PostgreSQL transaction.
+//! Only body-free, minimized projections cross this boundary. Campaign safety
+//! policy is embedded in the campaign aggregate; independently mutable source,
+//! consent, veto, selection, and derived-work state uses the corresponding
+//! private-inspiration collections. Receipts, audits, and deletion tombstones
+//! use their consolidated MongoDB collections.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use manchester_dnd_core::{
-    CampaignContentPins, Character, RollAlgorithm, SessionDto, SessionEventDto,
-    SessionEventPayload, SessionStatus, Sha256Digest, encounter::EncounterStatus,
-    hero::HeroCharacter,
+    Character, RollAlgorithm, SessionDto, SessionEventDto, SessionEventPayload, SessionStatus,
+    Sha256Digest, encounter::EncounterStatus, hero::HeroCharacter,
 };
-use serde::{Serialize, de::DeserializeOwned};
-use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+use mongodb::{
+    ClientSession, Collection,
+    bson::{self, Bson, DateTime, Document, doc},
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use uuid::Uuid;
 
 use crate::{
-    error::{PrivateInspirationError, RepositoryError},
+    error::{PersistenceError, PrivateInspirationError},
     events::{
-        DeterministicEventRandom, EventEligibility, EventNoSelectionReason, EventPrompt,
-        EventPromptLoader, EventSelectionAudit, RuntimeEventPrompt,
+        DeterministicEventRandom, EventEligibility, EventPrompt, EventPromptLoader,
+        EventSelectionAudit, RuntimeEventPrompt,
     },
     inspiration::{
         ApplyInspirationVetoCommand, ApplyPresentationPrivacyCommand,
@@ -29,45 +33,275 @@ use crate::{
         DerivedArtifactPolicy, DerivedWorkProjection, DisableCampaignInspirationCommand,
         DurableNoSelectionReason, GlobalInspirationControlProjection, GrantConsentCommand,
         InspirationAudience, InspirationMedia, InspirationTransformation, InspirationVetoScope,
-        OpaqueInspirationId, OpaqueOperatorId, PARTICIPANT_DELETION_TOMBSTONE_SECONDS,
+        OpaqueInspirationId, PARTICIPANT_DELETION_TOMBSTONE_SECONDS,
         PRIVATE_INSPIRATION_EXPORT_SCHEMA_VERSION, PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        ParticipantDeletionOutcome, ParticipantVerificationMethod,
-        ParticipantVerificationProjection, PresentationPrivacyAction, PresentationPrivacyOutcome,
-        PrivacyTransitionOutcome, PrivateInspirationSelection,
+        ParticipantDeletionOutcome, ParticipantVerificationProjection, PresentationPrivacyAction,
+        PresentationPrivacyOutcome, PrivacyTransitionOutcome, PrivateInspirationSelection,
         PurgeExpiredParticipantDeletionTombstonesCommand, Q11_CONSERVATIVE_POLICY_ID,
         RecordRestrictedDiagnosticAccessCommand, RegisterDerivedWorkCommand,
         RegisterSourceVersionCommand, RequestInspirationSelectionCommand,
-        ResolvedInspirationSelectionAuthority, RestrictedDiagnosticAccessKind,
-        RestrictedDiagnosticAccessProjection, RestrictedDiagnosticDecision,
-        RestrictedDiagnosticPurpose, ReviewSourceVersionCommand, RevokeConsentCommand,
-        SafetySetupEvidence, SetCampaignInspirationPauseCommand,
-        SetGlobalInspirationControlCommand, SourceReviewState, SourceVersionProjection,
-        VerifyParticipantCommand, VetoProjection, fingerprint, internal_id, invalid,
-        to_i64 as inspiration_to_i64, to_u64,
+        ResolvedInspirationSelectionAuthority, RestrictedDiagnosticAccessProjection,
+        RestrictedDiagnosticDecision, ReviewSourceVersionCommand, RevokeConsentCommand,
+        SetCampaignInspirationPauseCommand, SetGlobalInspirationControlCommand, SourceReviewState,
+        SourceVersionProjection, VerifyParticipantCommand, VetoProjection, fingerprint,
+        internal_id, invalid,
     },
+    persistence::CollectionName,
 };
 
-use super::{PostgresRepository, presentations::PRIVATE_INSPIRATION_REDACTION_BODY};
+use super::{MongoRepository, map_persistence, presentations::PRIVATE_INSPIRATION_REDACTION_BODY};
 
-const SETTINGS_COLUMNS: &str =
-    "campaign_session_id, schema_version, revision, enabled, generation_paused, safety_setup_complete,
-     adults_only, fictional_distance, audience, media, q11_policy_id, tone, updated_at_epoch,
-     (SELECT COUNT(*) FROM campaign_inspiration_lines AS line
-       WHERE line.campaign_session_id = campaign_inspiration_settings.campaign_session_id) AS line_count,
-     (SELECT COUNT(*) FROM campaign_inspiration_veils AS veil
-       WHERE veil.campaign_session_id = campaign_inspiration_settings.campaign_session_id) AS veil_count,
-     (SELECT COUNT(*) FROM campaign_inspiration_excluded_topics AS topic
-       WHERE topic.campaign_session_id = campaign_inspiration_settings.campaign_session_id) AS excluded_topic_count,
-     (SELECT COUNT(*) FROM campaign_inspiration_excluded_participants AS participant
-       WHERE participant.campaign_session_id = campaign_inspiration_settings.campaign_session_id) AS excluded_participant_count";
+const SYSTEM_ACTOR_ID: &str = "account:system-private-inspiration";
+const GLOBAL_SCOPE_ID: &str = "system:private-inspiration";
+const GLOBAL_STATE_ID: &str = "command-receipt:private-inspiration-global-state";
+const GLOBAL_STATE_SCOPE: &str = "private_inspiration_global_state";
+const GLOBAL_COMMAND_SCOPE: &str = "private_inspiration_global";
+const CAMPAIGN_COMMAND_SCOPE: &str = "private_inspiration";
+const RESTRICTED_COMMAND_SCOPE: &str = "private_inspiration_restricted";
+const PARTICIPANT_TOMBSTONE_KIND: &str = "private_inspiration_participant";
+const MAX_CAMPAIGN_SAFETY_CODES: usize = 64;
 
-#[derive(Debug)]
-struct LockedCampaign {
+#[derive(Debug, Clone, Deserialize)]
+struct InspirationCampaignDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    revision: i64,
+    #[serde(default)]
+    theme_id: String,
     session: SessionDto,
-    revision: u64,
+    #[serde(default)]
+    safety: Option<CampaignSafetyDocument>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CampaignSafetyDocument {
+    schema_version: i64,
+    revision: i64,
+    enabled: bool,
+    generation_paused: bool,
+    safety_setup_complete: bool,
+    adults_only: bool,
+    fictional_distance: String,
+    tone: String,
+    audience: String,
+    media: String,
+    q11_policy_id: String,
+    rng_cursor: i64,
+    allowed_sensitivities: Vec<String>,
+    lines: Vec<String>,
+    veils: Vec<String>,
+    excluded_topics: Vec<String>,
+    excluded_participant_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safety_setup_evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safety_reviewer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safety_reviewed_at_epoch: Option<i64>,
+    updated_at_epoch: i64,
+}
+
+impl CampaignSafetyDocument {
+    fn from_command(
+        command: &ConfigureCampaignInspirationCommand,
+        revision: u64,
+        now: u64,
+    ) -> Result<Self, PrivateInspirationError> {
+        let setup = command.safety_setup.as_ref();
+        Ok(Self {
+            schema_version: i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+            revision: inspiration_i64(revision, "settings_revision_range")?,
+            enabled: command.enabled,
+            generation_paused: false,
+            safety_setup_complete: setup.is_some(),
+            adults_only: true,
+            fictional_distance: "high_locked".to_owned(),
+            tone: setup
+                .map_or(CampaignInspirationTone::GothicAdventure, |value| value.tone)
+                .as_str()
+                .to_owned(),
+            audience: InspirationAudience::PrivateCampaign.as_str().to_owned(),
+            media: InspirationMedia::Text.as_str().to_owned(),
+            q11_policy_id: Q11_CONSERVATIVE_POLICY_ID.to_owned(),
+            rng_cursor: 0,
+            allowed_sensitivities: string_set(setup.map(|value| &value.allowed_sensitivity_codes)),
+            lines: string_set(setup.map(|value| &value.line_codes)),
+            veils: string_set(setup.map(|value| &value.veil_codes)),
+            excluded_topics: string_set(setup.map(|value| &value.excluded_topic_codes)),
+            excluded_participant_ids: string_set(
+                setup.map(|value| &value.excluded_participant_ids),
+            ),
+            safety_setup_evidence_digest: setup
+                .map(|value| value.evidence_digest.as_str().to_owned()),
+            safety_reviewer_id: setup.map(|value| value.reviewer_id.as_str().to_owned()),
+            safety_reviewed_at_epoch: setup
+                .map(|_| inspiration_i64(now, "safety_reviewed_at_range"))
+                .transpose()?,
+            updated_at_epoch: inspiration_i64(now, "settings_updated_at_range")?,
+        })
+    }
+
+    fn projection(
+        &self,
+        campaign_id: &str,
+    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
+        let allowed = validated_stored_ids(&self.allowed_sensitivities)?;
+        let lines = validated_stored_ids(&self.lines)?;
+        let veils = validated_stored_ids(&self.veils)?;
+        let excluded_topics = validated_stored_ids(&self.excluded_topics)?;
+        let excluded_participants = validated_stored_ids(&self.excluded_participant_ids)?;
+        if self.schema_version != i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
+            || self.fictional_distance != "high_locked"
+            || self.audience != InspirationAudience::PrivateCampaign.as_str()
+            || self.media != InspirationMedia::Text.as_str()
+            || self.q11_policy_id != Q11_CONSERVATIVE_POLICY_ID
+            || !self.adults_only
+            || [
+                allowed.len(),
+                lines.len(),
+                veils.len(),
+                excluded_topics.len(),
+                excluded_participants.len(),
+            ]
+            .into_iter()
+            .any(|length| length > MAX_CAMPAIGN_SAFETY_CODES)
+            || !lines.is_disjoint(&veils)
+            || !lines.is_disjoint(&excluded_topics)
+            || !veils.is_disjoint(&excluded_topics)
+            || (!self.safety_setup_complete
+                && (!allowed.is_empty()
+                    || !lines.is_empty()
+                    || !veils.is_empty()
+                    || !excluded_topics.is_empty()
+                    || !excluded_participants.is_empty()
+                    || self.safety_setup_evidence_digest.is_some()
+                    || self.safety_reviewer_id.is_some()
+                    || self.safety_reviewed_at_epoch.is_some()))
+        {
+            return Err(invalid("stored_settings_policy"));
+        }
+        Ok(CampaignInspirationSettingsProjection {
+            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+            campaign_session_id: OpaqueInspirationId::new(campaign_id.to_owned())?,
+            revision: inspiration_u64(self.revision, "stored_settings_revision")?,
+            enabled: self.enabled,
+            generation_paused: self.generation_paused,
+            safety_setup_complete: self.safety_setup_complete,
+            adults_only: true,
+            fictional_distance_locked_high: true,
+            tone: CampaignInspirationTone::parse(&self.tone)?,
+            line_count: bounded_count(self.lines.len(), "stored_line_count")?,
+            veil_count: bounded_count(self.veils.len(), "stored_veil_count")?,
+            excluded_topic_count: bounded_count(
+                self.excluded_topics.len(),
+                "stored_excluded_topic_count",
+            )?,
+            excluded_participant_count: bounded_count(
+                self.excluded_participant_ids.len(),
+                "stored_excluded_participant_count",
+            )?,
+            audience: InspirationAudience::PrivateCampaign,
+            media: InspirationMedia::Text,
+            q11_policy_id: self.q11_policy_id.clone(),
+            updated_at_epoch: inspiration_u64(self.updated_at_epoch, "stored_settings_updated_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    logical_id: String,
+    revision: i64,
+    source_digest: String,
+    category_id: String,
+    owner_participant_id: String,
+    review_state: String,
+    q11_screened: bool,
+    audience: String,
+    transformation: String,
+    provenance_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_epoch: Option<i64>,
+    participants: Vec<String>,
+    sensitivities: Vec<String>,
+    media: Vec<String>,
+    themes: Vec<String>,
+    runtime_facts: RuntimeFactsDocument,
+    runtime_projection: RuntimeEventPrompt,
+    projection_digest: String,
+    projection: SourceVersionProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review_evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewed_at_epoch: Option<i64>,
+    registered_at_epoch: i64,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeFactsDocument {
+    neutral_facts: Vec<String>,
+}
+
+impl SourceDocument {
+    fn stored(&self) -> Result<StoredSource, PrivateInspirationError> {
+        let participants = validated_stored_ids(&self.participants)?;
+        let sensitivities = validated_stored_ids(&self.sensitivities)?;
+        let eligible_media = self
+            .media
+            .iter()
+            .map(|value| InspirationMedia::parse(value))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let eligible_theme_pack_ids = self
+            .themes
+            .iter()
+            .map(|value| OpaqueInspirationId::new(value.clone()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if self.schema_version != i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
+            || self.audience != InspirationAudience::PrivateCampaign.as_str()
+            || self.transformation != InspirationTransformation::HighFictionDistanceV1.as_str()
+            || self.runtime_facts.neutral_facts != self.runtime_projection.neutral_facts
+            || eligible_media.len() != self.media.len()
+            || eligible_theme_pack_ids.len() != self.themes.len()
+        {
+            return Err(invalid("stored_source_policy"));
+        }
+        let projection = SourceVersionProjection {
+            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+            source_id: OpaqueInspirationId::new(self.logical_id.clone())?,
+            source_version: inspiration_u64(self.revision, "stored_source_revision")?,
+            source_digest: Sha256Digest::new(self.source_digest.clone())
+                .map_err(|_| invalid("stored_source_digest"))?,
+            category_id: OpaqueInspirationId::new(self.category_id.clone())?,
+            review_state: SourceReviewState::parse(&self.review_state)?,
+            q11_screened: self.q11_screened,
+            participant_count: bounded_count(participants.len(), "stored_participant_count")?,
+            sensitivity_count: bounded_count(sensitivities.len(), "stored_sensitivity_count")?,
+            eligible_media,
+            eligible_theme_pack_ids,
+            expires_at_epoch: self
+                .expires_at_epoch
+                .map(|value| inspiration_u64(value, "stored_source_expiry"))
+                .transpose()?,
+        };
+        Ok(StoredSource {
+            projection,
+            participants,
+            sensitivities,
+            theme_pack_ids: self.themes.iter().cloned().collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct StoredSource {
     projection: SourceVersionProjection,
     participants: BTreeSet<String>,
@@ -75,120 +309,183 @@ struct StoredSource {
     theme_pack_ids: BTreeSet<String>,
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsentDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    campaign_id: String,
+    source_id: String,
+    source_revision: i64,
+    source_digest: String,
+    participant_id: String,
+    version: i64,
+    audience: String,
+    media: String,
+    transformation: String,
+    artifact_policy: String,
+    sensitivities: Vec<String>,
+    reviewer_id: String,
+    participant_confirmation_digest: String,
+    review_evidence_digest: String,
+    state: String,
+    projection: ConsentGrantProjection,
+    granted_at_epoch: i64,
+    expires_at_epoch: i64,
+    expires_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_at_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation_code: Option<String>,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+impl ConsentDocument {
+    fn checked_projection(&self) -> Result<ConsentGrantProjection, PrivateInspirationError> {
+        validated_stored_ids(&self.sensitivities)?;
+        if self.schema_version != i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
+            || self.version <= 0
+            || self.id != self.projection.grant_id.as_str()
+            || !manchester_dnd_core::is_valid_opaque_id(&self.campaign_id)
+            || self.source_id != self.projection.source_id.as_str()
+            || inspiration_u64(self.source_revision, "stored_consent_source_revision")?
+                != self.projection.source_version
+            || self.source_digest != self.projection.source_digest.as_str()
+            || self.participant_id != self.projection.participant_id.as_str()
+            || self.audience != self.projection.audience.as_str()
+            || self.media != self.projection.media.as_str()
+            || self.transformation != self.projection.transformation.as_str()
+            || self.artifact_policy != self.projection.artifact_policy.as_str()
+            || !manchester_dnd_core::is_valid_opaque_id(&self.reviewer_id)
+            || Sha256Digest::new(self.participant_confirmation_digest.clone()).is_err()
+            || Sha256Digest::new(self.review_evidence_digest.clone()).is_err()
+            || self.state != consent_state_name(self.projection.state)
+            || inspiration_u64(self.expires_at_epoch, "stored_consent_expiry")?
+                != self.projection.expires_at_epoch
+        {
+            return Err(invalid("stored_consent_policy"));
+        }
+        Ok(self.projection.clone())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: i64,
+    campaign_id: String,
+    /// Unique storage binding used by the collection index.
+    selection_id: String,
+    /// The durable selection exposed by the application projection.
+    source_selection_id: String,
+    source_id: String,
+    source_revision: i64,
+    source_digest: String,
+    work_kind: String,
+    state: String,
+    artifact_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancellation_requested_at_epoch: Option<i64>,
+    created_at_epoch: i64,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+impl WorkDocument {
+    fn validate(&self) -> Result<(), PrivateInspirationError> {
+        if self.schema_version != i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
+            || !manchester_dnd_core::is_valid_opaque_id(&self.id)
+            || !manchester_dnd_core::is_valid_opaque_id(&self.campaign_id)
+            || !manchester_dnd_core::is_valid_opaque_id(&self.selection_id)
+            || !manchester_dnd_core::is_valid_opaque_id(&self.source_selection_id)
+            || !manchester_dnd_core::is_valid_opaque_id(&self.source_id)
+            || self.source_revision <= 0
+            || Sha256Digest::new(self.source_digest.clone()).is_err()
+            || !matches!(self.work_kind.as_str(), "text" | "image" | "recap")
+            || !matches!(
+                self.state.as_str(),
+                "pending" | "cancellation_requested" | "completed" | "redacted" | "deleted"
+            )
+            || DerivedArtifactPolicy::parse(&self.artifact_policy).is_err()
+            || matches!(self.state.as_str(), "completed" | "redacted")
+                != self.completed_artifact_id.is_some()
+        {
+            return Err(invalid("stored_derived_work"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VetoReceipt {
     veto: VetoProjection,
     transition: PrivacyTransitionOutcome,
 }
 
-impl PostgresRepository {
-    /// Loads only the minimized, integrity-bound runtime projections produced
-    /// by the offline source-review process. The ordinary game/image process
-    /// never needs the protected Markdown root or its decryption key.
+enum ReceiptReplay<T> {
+    Missing,
+    Replay(T),
+    Conflict,
+}
+
+impl MongoRepository {
+    /// Loads only minimized, integrity-bound runtime prompt projections.
     pub(crate) async fn load_private_inspiration_runtime_prompts(
         &self,
     ) -> Result<Vec<EventPrompt>, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        let rows = sqlx::query(
-            "SELECT runtime.source_id, runtime.source_version,
-                    runtime.source_digest, runtime.schema_version,
-                    runtime.selection_weight_nanounits, runtime.minimum_level,
-                    runtime.maximum_level, runtime.cooldown_turns,
-                    runtime.enabled, runtime.projection_digest
-             FROM private_inspiration_runtime_prompts AS runtime
-             ORDER BY runtime.source_id, runtime.source_version",
-        )
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let mut prompts = Vec::with_capacity(rows.len());
-        for row in rows {
-            let source_id: String = row.try_get("source_id").map_err(db)?;
-            let source_version = to_u64(row.try_get("source_version").map_err(db)?)?;
-            let source_digest = stored_digest(row.try_get("source_digest").map_err(db)?)?;
-            let schema_version = u16::try_from(to_u64(row.try_get("schema_version").map_err(db)?)?)
-                .map_err(|_| invalid("runtime_prompt_schema_range"))?;
-            let minimum_level = u8::try_from(row.try_get::<i16, _>("minimum_level").map_err(db)?)
-                .map_err(|_| invalid("runtime_prompt_minimum_level"))?;
-            let maximum_level = row
-                .try_get::<Option<i16>, _>("maximum_level")
-                .map_err(db)?
-                .map(u8::try_from)
-                .transpose()
-                .map_err(|_| invalid("runtime_prompt_maximum_level"))?;
-            let neutral_facts = sqlx::query_scalar::<_, String>(
-                "SELECT neutral_fact FROM private_inspiration_runtime_facts
-                 WHERE source_id = $1 AND source_version = $2
-                 ORDER BY fact_index",
-            )
-            .bind(&source_id)
-            .bind(inspiration_to_i64(source_version)?)
-            .fetch_all(&mut *transaction)
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let mut cursor = sources
+            .find(doc! {})
+            .sort(doc! { "logical_id": 1_i64, "revision": 1_i64 })
             .await
-            .map_err(db)?;
-            let participant_aliases = sqlx::query_scalar::<_, String>(
-                "SELECT participant_id FROM private_inspiration_source_participants
-                 WHERE source_id = $1 AND source_version = $2
-                 ORDER BY participant_id",
-            )
-            .bind(&source_id)
-            .bind(inspiration_to_i64(source_version)?)
-            .fetch_all(&mut *transaction)
+            .map_err(|error| private_mongo("load private inspiration runtime prompts", error))?;
+        let mut prompts = Vec::new();
+        while cursor
+            .advance()
             .await
-            .map_err(db)?;
-            let sensitivity_tags = sqlx::query_scalar::<_, String>(
-                "SELECT sensitivity_code FROM private_inspiration_source_sensitivities
-                 WHERE source_id = $1 AND source_version = $2
-                 ORDER BY sensitivity_code",
-            )
-            .bind(&source_id)
-            .bind(inspiration_to_i64(source_version)?)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(db)?;
-            let projection = RuntimeEventPrompt {
-                schema_version,
-                selection_weight_nanounits: to_u64(
-                    row.try_get("selection_weight_nanounits").map_err(db)?,
-                )?,
-                minimum_level,
-                maximum_level,
-                cooldown_turns: to_u64(row.try_get("cooldown_turns").map_err(db)?)?,
-                enabled: row.try_get("enabled").map_err(db)?,
-                neutral_facts,
-            };
-            let stored_projection_digest =
-                stored_digest(row.try_get("projection_digest").map_err(db)?)?;
-            if fingerprint(&projection)? != stored_projection_digest {
+            .map_err(|error| private_mongo("read private inspiration runtime prompts", error))?
+        {
+            let source = cursor.deserialize_current().map_err(|_| {
+                private_persistence(private_schema(
+                    CollectionName::PrivateInspirationSources,
+                    "runtime prompt document could not be decoded",
+                ))
+            })?;
+            let stored = source.stored()?;
+            if fingerprint(&source.runtime_projection)?.as_str() != source.projection_digest {
                 return Err(invalid("runtime_prompt_projection_digest"));
             }
             prompts.push(
                 EventPrompt::from_runtime_projection(
-                    &source_id,
-                    source_digest,
-                    participant_aliases,
-                    sensitivity_tags,
-                    projection,
+                    stored.projection.source_id.as_str(),
+                    stored.projection.source_digest.clone(),
+                    source.participants,
+                    source.sensitivities,
+                    source.runtime_projection,
                 )
                 .map_err(|_| invalid("stored_runtime_prompt"))?,
             );
         }
-        transaction.commit().await.map_err(db)?;
         Ok(prompts)
     }
 
     pub(crate) async fn load_global_inspiration_control(
         &self,
     ) -> Result<GlobalInspirationControlProjection, PrivateInspirationError> {
-        let row = sqlx::query(
-            "SELECT schema_version, revision, generation_disabled, updated_at_epoch
-             FROM private_inspiration_global_control WHERE singleton",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db)?;
-        global_control_from_row(row)
+        let collection = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        Ok(load_global_control(&collection, None)
+            .await
+            .map_err(private_persistence)?
+            .unwrap_or_else(default_global_control))
     }
 
     pub(crate) async fn record_private_inspiration_restricted_access(
@@ -197,87 +494,100 @@ impl PostgresRepository {
         request_fingerprint: &Sha256Digest,
         now: u64,
     ) -> Result<RestrictedDiagnosticAccessProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        if let Some(row) = sqlx::query(
-            "SELECT audit_id, schema_version, request_fingerprint,
-                    campaign_session_id, operator_id, access_kind, purpose_code,
-                    subject_id, evidence_digest, result_code, occurred_at_epoch
-             FROM private_inspiration_restricted_access_audits
-             WHERE idempotency_key = $1",
-        )
-        .bind(command.idempotency_key.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        {
-            let stored_fingerprint =
-                stored_digest(row.try_get("request_fingerprint").map_err(db)?)?;
-            if &stored_fingerprint != request_fingerprint {
-                return Err(PrivateInspirationError::ScopeDenied);
-            }
-            let projection = restricted_access_projection_from_row(row)?;
-            transaction.commit().await.map_err(db)?;
-            return Ok(projection);
-        }
+        let now_date = epoch_date(now, "restricted_access_time_range")?;
         let audit_id = internal_id("restricted-access")?;
-        sqlx::query(
-            "INSERT INTO private_inspiration_restricted_access_audits
-             (audit_id, schema_version, idempotency_key, request_fingerprint,
-              campaign_session_id, operator_id, access_kind, purpose_code,
-              subject_id, evidence_digest, result_code, occurred_at_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-        )
-        .bind(audit_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.idempotency_key.as_str())
-        .bind(request_fingerprint.as_str())
-        .bind(
-            command
-                .campaign_session_id
-                .as_ref()
-                .map(OpaqueInspirationId::as_str),
-        )
-        .bind(command.operator_id.as_str())
-        .bind(command.access_kind.as_str())
-        .bind(command.purpose.as_str())
-        .bind(command.subject_id.as_str())
-        .bind(command.evidence_digest.as_str())
-        .bind(command.decision.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        insert_privacy_audit(
-            &mut transaction,
-            command
-                .campaign_session_id
-                .as_ref()
-                .map(OpaqueInspirationId::as_str),
-            "restricted_diagnostic_access",
-            "restricted_diagnostic",
-            command.subject_id.as_str(),
-            Some(command.access_kind.as_str()),
-            if command.decision == RestrictedDiagnosticDecision::Allowed {
-                "applied"
-            } else {
-                "denied"
-            },
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(RestrictedDiagnosticAccessProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            audit_id,
-            campaign_session_id: command.campaign_session_id.clone(),
-            operator_id: command.operator_id.clone(),
-            access_kind: command.access_kind,
-            purpose: command.purpose,
-            subject_id: command.subject_id.clone(),
-            evidence_digest: command.evidence_digest.clone(),
-            decision: command.decision,
-            occurred_at_epoch: now,
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        let scope_id = command
+            .campaign_session_id
+            .as_ref()
+            .map_or(GLOBAL_SCOPE_ID.to_owned(), ToString::to_string);
+        self.with_transaction(move |session| {
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            let audit_id = audit_id.clone();
+            let scope_id = scope_id.clone();
+            Box::pin(async move {
+                match load_receipt::<RestrictedDiagnosticAccessProjection>(
+                    &receipts,
+                    session,
+                    RESTRICTED_COMMAND_SCOPE,
+                    &scope_id,
+                    command.idempotency_key.as_str(),
+                    "restricted_diagnostic_access",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::ScopeDenied));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let projection = RestrictedDiagnosticAccessProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    audit_id: audit_id.clone(),
+                    campaign_session_id: command.campaign_session_id.clone(),
+                    operator_id: command.operator_id.clone(),
+                    access_kind: command.access_kind,
+                    purpose: command.purpose,
+                    subject_id: command.subject_id.clone(),
+                    evidence_digest: command.evidence_digest.clone(),
+                    decision: command.decision,
+                    occurred_at_epoch: now,
+                };
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    command
+                        .campaign_session_id
+                        .as_ref()
+                        .map(OpaqueInspirationId::as_str),
+                    "restricted_diagnostic_access",
+                    "restricted_diagnostic",
+                    command.subject_id.as_str(),
+                    Some(command.access_kind.as_str()),
+                    if command.decision == RestrictedDiagnosticDecision::Allowed {
+                        "applied"
+                    } else {
+                        "denied"
+                    },
+                    now_date,
+                    Some(doc! {
+                        "operator_id": command.operator_id.as_str(),
+                        "purpose": command.purpose.as_str(),
+                        "evidence_digest": command.evidence_digest.as_str(),
+                        "decision": command.decision.as_str(),
+                    }),
+                )
+                .await?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    RESTRICTED_COMMAND_SCOPE,
+                    &scope_id,
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "restricted_diagnostic_access",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
         })
+        .await
+        .map_err(private_persistence)?
     }
 
     pub(crate) async fn set_global_inspiration_control(
@@ -286,92 +596,127 @@ impl PostgresRepository {
         request_fingerprint: &Sha256Digest,
         now: u64,
     ) -> Result<GlobalInspirationControlProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        let current = sqlx::query(
-            "SELECT schema_version, revision, generation_disabled, updated_at_epoch
-             FROM private_inspiration_global_control WHERE singleton FOR UPDATE",
-        )
-        .fetch_one(&mut *transaction)
+        let now_date = epoch_date(now, "global_control_time_range")?;
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                match load_receipt::<GlobalInspirationControlProjection>(
+                    &receipts,
+                    session,
+                    GLOBAL_COMMAND_SCOPE,
+                    GLOBAL_SCOPE_ID,
+                    command.idempotency_key.as_str(),
+                    "global_control_set",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let current = load_global_control(&receipts, Some(session))
+                    .await?
+                    .unwrap_or_else(default_global_control);
+                if current.revision != command.expected_revision {
+                    return Ok(Err(PrivateInspirationError::RevisionConflict {
+                        expected: command.expected_revision,
+                        current: current.revision,
+                    }));
+                }
+                let revision = current
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        private_schema(
+                            CollectionName::CommandReceipts,
+                            "global control revision overflow",
+                        )
+                    })?;
+                let projection = GlobalInspirationControlProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    revision,
+                    generation_disabled: command.generation_disabled,
+                    updated_at_epoch: now,
+                };
+                write_global_control(
+                    &receipts,
+                    session,
+                    &current,
+                    &projection,
+                    &command,
+                    &request_fingerprint,
+                    now_date,
+                )
+                .await?;
+                if command.generation_disabled {
+                    quarantine_all_private_inspiration_work(
+                        &work,
+                        &presentations,
+                        &audits,
+                        session,
+                        now,
+                        now_date,
+                    )
+                    .await?;
+                }
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    None,
+                    "global_kill_switch",
+                    "campaign",
+                    "global:private-inspiration",
+                    None,
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "operator_id": command.operator_id.as_str(),
+                        "evidence_digest": command.evidence_digest.as_str(),
+                        "generation_disabled": command.generation_disabled,
+                        "revision": inspiration_i64_persistence(revision, CollectionName::CommandReceipts)?,
+                    }),
+                )
+                .await?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    GLOBAL_COMMAND_SCOPE,
+                    GLOBAL_SCOPE_ID,
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "global_control_set",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
         .await
-        .map_err(db)
-        .and_then(global_control_from_row)?;
-        if let Some(row) = sqlx::query(
-            "SELECT request_fingerprint, response_json
-             FROM private_inspiration_global_command_receipts
-             WHERE idempotency_key = $1",
-        )
-        .bind(command.idempotency_key.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        {
-            let stored_fingerprint: String = row.try_get("request_fingerprint").map_err(db)?;
-            if stored_fingerprint != request_fingerprint.as_str() {
-                return Err(PrivateInspirationError::IdempotencyConflict);
-            }
-            let body: String = row.try_get("response_json").map_err(db)?;
-            return serde_json::from_str(&body)
-                .map_err(|_| invalid("stored_global_control_receipt"));
-        }
-        if current.revision != command.expected_revision {
-            return Err(PrivateInspirationError::RevisionConflict {
-                expected: command.expected_revision,
-                current: current.revision,
-            });
-        }
-        let projection = GlobalInspirationControlProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            revision: current
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| invalid("global_control_revision_overflow"))?,
-            generation_disabled: command.generation_disabled,
-            updated_at_epoch: now,
-        };
-        sqlx::query(
-            "UPDATE private_inspiration_global_control
-             SET revision = $1, generation_disabled = $2, operator_id = $3,
-                 evidence_digest = $4, updated_at_epoch = $5
-             WHERE singleton",
-        )
-        .bind(inspiration_to_i64(projection.revision)?)
-        .bind(projection.generation_disabled)
-        .bind(command.operator_id.as_str())
-        .bind(command.evidence_digest.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if command.generation_disabled {
-            quarantine_all_private_inspiration_work(&mut transaction, now).await?;
-        }
-        insert_privacy_audit(
-            &mut transaction,
-            None,
-            "global_kill_switch",
-            "campaign",
-            "global:private-inspiration",
-            None,
-            "applied",
-            now,
-        )
-        .await?;
-        let response_json =
-            serde_json::to_string(&projection).map_err(PrivateInspirationError::Serialization)?;
-        sqlx::query(
-            "INSERT INTO private_inspiration_global_command_receipts
-             (idempotency_key, request_fingerprint, response_json,
-              created_at_epoch) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(command.idempotency_key.as_str())
-        .bind(request_fingerprint.as_str())
-        .bind(response_json)
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
+        .map_err(private_persistence)?
     }
 
     pub(crate) async fn purge_expired_private_inspiration_deletion_tombstones(
@@ -380,2392 +725,894 @@ impl PostgresRepository {
         request_fingerprint: &Sha256Digest,
         now: u64,
     ) -> Result<DeletionTombstonePurgeOutcome, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        sqlx::query(
-            "SELECT revision FROM private_inspiration_global_control
-             WHERE singleton FOR UPDATE",
-        )
-        .fetch_one(&mut *transaction)
+        let now_date = epoch_date(now, "tombstone_purge_time_range")?;
+        let cutoff = epoch_date(
+            command.delete_after_epoch_inclusive,
+            "tombstone_purge_cutoff_range",
+        )?;
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let tombstones = self
+            .store()
+            .document_collection(CollectionName::DeletionTombstones);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let tombstones = tombstones.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                match load_receipt::<DeletionTombstonePurgeOutcome>(
+                    &receipts,
+                    session,
+                    GLOBAL_COMMAND_SCOPE,
+                    GLOBAL_SCOPE_ID,
+                    command.idempotency_key.as_str(),
+                    "tombstone_purge",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(outcome) => return Ok(Ok(outcome)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                serialize_global_operation(&receipts, session, now_date).await?;
+                let mut cursor = tombstones
+                    .find(doc! {
+                        "entity_kind": PARTICIPANT_TOMBSTONE_KIND,
+                        "purge_at": { "$lte": cutoff },
+                    })
+                    .sort(doc! { "entity_id": 1_i64, "_id": 1_i64 })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load expired inspiration tombstones", error)
+                    })?;
+                let mut ids = Vec::new();
+                let mut participant_ids = Vec::new();
+                while cursor.advance(&mut *session).await.map_err(|error| {
+                    PersistenceError::mongo("read expired inspiration tombstones", error)
+                })? {
+                    let document = cursor.deserialize_current().map_err(|_| {
+                        private_schema(
+                            CollectionName::DeletionTombstones,
+                            "tombstone document could not be decoded",
+                        )
+                    })?;
+                    ids.push(required_string(
+                        &document,
+                        "_id",
+                        CollectionName::DeletionTombstones,
+                    )?);
+                    participant_ids.push(required_string(
+                        &document,
+                        "entity_id",
+                        CollectionName::DeletionTombstones,
+                    )?);
+                }
+                if !ids.is_empty() {
+                    tombstones
+                        .delete_many(doc! { "_id": { "$in": &ids } })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("purge inspiration tombstones", error)
+                        })?;
+                }
+                for participant_id in &participant_ids {
+                    insert_privacy_audit(
+                        &audits,
+                        session,
+                        None,
+                        "deletion_tombstone_expired",
+                        "participant",
+                        participant_id,
+                        Some(command.operator_id.as_str()),
+                        "applied",
+                        now_date,
+                        None,
+                    )
+                    .await?;
+                }
+                let outcome = DeletionTombstonePurgeOutcome {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    delete_after_epoch_inclusive: command.delete_after_epoch_inclusive,
+                    purged_count: u32::try_from(ids.len()).map_err(|_| {
+                        private_schema(
+                            CollectionName::DeletionTombstones,
+                            "purged tombstone count exceeds u32",
+                        )
+                    })?,
+                    applied_at_epoch: now,
+                };
+                insert_receipt(
+                    &receipts,
+                    session,
+                    GLOBAL_COMMAND_SCOPE,
+                    GLOBAL_SCOPE_ID,
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "tombstone_purge",
+                    &request_fingerprint,
+                    &outcome,
+                    now_date,
+                )
+                .await?;
+                Ok(Ok(outcome))
+            })
+        })
         .await
-        .map_err(db)?;
-        if let Some(row) = sqlx::query(
-            "SELECT request_fingerprint, response_json
-             FROM private_inspiration_global_command_receipts
-             WHERE idempotency_key = $1",
-        )
-        .bind(command.idempotency_key.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        {
-            let stored_fingerprint: String = row.try_get("request_fingerprint").map_err(db)?;
-            if stored_fingerprint != request_fingerprint.as_str() {
-                return Err(PrivateInspirationError::IdempotencyConflict);
-            }
-            let body: String = row.try_get("response_json").map_err(db)?;
-            return serde_json::from_str(&body)
-                .map_err(|_| invalid("stored_tombstone_purge_receipt"));
-        }
-        let rows = sqlx::query(
-            "DELETE FROM private_inspiration_deletion_tombstones
-             WHERE delete_after_epoch <= $1
-             RETURNING participant_id",
-        )
-        .bind(inspiration_to_i64(command.delete_after_epoch_inclusive)?)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-        for row in &rows {
-            let participant_id: String = row.try_get("participant_id").map_err(db)?;
-            insert_privacy_audit(
-                &mut transaction,
-                None,
-                "deletion_tombstone_expired",
-                "participant",
-                &participant_id,
-                Some(command.operator_id.as_str()),
-                "applied",
-                now,
-            )
-            .await?;
-        }
-        let outcome = DeletionTombstonePurgeOutcome {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            delete_after_epoch_inclusive: command.delete_after_epoch_inclusive,
-            purged_count: u32::try_from(rows.len())
-                .map_err(|_| invalid("purged_tombstone_count_range"))?,
-            applied_at_epoch: now,
-        };
-        let response_json =
-            serde_json::to_string(&outcome).map_err(PrivateInspirationError::Serialization)?;
-        sqlx::query(
-            "INSERT INTO private_inspiration_global_command_receipts
-             (idempotency_key, request_fingerprint, response_json,
-              created_at_epoch) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(command.idempotency_key.as_str())
-        .bind(request_fingerprint.as_str())
-        .bind(response_json)
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        transaction.commit().await.map_err(db)?;
-        Ok(outcome)
+        .map_err(private_persistence)?
     }
 
     pub(crate) async fn load_private_inspiration_campaign_settings(
         &self,
         campaign_session_id: &OpaqueInspirationId,
     ) -> Result<Option<CampaignInspirationSettingsProjection>, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, campaign_session_id.as_str()).await?;
-        let settings =
-            load_settings_for_update(&mut transaction, campaign_session_id.as_str()).await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(settings)
-    }
-
-    pub(crate) async fn set_private_inspiration_campaign_pause(
-        &self,
-        command: &SetCampaignInspirationPauseCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "settings_pause",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let mut settings =
-            load_settings_for_update(&mut transaction, command.campaign_session_id.as_str())
-                .await?
-                .ok_or(PrivateInspirationError::NotFound)?;
-        if settings.revision != command.expected_revision {
-            return Err(PrivateInspirationError::RevisionConflict {
-                expected: command.expected_revision,
-                current: settings.revision,
-            });
-        }
-        settings.revision = settings
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("settings_revision_overflow"))?;
-        settings.generation_paused = command.paused;
-        settings.updated_at_epoch = now;
-        sqlx::query(
-            "UPDATE campaign_inspiration_settings
-             SET revision = $2, generation_paused = $3, updated_at_epoch = $4
-             WHERE campaign_session_id = $1",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(inspiration_to_i64(settings.revision)?)
-        .bind(command.paused)
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "settings_pause",
-            request_fingerprint,
-            &settings,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "settings_changed",
-            "campaign",
-            command.campaign_session_id.as_str(),
-            None,
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(settings)
-    }
-
-    pub(crate) async fn disable_private_inspiration_campaign(
-        &self,
-        command: &DisableCampaignInspirationCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "settings_disable",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let mut settings =
-            load_settings_for_update(&mut transaction, command.campaign_session_id.as_str())
-                .await?
-                .ok_or(PrivateInspirationError::NotFound)?;
-        if settings.revision != command.expected_revision {
-            return Err(PrivateInspirationError::RevisionConflict {
-                expected: command.expected_revision,
-                current: settings.revision,
-            });
-        }
-        settings.revision = settings
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("settings_revision_overflow"))?;
-        settings.enabled = false;
-        settings.generation_paused = false;
-        settings.updated_at_epoch = now;
-        sqlx::query(
-            "UPDATE campaign_inspiration_settings
-             SET revision = $2, enabled = FALSE, generation_paused = FALSE,
-                 updated_at_epoch = $3
-             WHERE campaign_session_id = $1",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(inspiration_to_i64(settings.revision)?)
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        sqlx::query(
-            "UPDATE private_inspiration_consent_grants
-             SET state = 'revoked', revoked_at_epoch = $2,
-                 revocation_code = 'campaign_disabled'
-             WHERE campaign_session_id = $1 AND state = 'active'",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        cancel_campaign_pending_work(&mut transaction, command.campaign_session_id.as_str(), now)
-            .await?;
-        apply_campaign_completed_work_policy(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            now,
-        )
-        .await?;
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "settings_disable",
-            request_fingerprint,
-            &settings,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "settings_changed",
-            "campaign",
-            command.campaign_session_id.as_str(),
-            None,
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(settings)
-    }
-
-    pub(crate) async fn apply_private_inspiration_presentation_control(
-        &self,
-        command: &ApplyPresentationPrivacyCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<PresentationPrivacyOutcome, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "presentation_control",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let row = sqlx::query(
-            "SELECT presentation.privacy_state, work.work_id, work.state,
-                    work.source_id, work.source_version, work.source_digest,
-                    source.category_id
-             FROM generated_text_presentations AS presentation
-             JOIN private_inspiration_derived_work AS work
-               ON work.work_id = presentation.private_inspiration_work_id
-             JOIN private_inspiration_sources AS source
-               ON source.source_id = work.source_id
-              AND source.source_version = work.source_version
-             WHERE presentation.id = $1
-               AND presentation.campaign_session_id = $2
-             FOR UPDATE OF presentation, work",
-        )
-        .bind(command.presentation_id.as_str())
-        .bind(command.campaign_session_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        let work_id = OpaqueInspirationId::new(row.try_get::<String, _>("work_id").map_err(db)?)?;
-        let work_state: String = row.try_get("state").map_err(db)?;
-        if !matches!(work_state.as_str(), "completed" | "redacted") {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        let source_id =
-            OpaqueInspirationId::new(row.try_get::<String, _>("source_id").map_err(db)?)?;
-        let source_version = to_u64(row.try_get("source_version").map_err(db)?)?;
-        let source_digest = stored_digest(row.try_get("source_digest").map_err(db)?)?;
-        let category_id =
-            OpaqueInspirationId::new(row.try_get::<String, _>("category_id").map_err(db)?)?;
-
-        let mut settings_revision = None;
-        match command.action {
-            PresentationPrivacyAction::Veil | PresentationPrivacyAction::Report => {
-                sqlx::query(
-                    "UPDATE generated_text_presentations
-                     SET body = $2, privacy_state = 'redacted',
-                         updated_at = CURRENT_TIMESTAMP
-                     WHERE id = $1",
-                )
-                .bind(command.presentation_id.as_str())
-                .bind(PRIVATE_INSPIRATION_REDACTION_BODY)
-                .execute(&mut *transaction)
-                .await
-                .map_err(db)?;
-                sqlx::query(
-                    "UPDATE private_inspiration_derived_work
-                     SET state = 'redacted'
-                     WHERE work_id = $1 AND state IN ('completed', 'redacted')",
-                )
-                .bind(work_id.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(db)?;
-                let operation = if command.action == PresentationPrivacyAction::Report {
-                    let revision: i64 = sqlx::query_scalar(
-                        "UPDATE campaign_inspiration_settings
-                         SET generation_paused = TRUE, revision = revision + 1,
-                             updated_at_epoch = $2
-                         WHERE campaign_session_id = $1
-                         RETURNING revision",
-                    )
-                    .bind(command.campaign_session_id.as_str())
-                    .bind(inspiration_to_i64(now)?)
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(db)?;
-                    settings_revision = Some(to_u64(revision)?);
-                    "privacy_reported"
-                } else {
-                    "presentation_veiled"
-                };
-                insert_privacy_audit(
-                    &mut transaction,
-                    Some(command.campaign_session_id.as_str()),
-                    operation,
-                    "derived_work",
-                    work_id.as_str(),
-                    Some(command.presentation_id.as_str()),
-                    "applied",
-                    now,
-                )
-                .await?;
-            }
-            PresentationPrivacyAction::VetoSource | PresentationPrivacyAction::VetoCategory => {
-                let scope = if command.action == PresentationPrivacyAction::VetoSource {
-                    InspirationVetoScope::SourceVersion {
-                        source_id,
-                        source_version,
-                        source_digest,
-                    }
-                } else {
-                    InspirationVetoScope::Category { category_id }
-                };
-                insert_owner_veto(
-                    &mut transaction,
-                    command.campaign_session_id.as_str(),
-                    &scope,
-                    command.presentation_id.as_str(),
-                    now,
-                )
-                .await?;
-                cancel_vetoed_pending_work(
-                    &mut transaction,
-                    command.campaign_session_id.as_str(),
-                    &scope,
-                    now,
-                )
-                .await?;
-                apply_vetoed_completed_work_policy(
-                    &mut transaction,
-                    command.campaign_session_id.as_str(),
-                    &scope,
-                    now,
-                )
-                .await?;
-            }
-        }
-        let outcome = PresentationPrivacyOutcome {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            presentation_id: command.presentation_id.clone(),
-            action: command.action,
-            presentation_hidden: true,
-            settings_revision,
-            effective_at_epoch: now,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "presentation_control",
-            request_fingerprint,
-            &outcome,
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(outcome)
-    }
-
-    pub(crate) async fn configure_private_inspiration_campaign(
-        &self,
-        command: &ConfigureCampaignInspirationCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "settings_change",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-
-        let current =
-            load_settings_for_update(&mut transaction, command.campaign_session_id.as_str())
-                .await?;
-        let current_revision = current.as_ref().map_or(0, |settings| settings.revision);
-        if current_revision != command.expected_revision {
-            return Err(PrivateInspirationError::RevisionConflict {
-                expected: command.expected_revision,
-                current: current_revision,
-            });
-        }
-        let revision = current_revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("settings_revision_overflow"))?;
-        let safety_setup_complete = command.safety_setup.is_some();
-        let tone = command
-            .safety_setup
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let campaign = campaigns
+            .find_one(doc! { "_id": campaign_session_id.as_str() })
+            .await
+            .map_err(|error| private_mongo("load private inspiration campaign settings", error))?
+            .ok_or(PrivateInspirationError::NotFound)?;
+        validate_campaign(&campaign)?;
+        campaign
+            .safety
             .as_ref()
-            .map_or(CampaignInspirationTone::GothicAdventure, |setup| setup.tone);
-        let (evidence, reviewer, reviewed_at) =
-            command
-                .safety_setup
-                .as_ref()
-                .map_or((None, None, None), |setup| {
-                    (
-                        Some(setup.evidence_digest.as_str()),
-                        Some(setup.reviewer_id.as_str()),
-                        Some(now),
-                    )
-                });
-
-        sqlx::query(
-            "INSERT INTO campaign_inspiration_settings
-             (campaign_session_id, schema_version, revision, enabled,
-              generation_paused, safety_setup_complete, safety_setup_evidence_digest,
-              safety_reviewer_id, safety_reviewed_at_epoch, tone, updated_at_epoch)
-             VALUES ($1, $2, $3, $4, FALSE, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT (campaign_session_id) DO UPDATE SET
-               schema_version = EXCLUDED.schema_version,
-               revision = EXCLUDED.revision,
-               enabled = EXCLUDED.enabled,
-               generation_paused = FALSE,
-               safety_setup_complete = EXCLUDED.safety_setup_complete,
-               safety_setup_evidence_digest = EXCLUDED.safety_setup_evidence_digest,
-               safety_reviewer_id = EXCLUDED.safety_reviewer_id,
-               safety_reviewed_at_epoch = EXCLUDED.safety_reviewed_at_epoch,
-               tone = EXCLUDED.tone,
-               updated_at_epoch = EXCLUDED.updated_at_epoch",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(inspiration_to_i64(revision)?)
-        .bind(command.enabled)
-        .bind(safety_setup_complete)
-        .bind(evidence)
-        .bind(reviewer)
-        .bind(reviewed_at.map(inspiration_to_i64).transpose()?)
-        .bind(tone.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-
-        replace_campaign_safety_setup(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.safety_setup.as_ref(),
-        )
-        .await?;
-
-        if !command.enabled {
-            sqlx::query(
-                "UPDATE private_inspiration_consent_grants
-                 SET state = 'revoked', revoked_at_epoch = $2,
-                     revocation_code = 'campaign_disabled'
-                 WHERE campaign_session_id = $1 AND state = 'active'",
-            )
-            .bind(command.campaign_session_id.as_str())
-            .bind(inspiration_to_i64(now)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-            cancel_campaign_pending_work(
-                &mut transaction,
-                command.campaign_session_id.as_str(),
-                now,
-            )
-            .await?;
-            apply_campaign_completed_work_policy(
-                &mut transaction,
-                command.campaign_session_id.as_str(),
-                now,
-            )
-            .await?;
-        }
-
-        let projection = CampaignInspirationSettingsProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            campaign_session_id: command.campaign_session_id.clone(),
-            revision,
-            enabled: command.enabled,
-            generation_paused: false,
-            safety_setup_complete,
-            adults_only: true,
-            fictional_distance_locked_high: true,
-            tone,
-            line_count: command
-                .safety_setup
-                .as_ref()
-                .map_or(0, |setup| setup.line_codes.len() as u32),
-            veil_count: command
-                .safety_setup
-                .as_ref()
-                .map_or(0, |setup| setup.veil_codes.len() as u32),
-            excluded_topic_count: command
-                .safety_setup
-                .as_ref()
-                .map_or(0, |setup| setup.excluded_topic_codes.len() as u32),
-            excluded_participant_count: command
-                .safety_setup
-                .as_ref()
-                .map_or(0, |setup| setup.excluded_participant_ids.len() as u32),
-            audience: InspirationAudience::PrivateCampaign,
-            media: InspirationMedia::Text,
-            q11_policy_id: Q11_CONSERVATIVE_POLICY_ID.to_owned(),
-            updated_at_epoch: now,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "settings_change",
-            request_fingerprint,
-            &projection,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "settings_changed",
-            "campaign",
-            command.campaign_session_id.as_str(),
-            None,
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
-    }
-
-    pub(crate) async fn verify_private_inspiration_participant(
-        &self,
-        command: &VerifyParticipantCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<ParticipantVerificationProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "participant_verify",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-
-        sqlx::query(
-            "DELETE FROM private_inspiration_deletion_tombstones
-             WHERE participant_id = $1 AND delete_after_epoch <= $2",
-        )
-        .bind(command.participant_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let deletion_pending: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-               SELECT 1 FROM private_inspiration_deletion_tombstones
-               WHERE participant_id = $1
-             )",
-        )
-        .bind(command.participant_id.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if deletion_pending {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-
-        sqlx::query(
-            "INSERT INTO private_inspiration_participants
-             (participant_id, schema_version, verification_state,
-              verification_method, verification_evidence_digest, verifier_id,
-              verified_at_epoch, revoked_at_epoch)
-             VALUES ($1, $2, 'verified', $3, $4, $5, $6, NULL)
-             ON CONFLICT (participant_id) DO UPDATE SET
-               schema_version = EXCLUDED.schema_version,
-               verification_state = 'verified',
-               verification_method = EXCLUDED.verification_method,
-               verification_evidence_digest = EXCLUDED.verification_evidence_digest,
-               verifier_id = EXCLUDED.verifier_id,
-               verified_at_epoch = EXCLUDED.verified_at_epoch,
-               revoked_at_epoch = NULL",
-        )
-        .bind(command.participant_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.method.as_str())
-        .bind(command.evidence_digest.as_str())
-        .bind(command.verifier_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-
-        let projection = ParticipantVerificationProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            participant_id: command.participant_id.clone(),
-            method: command.method,
-            verified_at_epoch: now,
-            revoked: false,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "participant_verify",
-            request_fingerprint,
-            &projection,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "participant_verified",
-            "participant",
-            command.participant_id.as_str(),
-            None,
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
-    }
-
-    pub(crate) async fn delete_private_inspiration_participant_data(
-        &self,
-        command: &DeleteParticipantPrivateDataCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<ParticipantDeletionOutcome, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "participant_delete",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-
-        let participant_state = sqlx::query_scalar::<_, String>(
-            "SELECT verification_state FROM private_inspiration_participants
-             WHERE participant_id = $1 FOR UPDATE",
-        )
-        .bind(command.participant_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        if !matches!(participant_state.as_str(), "verified" | "revoked") {
-            return Err(invalid("stored_participant_verification_state"));
-        }
-        let tombstone_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-               SELECT 1 FROM private_inspiration_deletion_tombstones
-               WHERE participant_id = $1
-             )",
-        )
-        .bind(command.participant_id.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if tombstone_exists {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-
-        let source_rows = sqlx::query(
-            "SELECT source.source_id, source.source_version
-             FROM private_inspiration_sources AS source
-             JOIN private_inspiration_source_participants AS participant
-               ON participant.source_id = source.source_id
-              AND participant.source_version = source.source_version
-             WHERE participant.participant_id = $1
-             ORDER BY source.source_id, source.source_version
-             FOR UPDATE OF source",
-        )
-        .bind(command.participant_id.as_str())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-
-        sqlx::query(
-            "UPDATE private_inspiration_participants
-             SET verification_state = 'revoked',
-                 verification_evidence_digest = $2,
-                 verifier_id = $3,
-                 revoked_at_epoch = GREATEST(verified_at_epoch, $4)
-             WHERE participant_id = $1",
-        )
-        .bind(command.participant_id.as_str())
-        .bind(command.deletion_evidence_digest.as_str())
-        .bind(command.operator_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-
-        let revoked_grants = sqlx::query(
-            "UPDATE private_inspiration_consent_grants
-             SET state = 'revoked',
-                 revoked_at_epoch = GREATEST(granted_at_epoch, $2),
-                 revocation_code = 'privacy_request'
-             WHERE participant_id = $1 AND state IN ('active', 'expired')",
-        )
-        .bind(command.participant_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?
-        .rows_affected();
-
-        for row in &source_rows {
-            let source_id: String = row.try_get("source_id").map_err(db)?;
-            let source_version: i64 = row.try_get("source_version").map_err(db)?;
-            let source_version_text = source_version.to_string();
-            sqlx::query(
-                "UPDATE private_inspiration_sources
-                 SET review_state = 'quarantined', q11_screened = FALSE,
-                     review_evidence_digest = $3, reviewer_id = $4,
-                     reviewed_at_epoch = $5
-                 WHERE source_id = $1 AND source_version = $2",
-            )
-            .bind(&source_id)
-            .bind(source_version)
-            .bind(command.deletion_evidence_digest.as_str())
-            .bind(command.operator_id.as_str())
-            .bind(inspiration_to_i64(now)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-            insert_privacy_audit(
-                &mut transaction,
-                Some(command.campaign_session_id.as_str()),
-                "source_quarantined",
-                "source_version",
-                &source_id,
-                Some(&source_version_text),
-                "applied",
-                now,
-            )
-            .await?;
-        }
-
-        let pending_rows = sqlx::query(
-            "UPDATE private_inspiration_derived_work AS work
-             SET state = 'cancellation_requested',
-                 cancellation_requested_at_epoch = GREATEST(work.created_at_epoch, $2)
-             FROM private_inspiration_source_participants AS participant
-             WHERE participant.participant_id = $1
-               AND participant.source_id = work.source_id
-               AND participant.source_version = work.source_version
-               AND work.state = 'pending'
-             RETURNING work.campaign_session_id, work.work_id",
-        )
-        .bind(command.participant_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let mut pending_work_cancellation_ids = Vec::with_capacity(pending_rows.len());
-        for row in pending_rows {
-            let campaign_id: String = row.try_get("campaign_session_id").map_err(db)?;
-            let work_id =
-                OpaqueInspirationId::new(row.try_get::<String, _>("work_id").map_err(db)?)?;
-            insert_privacy_audit(
-                &mut transaction,
-                Some(&campaign_id),
-                "derived_work_cancel_requested",
-                "derived_work",
-                work_id.as_str(),
-                None,
-                "cancel_requested",
-                now,
-            )
-            .await?;
-            pending_work_cancellation_ids.push(work_id);
-        }
-        pending_work_cancellation_ids.sort();
-
-        let completed_rows = sqlx::query(
-            "SELECT work.campaign_session_id, work.work_id,
-                    work.artifact_policy, work.completed_artifact_id
-             FROM private_inspiration_derived_work AS work
-             JOIN private_inspiration_source_participants AS participant
-               ON participant.source_id = work.source_id
-              AND participant.source_version = work.source_version
-             WHERE participant.participant_id = $1
-               AND work.state IN ('completed', 'redacted')
-             ORDER BY work.campaign_session_id, work.work_id
-             FOR UPDATE OF work",
-        )
-        .bind(command.participant_id.as_str())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let affected_completed_artifact_count = u32::try_from(completed_rows.len())
-            .map_err(|_| invalid("completed_artifact_count_range"))?;
-        let mut completed_by_campaign = BTreeMap::<String, Vec<PgRow>>::new();
-        for row in completed_rows {
-            let campaign_id: String = row.try_get("campaign_session_id").map_err(db)?;
-            completed_by_campaign
-                .entry(campaign_id)
-                .or_default()
-                .push(row);
-        }
-        for (campaign_id, rows) in completed_by_campaign {
-            apply_completed_work_policy(&mut transaction, &campaign_id, rows, now).await?;
-        }
-
-        let tombstone_delete_after_epoch = now
-            .checked_add(PARTICIPANT_DELETION_TOMBSTONE_SECONDS)
-            .ok_or_else(|| invalid("deletion_tombstone_expiry_overflow"))?;
-        sqlx::query(
-            "INSERT INTO private_inspiration_deletion_tombstones
-             (participant_id, schema_version, requested_by_operator_id,
-              deletion_evidence_digest, requested_at_epoch, delete_after_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(command.participant_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.operator_id.as_str())
-        .bind(command.deletion_evidence_digest.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .bind(inspiration_to_i64(tombstone_delete_after_epoch)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-
-        let outcome = ParticipantDeletionOutcome {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            participant_id: command.participant_id.clone(),
-            revoked_grant_count: u32::try_from(revoked_grants)
-                .map_err(|_| invalid("revoked_grant_count_range"))?,
-            quarantined_source_count: u32::try_from(source_rows.len())
-                .map_err(|_| invalid("quarantined_source_count_range"))?,
-            pending_work_cancellation_ids,
-            affected_completed_artifact_count,
-            effective_at_epoch: now,
-            tombstone_delete_after_epoch,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "participant_delete",
-            request_fingerprint,
-            &outcome,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "participant_deletion_requested",
-            "participant",
-            command.participant_id.as_str(),
-            None,
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(outcome)
-    }
-
-    pub(crate) async fn register_private_inspiration_source(
-        &self,
-        command: &RegisterSourceVersionCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<SourceVersionProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "source_register",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        for participant in &command.participant_ids {
-            ensure_verified_participant(&mut transaction, participant.as_str()).await?;
-        }
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-               SELECT 1 FROM private_inspiration_sources
-               WHERE source_id = $1 AND source_version = $2
-             )",
-        )
-        .bind(command.source_id.as_str())
-        .bind(inspiration_to_i64(command.source_version)?)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if exists {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-
-        sqlx::query(
-            "INSERT INTO private_inspiration_sources
-             (source_id, source_version, source_digest, schema_version,
-              category_id, owner_participant_id, review_state, q11_screened,
-              audience, transformation, provenance_digest, expires_at_epoch,
-              registered_at_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, 'pending', FALSE,
-                     'private_campaign', 'high_fiction_distance_v1', $7, $8, $9)",
-        )
-        .bind(command.source_id.as_str())
-        .bind(inspiration_to_i64(command.source_version)?)
-        .bind(command.source_digest.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.category_id.as_str())
-        .bind(command.owner_participant_id.as_str())
-        .bind(command.provenance_digest.as_str())
-        .bind(
-            command
-                .expires_at_epoch
-                .map(inspiration_to_i64)
-                .transpose()?,
-        )
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let runtime_projection_digest = fingerprint(&command.runtime_prompt)?;
-        sqlx::query(
-            "INSERT INTO private_inspiration_runtime_prompts
-             (source_id, source_version, source_digest, schema_version,
-              selection_weight_nanounits, minimum_level, maximum_level,
-              cooldown_turns, enabled, projection_digest)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .bind(command.source_id.as_str())
-        .bind(inspiration_to_i64(command.source_version)?)
-        .bind(command.source_digest.as_str())
-        .bind(i64::from(command.runtime_prompt.schema_version))
-        .bind(inspiration_to_i64(
-            command.runtime_prompt.selection_weight_nanounits,
-        )?)
-        .bind(i16::from(command.runtime_prompt.minimum_level))
-        .bind(command.runtime_prompt.maximum_level.map(i16::from))
-        .bind(inspiration_to_i64(command.runtime_prompt.cooldown_turns)?)
-        .bind(command.runtime_prompt.enabled)
-        .bind(runtime_projection_digest.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        for (index, fact) in command.runtime_prompt.neutral_facts.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO private_inspiration_runtime_facts
-                 (source_id, source_version, fact_index, neutral_fact)
-                 VALUES ($1, $2, $3, $4)",
-            )
-            .bind(command.source_id.as_str())
-            .bind(inspiration_to_i64(command.source_version)?)
-            .bind(i16::try_from(index + 1).map_err(|_| invalid("runtime_fact_index"))?)
-            .bind(fact)
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-        for participant in &command.participant_ids {
-            sqlx::query(
-                "INSERT INTO private_inspiration_source_participants
-                 (source_id, source_version, participant_id) VALUES ($1, $2, $3)",
-            )
-            .bind(command.source_id.as_str())
-            .bind(inspiration_to_i64(command.source_version)?)
-            .bind(participant.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-        for sensitivity in &command.sensitivity_codes {
-            sqlx::query(
-                "INSERT INTO private_inspiration_source_sensitivities
-                 (source_id, source_version, sensitivity_code) VALUES ($1, $2, $3)",
-            )
-            .bind(command.source_id.as_str())
-            .bind(inspiration_to_i64(command.source_version)?)
-            .bind(sensitivity.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-        for media in &command.eligible_media {
-            sqlx::query(
-                "INSERT INTO private_inspiration_source_media
-                 (source_id, source_version, media) VALUES ($1, $2, $3)",
-            )
-            .bind(command.source_id.as_str())
-            .bind(inspiration_to_i64(command.source_version)?)
-            .bind(media.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-        for theme_pack_id in &command.eligible_theme_pack_ids {
-            sqlx::query(
-                "INSERT INTO private_inspiration_source_themes
-                 (source_id, source_version, theme_pack_id) VALUES ($1, $2, $3)",
-            )
-            .bind(command.source_id.as_str())
-            .bind(inspiration_to_i64(command.source_version)?)
-            .bind(theme_pack_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-
-        let projection = SourceVersionProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            source_id: command.source_id.clone(),
-            source_version: command.source_version,
-            source_digest: command.source_digest.clone(),
-            category_id: command.category_id.clone(),
-            review_state: SourceReviewState::Pending,
-            q11_screened: false,
-            participant_count: u32::try_from(command.participant_ids.len())
-                .map_err(|_| invalid("participant_count_range"))?,
-            sensitivity_count: u32::try_from(command.sensitivity_codes.len())
-                .map_err(|_| invalid("sensitivity_count_range"))?,
-            eligible_media: command.eligible_media.clone(),
-            eligible_theme_pack_ids: command.eligible_theme_pack_ids.clone(),
-            expires_at_epoch: command.expires_at_epoch,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "source_register",
-            request_fingerprint,
-            &projection,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "source_registered",
-            "source_version",
-            command.source_id.as_str(),
-            Some(&command.source_version.to_string()),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
-    }
-
-    pub(crate) async fn review_private_inspiration_source(
-        &self,
-        command: &ReviewSourceVersionCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<SourceVersionProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "source_review",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let source = load_source_for_update(
-            &mut transaction,
-            command.source_id.as_str(),
-            command.source_version,
-        )
-        .await?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        if source.projection.source_digest != command.source_digest
-            || source.projection.review_state != SourceReviewState::Pending
-        {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        sqlx::query(
-            "UPDATE private_inspiration_sources
-             SET review_state = $3, q11_screened = $4,
-                 review_evidence_digest = $5, reviewer_id = $6,
-                 reviewed_at_epoch = $7
-             WHERE source_id = $1 AND source_version = $2",
-        )
-        .bind(command.source_id.as_str())
-        .bind(inspiration_to_i64(command.source_version)?)
-        .bind(command.decision.as_str())
-        .bind(command.q11_screened)
-        .bind(command.review_evidence_digest.as_str())
-        .bind(command.reviewer_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-
-        let mut projection = source.projection;
-        projection.review_state = command.decision;
-        projection.q11_screened = command.q11_screened;
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "source_review",
-            request_fingerprint,
-            &projection,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "source_reviewed",
-            "source_version",
-            command.source_id.as_str(),
-            Some(&command.source_version.to_string()),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
-    }
-
-    pub(crate) async fn abandon_private_inspiration_derived_work(
-        &self,
-        campaign_session_id: &OpaqueInspirationId,
-        work_id: &OpaqueInspirationId,
-        now: u64,
-    ) -> Result<(), PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, campaign_session_id.as_str()).await?;
-        let state: String = sqlx::query_scalar(
-            "SELECT state FROM private_inspiration_derived_work
-             WHERE work_id = $1 AND campaign_session_id = $2 FOR UPDATE",
-        )
-        .bind(work_id.as_str())
-        .bind(campaign_session_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        match state.as_str() {
-            "pending" => {
-                sqlx::query(
-                    "UPDATE private_inspiration_derived_work
-                     SET state = 'cancellation_requested',
-                         cancellation_requested_at_epoch = $2
-                     WHERE work_id = $1",
-                )
-                .bind(work_id.as_str())
-                .bind(inspiration_to_i64(now)?)
-                .execute(&mut *transaction)
-                .await
-                .map_err(db)?;
-                insert_privacy_audit(
-                    &mut transaction,
-                    Some(campaign_session_id.as_str()),
-                    "derived_work_cancel_requested",
-                    "derived_work",
-                    work_id.as_str(),
-                    None,
-                    "cancel_requested",
-                    now,
-                )
-                .await?;
-            }
-            "cancellation_requested" | "redacted" | "deleted" => {}
-            "completed" => return Err(PrivateInspirationError::ScopeDenied),
-            _ => return Err(invalid("stored_derived_work_state")),
-        }
-        transaction.commit().await.map_err(db)
+            .map(|safety| safety.projection(&campaign.id))
+            .transpose()
     }
 }
 
-impl PostgresRepository {
-    pub(crate) async fn reserve_private_inspiration_selection(
-        &self,
-        deployment_enabled: bool,
-        command: &RequestInspirationSelectionCommand,
-        authority: &ResolvedInspirationSelectionAuthority,
-        prompts: &[EventPrompt],
-        now: u64,
-    ) -> Result<PrivateInspirationSelection, PrivateInspirationError> {
-        let request_fingerprint = fingerprint(command)?;
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        let campaign =
-            lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_selection_replay(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            &request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        if campaign.revision != command.expected_campaign_revision {
-            return Err(PrivateInspirationError::RevisionConflict {
-                expected: command.expected_campaign_revision,
-                current: campaign.revision,
-            });
-        }
-        let settings =
-            load_settings_for_update(&mut transaction, command.campaign_session_id.as_str())
-                .await?
-                .ok_or(PrivateInspirationError::NotFound)?;
-        if settings.revision != command.expected_settings_revision {
-            return Err(PrivateInspirationError::RevisionConflict {
-                expected: command.expected_settings_revision,
-                current: settings.revision,
-            });
-        }
-        let global_generation_disabled: bool = sqlx::query_scalar(
-            "SELECT generation_disabled FROM private_inspiration_global_control
-             WHERE singleton FOR SHARE",
-        )
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let (turn_number, trigger_window_id) =
-            trusted_trigger_window(&mut transaction, &campaign).await?;
-        let cursor: u64 = to_u64(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT rng_cursor FROM campaign_inspiration_settings
-                 WHERE campaign_session_id = $1",
-            )
-            .bind(command.campaign_session_id.as_str())
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(db)?,
-        )?;
-
-        let early_reason = if !deployment_enabled {
-            Some(DurableNoSelectionReason::DeploymentDisabled)
-        } else if global_generation_disabled {
-            Some(DurableNoSelectionReason::GlobalKillSwitch)
-        } else if !settings.enabled {
-            Some(DurableNoSelectionReason::CampaignDisabled)
-        } else if settings.generation_paused {
-            Some(DurableNoSelectionReason::CampaignPaused)
-        } else if !settings.safety_setup_complete {
-            Some(DurableNoSelectionReason::SafetyIncomplete)
-        } else {
-            None
-        };
-
-        let mut selected_source_version = None;
-        let (audit, durable_no_selection_reason, selected_cooldown) = if let Some(reason) =
-            early_reason
-        {
-            let audit = empty_selection_audit(authority.seed, cursor)?;
-            (audit, Some(reason), None)
-        } else {
-            let party_level =
-                trusted_party_level(&mut transaction, command.campaign_session_id.as_str()).await?;
-            let theme_pack_id =
-                trusted_theme_pack_id(&mut transaction, command.campaign_session_id.as_str())
-                    .await?;
-            let allowed_sensitivities =
-                load_allowed_sensitivities(&mut transaction, command.campaign_session_id.as_str())
-                    .await?;
-            let (excluded_safety_codes, excluded_participants) = load_campaign_safety_exclusions(
-                &mut transaction,
-                command.campaign_session_id.as_str(),
-            )
-            .await?;
-            let source_rows = sqlx::query(
-                "SELECT DISTINCT source.source_id, source.source_version
-                     FROM private_inspiration_sources AS source
-                     JOIN private_inspiration_source_media AS media
-                       ON media.source_id = source.source_id
-                      AND media.source_version = source.source_version
-                     WHERE source.review_state = 'approved' AND source.q11_screened
-                       AND media.media = $1
-                       AND (source.expires_at_epoch IS NULL OR source.expires_at_epoch > $2)
-                     ORDER BY source.source_id, source.source_version",
-            )
-            .bind(command.media.as_str())
-            .bind(inspiration_to_i64(now)?)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(db)?;
-            let mut authenticated_prompts = Vec::new();
-            let mut source_versions = BTreeMap::<(String, String), u64>::new();
-            let mut consenting_participants = BTreeSet::new();
-            for row in source_rows {
-                let source_id: String = row.try_get("source_id").map_err(db)?;
-                let source_version = to_u64(row.try_get("source_version").map_err(db)?)?;
-                let source = load_source_for_update(&mut transaction, &source_id, source_version)
-                    .await?
-                    .ok_or_else(|| invalid("source_disappeared_during_selection"))?;
-                if !source.sensitivities.is_subset(&allowed_sensitivities)
-                    || !source.sensitivities.is_disjoint(&excluded_safety_codes)
-                    || !source.participants.is_disjoint(&excluded_participants)
-                    || !source.theme_pack_ids.contains(&theme_pack_id)
-                    || source_is_vetoed(
-                        &mut transaction,
-                        command.campaign_session_id.as_str(),
-                        &source,
-                    )
-                    .await?
-                    || !all_source_participants_verified(&mut transaction, &source).await?
-                    || !source_has_complete_consent(&mut transaction, command, &source, now).await?
-                {
-                    continue;
-                }
-                let Some(prompt) = prompts.iter().find(|prompt| {
-                    prompt.privacy_source_id() == source.projection.source_id.as_str()
-                        && prompt.source_digest() == &source.projection.source_digest
-                        && prompt.metadata.enabled
-                        && normalized_set(&prompt.metadata.sensitivity_tags)
-                            == normalized_stored_set(&source.sensitivities)
-                        && normalized_set(&prompt.metadata.participant_aliases)
-                            == normalized_stored_set(&source.participants)
-                }) else {
-                    continue;
-                };
-                source_versions.insert(
-                    (
-                        source.projection.source_id.as_str().to_owned(),
-                        source.projection.source_digest.as_str().to_owned(),
-                    ),
-                    source.projection.source_version,
-                );
-                consenting_participants.extend(normalized_stored_set(&source.participants));
-                authenticated_prompts.push(prompt.clone());
-            }
-            let last_triggered_turn =
-                load_last_triggered_turns(&mut transaction, command.campaign_session_id.as_str())
-                    .await?;
-            let normalized_allowed = normalized_stored_set(&allowed_sensitivities);
-            let context = EventEligibility {
-                inspiration_enabled: true,
-                party_level,
-                current_turn: turn_number,
-                allowed_sensitivity_tags: &normalized_allowed,
-                consenting_participant_aliases: &consenting_participants,
-                last_triggered_turn: &last_triggered_turn,
-            };
-            let mut random = DeterministicEventRandom::new(authority.seed, cursor);
-            let selected = EventPromptLoader
-                .select_with_audit(&authenticated_prompts, &context, &mut random)
-                .map_err(PrivateInspirationError::Selection)?;
-            let selected_cooldown = selected.prompt.map(|prompt| prompt.metadata.cooldown_turns);
-            if let (Some(source_id), Some(source_digest)) = (
-                selected.audit.selected_source_id.as_ref(),
-                selected.audit.selected_source_digest.as_ref(),
-            ) {
-                selected_source_version = source_versions
-                    .get(&(source_id.clone(), source_digest.as_str().to_owned()))
-                    .copied();
-                if selected_source_version.is_none() {
-                    return Err(invalid("selected_source_version_missing"));
-                }
-            }
-            let reason = selected
-                .prompt
-                .is_none()
-                .then_some(DurableNoSelectionReason::NoEligibleSources);
-            (selected.audit, reason, selected_cooldown)
-        };
-
-        let selection_id = internal_id("inspiration-selection")?;
-        persist_selection(
-            &mut transaction,
-            &selection_id,
-            command,
-            &request_fingerprint,
-            authority,
-            &trigger_window_id,
-            turn_number,
-            selected_source_version,
-            durable_no_selection_reason,
-            &audit,
-            now,
-        )
-        .await?;
-        if let (Some(source_id), Some(source_version), Some(source_digest), Some(cooldown)) = (
-            audit.selected_source_id.as_deref(),
-            selected_source_version,
-            audit.selected_source_digest.as_ref(),
-            selected_cooldown,
-        ) {
-            let next_eligible_turn = turn_number
-                .checked_add(cooldown)
-                .ok_or_else(|| invalid("cooldown_turn_overflow"))?;
-            if next_eligible_turn <= turn_number {
-                return Err(invalid("selected_source_cooldown"));
-            }
-            sqlx::query(
-                "INSERT INTO private_inspiration_source_usage
-                 (selection_id, campaign_session_id, source_id, source_version,
-                  source_digest, turn_number, next_eligible_turn, created_at_epoch)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            )
-            .bind(selection_id.as_str())
-            .bind(command.campaign_session_id.as_str())
-            .bind(source_id)
-            .bind(inspiration_to_i64(source_version)?)
-            .bind(source_digest.as_str())
-            .bind(inspiration_to_i64(turn_number)?)
-            .bind(inspiration_to_i64(next_eligible_turn)?)
-            .bind(inspiration_to_i64(now)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-        sqlx::query(
-            "UPDATE campaign_inspiration_settings SET rng_cursor = $2
-             WHERE campaign_session_id = $1",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(inspiration_to_i64(audit.cursor_after)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "selection_reserved",
-            "selection",
-            selection_id.as_str(),
-            audit.selected_source_id.as_deref(),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(PrivateInspirationSelection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            selection_id,
-            campaign_session_id: command.campaign_session_id.clone(),
-            source_version: selected_source_version,
-            durable_no_selection_reason,
-            audit,
-            created_at_epoch: now,
-        })
-    }
-
-    pub(crate) async fn load_private_inspiration_redacted_export(
-        &self,
-        campaign_session_id: &OpaqueInspirationId,
-        requesting_participant_id: &OpaqueInspirationId,
-    ) -> Result<CampaignInspirationRedactedExportV1, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, campaign_session_id.as_str()).await?;
-        ensure_verified_participant(&mut transaction, requesting_participant_id.as_str()).await?;
-        let settings = load_settings_for_update(&mut transaction, campaign_session_id.as_str())
-            .await?
-            .ok_or(PrivateInspirationError::NotFound)?;
-        let grant_rows = sqlx::query(
-            "SELECT grant_id, schema_version, source_id, source_version,
-                    source_digest, participant_id, audience, media, transformation,
-                    artifact_policy, expires_at_epoch, state
-             FROM private_inspiration_consent_grants
-             WHERE campaign_session_id = $1 AND participant_id = $2
-             ORDER BY source_id, source_version, grant_id",
-        )
-        .bind(campaign_session_id.as_str())
-        .bind(requesting_participant_id.as_str())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if grant_rows.is_empty() {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        let mut requester_grants = Vec::with_capacity(grant_rows.len());
-        let mut source_keys = BTreeSet::new();
-        for row in grant_rows {
-            let projection = consent_projection_from_row(row)?;
-            source_keys.insert((
-                projection.source_id.as_str().to_owned(),
-                projection.source_version,
-            ));
-            requester_grants.push(projection);
-        }
-        let mut sources = Vec::with_capacity(source_keys.len());
-        for (source_id, source_version) in source_keys {
-            let source = load_source_for_update(&mut transaction, &source_id, source_version)
-                .await?
-                .ok_or_else(|| invalid("export_source_missing"))?;
-            if !source
-                .participants
-                .contains(requesting_participant_id.as_str())
-            {
-                return Err(invalid("export_participant_scope"));
-            }
-            sources.push(source.projection);
-        }
-        transaction.commit().await.map_err(db)?;
-        Ok(CampaignInspirationRedactedExportV1 {
-            schema_version: PRIVATE_INSPIRATION_EXPORT_SCHEMA_VERSION,
-            campaign_session_id: campaign_session_id.clone(),
-            requesting_participant_id: requesting_participant_id.clone(),
-            settings,
-            sources,
-            requester_grants,
-        })
-    }
+fn string_set(values: Option<&BTreeSet<OpaqueInspirationId>>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(BTreeSet::iter)
+        .map(ToString::to_string)
+        .collect()
 }
 
-impl PostgresRepository {
-    pub(crate) async fn grant_private_inspiration_consent(
-        &self,
-        command: &GrantConsentCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<ConsentGrantProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "consent_grant",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let settings =
-            load_settings_for_update(&mut transaction, command.campaign_session_id.as_str())
-                .await?
-                .ok_or(PrivateInspirationError::ScopeDenied)?;
-        if !settings.enabled || !settings.safety_setup_complete {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        ensure_verified_participant(&mut transaction, command.participant_id.as_str()).await?;
-        let source = load_source_for_update(
-            &mut transaction,
-            command.source_id.as_str(),
-            command.source_version,
-        )
-        .await?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        let command_sensitivities = command
-            .sensitivity_codes
-            .iter()
-            .map(|code| code.as_str().to_owned())
-            .collect::<BTreeSet<_>>();
-        let allowed_sensitivities =
-            load_allowed_sensitivities(&mut transaction, command.campaign_session_id.as_str())
-                .await?;
-        if source.projection.source_digest != command.source_digest
-            || source.projection.review_state != SourceReviewState::Approved
-            || !source.projection.q11_screened
-            || source
-                .projection
-                .expires_at_epoch
-                .is_some_and(|expiry| expiry <= now)
-            || !source
-                .participants
-                .contains(command.participant_id.as_str())
-            || !source.projection.eligible_media.contains(&command.media)
-            || source.sensitivities != command_sensitivities
-            || !source.sensitivities.is_subset(&allowed_sensitivities)
-            || source_is_vetoed(
-                &mut transaction,
-                command.campaign_session_id.as_str(),
-                &source,
-            )
-            .await?
-        {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-
-        sqlx::query(
-            "UPDATE private_inspiration_consent_grants
-             SET state = 'expired'
-             WHERE campaign_session_id = $1 AND state = 'active'
-               AND expires_at_epoch <= $2",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let active_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-               SELECT 1 FROM private_inspiration_consent_grants
-               WHERE campaign_session_id = $1 AND source_id = $2
-                 AND source_version = $3 AND participant_id = $4
-                 AND audience = $5 AND media = $6 AND transformation = $7
-                 AND state = 'active'
-             )",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(command.source_id.as_str())
-        .bind(inspiration_to_i64(command.source_version)?)
-        .bind(command.participant_id.as_str())
-        .bind(command.audience.as_str())
-        .bind(command.media.as_str())
-        .bind(command.transformation.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if active_exists {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-
-        let grant_id = internal_id("consent-grant")?;
-        sqlx::query(
-            "INSERT INTO private_inspiration_consent_grants
-             (grant_id, schema_version, campaign_session_id, source_id,
-              source_version, source_digest, participant_id, audience, media,
-              transformation, artifact_policy, reviewer_id,
-              participant_confirmation_digest, review_evidence_digest, state,
-              granted_at_epoch, expires_at_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                     $12, $13, $14, 'active', $15, $16)",
-        )
-        .bind(grant_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.campaign_session_id.as_str())
-        .bind(command.source_id.as_str())
-        .bind(inspiration_to_i64(command.source_version)?)
-        .bind(command.source_digest.as_str())
-        .bind(command.participant_id.as_str())
-        .bind(command.audience.as_str())
-        .bind(command.media.as_str())
-        .bind(command.transformation.as_str())
-        .bind(command.artifact_policy.as_str())
-        .bind(command.reviewer_id.as_str())
-        .bind(command.participant_confirmation_digest.as_str())
-        .bind(command.review_evidence_digest.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .bind(inspiration_to_i64(command.expires_at_epoch)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        for sensitivity in &command.sensitivity_codes {
-            sqlx::query(
-                "INSERT INTO private_inspiration_consent_sensitivities
-                 (grant_id, sensitivity_code) VALUES ($1, $2)",
-            )
-            .bind(grant_id.as_str())
-            .bind(sensitivity.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(db)?;
-        }
-
-        let projection = ConsentGrantProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            grant_id,
-            source_id: command.source_id.clone(),
-            source_version: command.source_version,
-            source_digest: command.source_digest.clone(),
-            participant_id: command.participant_id.clone(),
-            audience: command.audience,
-            media: command.media,
-            transformation: command.transformation,
-            artifact_policy: command.artifact_policy,
-            expires_at_epoch: command.expires_at_epoch,
-            state: ConsentGrantState::Active,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "consent_grant",
-            request_fingerprint,
-            &projection,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "consent_granted",
-            "consent_grant",
-            projection.grant_id.as_str(),
-            Some(command.source_id.as_str()),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
+fn validated_stored_ids(values: &[String]) -> Result<BTreeSet<String>, PrivateInspirationError> {
+    let unique = values.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.len() != values.len() {
+        return Err(invalid("stored_duplicate_identifier"));
     }
-
-    pub(crate) async fn revoke_private_inspiration_consent(
-        &self,
-        command: &RevokeConsentCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<PrivacyTransitionOutcome, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "consent_revoke",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let row = sqlx::query(
-            "SELECT campaign_session_id, source_id, source_version,
-                    participant_id, state
-             FROM private_inspiration_consent_grants
-             WHERE grant_id = $1 FOR UPDATE",
-        )
-        .bind(command.grant_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        let campaign: String = row.try_get("campaign_session_id").map_err(db)?;
-        let participant: String = row.try_get("participant_id").map_err(db)?;
-        let state: String = row.try_get("state").map_err(db)?;
-        if campaign != command.campaign_session_id.as_str()
-            || participant != command.requester_participant_id.as_str()
-            || state == "revoked"
-        {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        let source_id: String = row.try_get("source_id").map_err(db)?;
-        let source_version = to_u64(row.try_get("source_version").map_err(db)?)?;
-        sqlx::query(
-            "UPDATE private_inspiration_consent_grants
-             SET state = 'revoked', revoked_at_epoch = $2, revocation_code = $3
-             WHERE grant_id = $1",
-        )
-        .bind(command.grant_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .bind(command.reason.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let pending_work_cancellation_ids = cancel_source_pending_work(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            &source_id,
-            source_version,
-            now,
-        )
-        .await?;
-        apply_source_completed_work_policy(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            &source_id,
-            source_version,
-            now,
-        )
-        .await?;
-        let outcome = PrivacyTransitionOutcome {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            subject_id: command.grant_id.clone(),
-            pending_work_cancellation_ids,
-            effective_at_epoch: now,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "consent_revoke",
-            request_fingerprint,
-            &outcome,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "consent_revoked",
-            "consent_grant",
-            command.grant_id.as_str(),
-            Some(command.requester_participant_id.as_str()),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(outcome)
+    for value in &unique {
+        OpaqueInspirationId::new(value.clone())?;
     }
-
-    pub(crate) async fn apply_private_inspiration_veto(
-        &self,
-        command: &ApplyInspirationVetoCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<(VetoProjection, PrivacyTransitionOutcome), PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt::<VetoReceipt>(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "veto_apply",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok((replay.veto, replay.transition));
-        }
-        ensure_verified_participant(&mut transaction, command.participant_id.as_str()).await?;
-        if let InspirationVetoScope::SourceVersion {
-            source_id,
-            source_version,
-            source_digest,
-        } = &command.scope
-        {
-            let source =
-                load_source_for_update(&mut transaction, source_id.as_str(), *source_version)
-                    .await?
-                    .ok_or(PrivateInspirationError::NotFound)?;
-            if source.projection.source_digest != *source_digest
-                || !source
-                    .participants
-                    .contains(command.participant_id.as_str())
-            {
-                return Err(PrivateInspirationError::ScopeDenied);
-            }
-        }
-        let veto_id = internal_id("inspiration-veto")?;
-        let (scope_kind, category_id, source_id, source_version, source_digest) =
-            match &command.scope {
-                InspirationVetoScope::Campaign => ("campaign", None, None, None, None),
-                InspirationVetoScope::Category { category_id } => {
-                    ("category", Some(category_id.as_str()), None, None, None)
-                }
-                InspirationVetoScope::SourceVersion {
-                    source_id,
-                    source_version,
-                    source_digest,
-                } => (
-                    "source_version",
-                    None,
-                    Some(source_id.as_str()),
-                    Some(inspiration_to_i64(*source_version)?),
-                    Some(source_digest.as_str()),
-                ),
-            };
-        sqlx::query(
-            "INSERT INTO private_inspiration_vetoes
-             (veto_id, schema_version, campaign_session_id, participant_id,
-              scope_kind, category_id, source_id, source_version, source_digest,
-              veto_code, created_at_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        )
-        .bind(veto_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.campaign_session_id.as_str())
-        .bind(command.participant_id.as_str())
-        .bind(scope_kind)
-        .bind(category_id)
-        .bind(source_id)
-        .bind(source_version)
-        .bind(source_digest)
-        .bind(command.code.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let pending_work_cancellation_ids = cancel_vetoed_pending_work(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            &command.scope,
-            now,
-        )
-        .await?;
-        apply_vetoed_completed_work_policy(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            &command.scope,
-            now,
-        )
-        .await?;
-        let veto = VetoProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            veto_id: veto_id.clone(),
-            campaign_session_id: command.campaign_session_id.clone(),
-            participant_id: command.participant_id.clone(),
-            scope: command.scope.clone(),
-            code: command.code,
-            created_at_epoch: now,
-        };
-        let transition = PrivacyTransitionOutcome {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            subject_id: veto_id,
-            pending_work_cancellation_ids,
-            effective_at_epoch: now,
-        };
-        let receipt = VetoReceipt {
-            veto: veto.clone(),
-            transition: transition.clone(),
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "veto_apply",
-            request_fingerprint,
-            &receipt,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "veto_applied",
-            "veto",
-            veto.veto_id.as_str(),
-            Some(command.participant_id.as_str()),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok((veto, transition))
-    }
-
-    pub(crate) async fn register_private_inspiration_derived_work(
-        &self,
-        command: &RegisterDerivedWorkCommand,
-        request_fingerprint: &Sha256Digest,
-        now: u64,
-    ) -> Result<DerivedWorkProjection, PrivateInspirationError> {
-        let mut transaction = self.pool.begin().await.map_err(db)?;
-        lock_campaign(&mut transaction, command.campaign_session_id.as_str()).await?;
-        if let Some(replay) = load_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "derived_work_register",
-            request_fingerprint,
-        )
-        .await?
-        {
-            return Ok(replay);
-        }
-        let row = sqlx::query(
-            "SELECT selected_source_id AS source_id, selected_source_version AS source_version,
-                    selected_source_digest AS source_digest, media
-             FROM private_inspiration_selection_audits
-             WHERE selection_id = $1 AND campaign_session_id = $2
-               AND selected_source_id IS NOT NULL
-             FOR UPDATE",
-        )
-        .bind(command.selection_id.as_str())
-        .bind(command.campaign_session_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db)?
-        .ok_or(PrivateInspirationError::NotFound)?;
-        let source_id: String = row.try_get("source_id").map_err(db)?;
-        let source_version = to_u64(row.try_get("source_version").map_err(db)?)?;
-        let source_digest = stored_digest(row.try_get("source_digest").map_err(db)?)?;
-        let media: String = row.try_get("media").map_err(db)?;
-        if media != command.kind.as_str() {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        let source = load_source_for_update(&mut transaction, &source_id, source_version)
-            .await?
-            .ok_or(PrivateInspirationError::NotFound)?;
-        if source.projection.source_digest != source_digest
-            || source_is_vetoed(
-                &mut transaction,
-                command.campaign_session_id.as_str(),
-                &source,
-            )
-            .await?
-        {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        let policies = sqlx::query_scalar::<_, String>(
-            "SELECT artifact_policy FROM private_inspiration_consent_grants
-             WHERE campaign_session_id = $1 AND source_id = $2
-               AND source_version = $3 AND source_digest = $4
-               AND media = $5 AND state = 'active' AND expires_at_epoch > $6",
-        )
-        .bind(command.campaign_session_id.as_str())
-        .bind(&source_id)
-        .bind(inspiration_to_i64(source_version)?)
-        .bind(source_digest.as_str())
-        .bind(&media)
-        .bind(inspiration_to_i64(now)?)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(db)?;
-        if policies.len() != source.participants.len()
-            || policies.iter().any(|policy| {
-                DerivedArtifactPolicy::parse(policy).map_or(true, |stored| {
-                    artifact_policy_rank(command.artifact_policy) < artifact_policy_rank(stored)
-                })
-            })
-        {
-            return Err(PrivateInspirationError::ScopeDenied);
-        }
-        sqlx::query(
-            "INSERT INTO private_inspiration_derived_work
-             (work_id, schema_version, campaign_session_id, selection_id,
-              source_id, source_version, source_digest, work_kind, state,
-              artifact_policy, created_at_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10)",
-        )
-        .bind(command.work_id.as_str())
-        .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-        .bind(command.campaign_session_id.as_str())
-        .bind(command.selection_id.as_str())
-        .bind(&source_id)
-        .bind(inspiration_to_i64(source_version)?)
-        .bind(source_digest.as_str())
-        .bind(command.kind.as_str())
-        .bind(command.artifact_policy.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db)?;
-        let projection = DerivedWorkProjection {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            work_id: command.work_id.clone(),
-            selection_id: command.selection_id.clone(),
-            source_id: OpaqueInspirationId::new(source_id)?,
-            source_version,
-            source_digest,
-            kind: command.kind,
-            artifact_policy: command.artifact_policy,
-        };
-        insert_receipt(
-            &mut transaction,
-            command.campaign_session_id.as_str(),
-            command.idempotency_key.as_str(),
-            "derived_work_register",
-            request_fingerprint,
-            &projection,
-            now,
-        )
-        .await?;
-        insert_privacy_audit(
-            &mut transaction,
-            Some(command.campaign_session_id.as_str()),
-            "derived_work_registered",
-            "derived_work",
-            command.work_id.as_str(),
-            Some(command.selection_id.as_str()),
-            "applied",
-            now,
-        )
-        .await?;
-        transaction.commit().await.map_err(db)?;
-        Ok(projection)
-    }
+    Ok(unique)
 }
 
-fn global_control_from_row(
-    row: PgRow,
-) -> Result<GlobalInspirationControlProjection, PrivateInspirationError> {
-    let schema = to_u64(row.try_get("schema_version").map_err(db)?)?;
-    if schema != u64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION) {
-        return Err(invalid("stored_global_control_schema"));
-    }
-    Ok(GlobalInspirationControlProjection {
-        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        revision: to_u64(row.try_get("revision").map_err(db)?)?,
-        generation_disabled: row.try_get("generation_disabled").map_err(db)?,
-        updated_at_epoch: to_u64(row.try_get("updated_at_epoch").map_err(db)?)?,
+fn bounded_count(value: usize, code: &'static str) -> Result<u32, PrivateInspirationError> {
+    u32::try_from(value).map_err(|_| invalid(code))
+}
+
+fn inspiration_i64(value: u64, code: &'static str) -> Result<i64, PrivateInspirationError> {
+    i64::try_from(value).map_err(|_| invalid(code))
+}
+
+fn inspiration_u64(value: i64, code: &'static str) -> Result<u64, PrivateInspirationError> {
+    u64::try_from(value).map_err(|_| invalid(code))
+}
+
+fn inspiration_i64_persistence(
+    value: u64,
+    collection: CollectionName,
+) -> Result<i64, PersistenceError> {
+    i64::try_from(value).map_err(|_| {
+        private_schema(
+            collection,
+            "unsigned value exceeds MongoDB signed integer range",
+        )
     })
 }
 
-fn restricted_access_projection_from_row(
-    row: PgRow,
-) -> Result<RestrictedDiagnosticAccessProjection, PrivateInspirationError> {
-    let schema = to_u64(row.try_get("schema_version").map_err(db)?)?;
-    if schema != u64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION) {
-        return Err(invalid("stored_restricted_access_schema"));
-    }
-    Ok(RestrictedDiagnosticAccessProjection {
-        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        audit_id: OpaqueInspirationId::new(row.try_get::<String, _>("audit_id").map_err(db)?)?,
-        campaign_session_id: row
-            .try_get::<Option<String>, _>("campaign_session_id")
-            .map_err(db)?
-            .map(OpaqueInspirationId::new)
-            .transpose()?,
-        operator_id: OpaqueOperatorId::new(row.try_get::<String, _>("operator_id").map_err(db)?)?,
-        access_kind: RestrictedDiagnosticAccessKind::parse(
-            &row.try_get::<String, _>("access_kind").map_err(db)?,
-        )?,
-        purpose: RestrictedDiagnosticPurpose::parse(
-            &row.try_get::<String, _>("purpose_code").map_err(db)?,
-        )?,
-        subject_id: OpaqueInspirationId::new(row.try_get::<String, _>("subject_id").map_err(db)?)?,
-        evidence_digest: stored_digest(row.try_get("evidence_digest").map_err(db)?)?,
-        decision: RestrictedDiagnosticDecision::parse(
-            &row.try_get::<String, _>("result_code").map_err(db)?,
-        )?,
-        occurred_at_epoch: to_u64(row.try_get("occurred_at_epoch").map_err(db)?)?,
-    })
+fn inspiration_u64_persistence(
+    value: i64,
+    collection: CollectionName,
+) -> Result<u64, PersistenceError> {
+    u64::try_from(value)
+        .map_err(|_| private_schema(collection, "stored integer is negative or outside u64"))
 }
 
-async fn quarantine_all_private_inspiration_work(
-    transaction: &mut Transaction<'_, Postgres>,
-    now: u64,
+fn epoch_date(value: u64, code: &'static str) -> Result<DateTime, PrivateInspirationError> {
+    let milliseconds = value
+        .checked_mul(1_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| invalid(code))?;
+    Ok(DateTime::from_millis(milliseconds))
+}
+
+fn private_schema(collection: CollectionName, detail: &'static str) -> PersistenceError {
+    PersistenceError::SchemaDrift {
+        collection: collection.as_str().to_owned(),
+        detail: detail.to_owned(),
+    }
+}
+
+fn domain_as_schema(_: PrivateInspirationError) -> PersistenceError {
+    private_schema(
+        CollectionName::PrivateInspirationSources,
+        "stored private inspiration domain projection is invalid",
+    )
+}
+
+fn private_persistence(error: PersistenceError) -> PrivateInspirationError {
+    match error {
+        PersistenceError::NotFound {
+            entity: "private inspiration campaign",
+            ..
+        } => PrivateInspirationError::NotFound,
+        PersistenceError::RevisionConflict {
+            entity: "private inspiration settings",
+            expected,
+            actual,
+            ..
+        }
+        | PersistenceError::RevisionConflict {
+            entity: "private inspiration global control",
+            expected,
+            actual,
+            ..
+        } => PrivateInspirationError::RevisionConflict {
+            expected,
+            current: actual,
+        },
+        other => PrivateInspirationError::Repository(map_persistence(other)),
+    }
+}
+
+fn private_mongo(operation: &'static str, error: mongodb::error::Error) -> PrivateInspirationError {
+    private_persistence(PersistenceError::mongo(operation, error))
+}
+
+fn bson_value<T: Serialize>(
+    value: &T,
+    collection: CollectionName,
+) -> Result<Bson, PersistenceError> {
+    bson::to_bson(value)
+        .map_err(|_| private_schema(collection, "private inspiration BSON encoding failed"))
+}
+
+fn bson_document<T: Serialize>(
+    value: &T,
+    collection: CollectionName,
+) -> Result<Document, PersistenceError> {
+    bson::to_document(value)
+        .map_err(|_| private_schema(collection, "private inspiration BSON encoding failed"))
+}
+
+fn decode_field<T: DeserializeOwned>(
+    document: &Document,
+    field: &str,
+    collection: CollectionName,
+) -> Result<T, PersistenceError> {
+    let value = document
+        .get(field)
+        .cloned()
+        .ok_or_else(|| private_schema(collection, "required BSON field is missing"))?;
+    bson::from_bson(value)
+        .map_err(|_| private_schema(collection, "private inspiration BSON decoding failed"))
+}
+
+fn required_string(
+    document: &Document,
+    field: &str,
+    collection: CollectionName,
+) -> Result<String, PersistenceError> {
+    document
+        .get_str(field)
+        .map(str::to_owned)
+        .map_err(|_| private_schema(collection, "required string field is missing"))
+}
+
+fn optional_string_bson(value: Option<&str>) -> Bson {
+    value.map_or(Bson::Null, |value| Bson::String(value.to_owned()))
+}
+
+fn optional_u64_bson(
+    value: Option<u64>,
+    collection: CollectionName,
+) -> Result<Bson, PersistenceError> {
+    value
+        .map(|value| inspiration_i64_persistence(value, collection).map(Bson::Int64))
+        .transpose()
+        .map(|value| value.unwrap_or(Bson::Null))
+}
+
+const fn consent_state_name(state: ConsentGrantState) -> &'static str {
+    match state {
+        ConsentGrantState::Active => "active",
+        ConsentGrantState::Expired => "expired",
+        ConsentGrantState::Revoked => "revoked",
+    }
+}
+
+const fn artifact_policy_rank(policy: DerivedArtifactPolicy) -> u8 {
+    match policy {
+        DerivedArtifactPolicy::DeleteDerived => 3,
+        DerivedArtifactPolicy::RedactDerived => 2,
+        DerivedArtifactPolicy::RetainMinimalAudit => 1,
+    }
+}
+
+fn default_global_control() -> GlobalInspirationControlProjection {
+    GlobalInspirationControlProjection {
+        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+        revision: 1,
+        generation_disabled: false,
+        updated_at_epoch: 0,
+    }
+}
+
+fn validate_campaign(
+    campaign: &InspirationCampaignDocument,
 ) -> Result<(), PrivateInspirationError> {
-    let pending = sqlx::query(
-        "UPDATE private_inspiration_derived_work
-         SET state = 'cancellation_requested',
-             cancellation_requested_at_epoch = GREATEST(created_at_epoch, $1)
-         WHERE state = 'pending'
-         RETURNING campaign_session_id, work_id",
-    )
-    .bind(inspiration_to_i64(now)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    for row in pending {
-        let campaign_id: String = row.try_get("campaign_session_id").map_err(db)?;
-        let work_id: String = row.try_get("work_id").map_err(db)?;
-        insert_privacy_audit(
-            transaction,
-            Some(&campaign_id),
-            "derived_work_cancel_requested",
-            "derived_work",
-            &work_id,
-            None,
-            "cancel_requested",
-            now,
-        )
-        .await?;
-    }
-    let completed = sqlx::query(
-        "UPDATE generated_text_presentations AS presentation
-         SET body = $1, privacy_state = 'redacted', updated_at = CURRENT_TIMESTAMP
-         FROM private_inspiration_derived_work AS work
-         WHERE presentation.private_inspiration_work_id = work.work_id
-           AND work.state IN ('completed', 'redacted')
-         RETURNING work.campaign_session_id, work.work_id, presentation.id",
-    )
-    .bind(PRIVATE_INSPIRATION_REDACTION_BODY)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    for row in completed {
-        let campaign_id: String = row.try_get("campaign_session_id").map_err(db)?;
-        let work_id: String = row.try_get("work_id").map_err(db)?;
-        let presentation_id: String = row.try_get("id").map_err(db)?;
-        sqlx::query(
-            "UPDATE private_inspiration_derived_work
-             SET state = 'redacted' WHERE work_id = $1",
-        )
-        .bind(&work_id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(db)?;
-        insert_privacy_audit(
-            transaction,
-            Some(&campaign_id),
-            "derived_work_redacted",
-            "derived_work",
-            &work_id,
-            Some(&presentation_id),
-            "applied",
-            now,
-        )
-        .await?;
+    campaign
+        .session
+        .validate()
+        .map_err(|_| invalid("stored_campaign_validation"))?;
+    let revision = inspiration_u64(campaign.revision, "stored_campaign_revision")?;
+    if campaign.session.id != campaign.id
+        || campaign.session.last_event_sequence.checked_add(1) != Some(revision)
+    {
+        return Err(invalid("stored_campaign_identity_or_revision"));
     }
     Ok(())
 }
 
-async fn lock_campaign(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<LockedCampaign, PrivateInspirationError> {
-    let row = sqlx::query(
-        "SELECT revision, payload_json::text AS payload_json
-         FROM campaign_sessions WHERE id = $1 FOR UPDATE",
-    )
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?
-    .ok_or(PrivateInspirationError::NotFound)?;
-    let revision = to_u64(row.try_get("revision").map_err(db)?)?;
-    let payload: String = row.try_get("payload_json").map_err(db)?;
-    let session: SessionDto =
-        serde_json::from_str(&payload).map_err(|_| invalid("stored_campaign_payload"))?;
-    session
-        .validate()
-        .map_err(|_| invalid("stored_campaign_validation"))?;
-    if session.id != campaign_session_id
-        || session.last_event_sequence.checked_add(1) != Some(revision)
-    {
-        return Err(invalid("stored_campaign_identity_or_revision"));
-    }
-    Ok(LockedCampaign { session, revision })
+async fn load_campaign_in_session(
+    campaigns: &Collection<InspirationCampaignDocument>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<InspirationCampaignDocument, PersistenceError> {
+    let campaign = campaigns
+        .find_one(doc! { "_id": campaign_id })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load private inspiration campaign", error))?
+        .ok_or_else(|| PersistenceError::NotFound {
+            entity: "private inspiration campaign",
+            id: campaign_id.to_owned(),
+        })?;
+    validate_campaign(&campaign).map_err(domain_as_schema)?;
+    Ok(campaign)
 }
 
-async fn trusted_trigger_window(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign: &LockedCampaign,
-) -> Result<(u64, OpaqueInspirationId), PrivateInspirationError> {
-    if campaign.session.status != SessionStatus::Active || campaign.session.last_event_sequence == 0
-    {
-        return Err(PrivateInspirationError::ScopeDenied);
-    }
-    let turn_number = campaign.session.last_event_sequence;
-    let payload: String = sqlx::query_scalar(
-        "SELECT payload_json::text FROM turn_audits
-         WHERE campaign_session_id = $1 AND turn_number = $2",
-    )
-    .bind(&campaign.session.id)
-    .bind(inspiration_to_i64(turn_number)?)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?
-    .ok_or_else(|| invalid("trigger_event_missing"))?;
-    let event: SessionEventDto =
-        serde_json::from_str(&payload).map_err(|_| invalid("stored_trigger_event"))?;
-    event
-        .validate()
-        .map_err(|_| invalid("stored_trigger_event_validation"))?;
-    if event.session_id != campaign.session.id || event.sequence != turn_number {
-        return Err(invalid("stored_trigger_event_identity"));
-    }
-    let safe = match event.payload {
-        SessionEventPayload::AbilityCheckResolved { .. }
-        | SessionEventPayload::ExplorationSocialResolved { .. }
-        | SessionEventPayload::GmNarration { .. }
-        | SessionEventPayload::ExperienceAwarded { .. }
-        | SessionEventPayload::AiProposalAccepted { .. }
-        | SessionEventPayload::AiProposalRejected { .. } => true,
-        SessionEventPayload::EncounterResolved { outcome, .. } => {
-            matches!(outcome.resolution.state.status, EncounterStatus::Victory)
-                || (matches!(outcome.resolution.state.status, EncounterStatus::Defeat)
-                    && outcome
-                        .resolution
-                        .state
-                        .transition
-                        .as_ref()
-                        .is_some_and(|transition| transition.story_recovery_applied))
+async fn replace_campaign_safety(
+    campaigns: &Collection<InspirationCampaignDocument>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    current_revision: Option<u64>,
+    safety: &CampaignSafetyDocument,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    let mut filter = doc! { "_id": campaign_id };
+    match current_revision {
+        Some(revision) => {
+            filter.insert(
+                "safety.revision",
+                inspiration_i64_persistence(revision, CollectionName::Campaigns)?,
+            );
         }
-        SessionEventPayload::SessionStarted
-        | SessionEventPayload::PlayerIntent { .. }
-        | SessionEventPayload::DiceResolved { .. }
-        | SessionEventPayload::SessionEnded => false,
+        None => {
+            filter.insert("safety", Bson::Null);
+        }
+    }
+    let updated = campaigns
+        .update_one(
+            filter,
+            doc! {
+                "$set": {
+                    "safety": bson_document(safety, CollectionName::Campaigns)?,
+                    "updated_at": now,
+                }
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("replace campaign inspiration safety", error))?;
+    if updated.matched_count != 1 {
+        return Err(PersistenceError::RevisionConflict {
+            entity: "private inspiration settings",
+            id: campaign_id.to_owned(),
+            expected: current_revision.unwrap_or(0),
+            actual: current_revision.unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+async fn load_receipt<T: DeserializeOwned>(
+    receipts: &Collection<Document>,
+    session: &mut ClientSession,
+    scope_kind: &str,
+    scope_id: &str,
+    idempotency_key: &str,
+    command_kind: &str,
+    request_fingerprint: &Sha256Digest,
+) -> Result<ReceiptReplay<T>, PersistenceError> {
+    let Some(receipt) = receipts
+        .find_one(doc! {
+            "scope_kind": scope_kind,
+            "scope_id": scope_id,
+            "idempotency_key": idempotency_key,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load inspiration command receipt", error))?
+    else {
+        return Ok(ReceiptReplay::Missing);
     };
-    if !safe {
-        return Err(PrivateInspirationError::ScopeDenied);
+    if required_string(&receipt, "command_kind", CollectionName::CommandReceipts)? != command_kind
+        || required_string(
+            &receipt,
+            "request_fingerprint",
+            CollectionName::CommandReceipts,
+        )? != request_fingerprint.as_str()
+    {
+        return Ok(ReceiptReplay::Conflict);
     }
-    Ok((
-        turn_number,
-        OpaqueInspirationId::new(format!("trigger-window:{turn_number}"))?,
-    ))
+    decode_field(&receipt, "response", CollectionName::CommandReceipts).map(ReceiptReplay::Replay)
 }
 
-async fn trusted_party_level(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<u8, PrivateInspirationError> {
-    let hero_payload: Option<String> = sqlx::query_scalar(
-        "SELECT payload_json::text FROM hero_characters
-         WHERE campaign_session_id = $1 ORDER BY id LIMIT 1",
-    )
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?;
-    if let Some(payload) = hero_payload {
-        let hero: HeroCharacter =
-            serde_json::from_str(&payload).map_err(|_| invalid("stored_hero_payload"))?;
-        hero.validate()
-            .map_err(|_| invalid("stored_hero_validation"))?;
-        if hero.campaign_id != campaign_session_id {
-            return Err(invalid("stored_hero_campaign"));
+#[allow(clippy::too_many_arguments)]
+async fn insert_receipt<T: Serialize>(
+    receipts: &Collection<Document>,
+    session: &mut ClientSession,
+    scope_kind: &str,
+    scope_id: &str,
+    actor_account_id: &str,
+    idempotency_key: &str,
+    command_kind: &str,
+    request_fingerprint: &Sha256Digest,
+    response: &T,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    receipts
+        .insert_one(doc! {
+            "_id": format!("command-receipt:{}", Uuid::new_v4()),
+            "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+            "scope_kind": scope_kind,
+            "scope_id": scope_id,
+            "campaign_id": if scope_kind == CAMPAIGN_COMMAND_SCOPE {
+                Bson::String(scope_id.to_owned())
+            } else {
+                Bson::Null
+            },
+            "actor_account_id": actor_account_id,
+            "command_kind": command_kind,
+            "idempotency_key": idempotency_key,
+            "request_fingerprint": request_fingerprint.as_str(),
+            "state": "committed",
+            "response": bson_value(response, CollectionName::CommandReceipts)?,
+            "created_at": now,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("insert inspiration command receipt", error))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_privacy_audit(
+    audits: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: Option<&str>,
+    action: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    secondary_id: Option<&str>,
+    outcome: &str,
+    now: DateTime,
+    extra_metadata: Option<Document>,
+) -> Result<(), PersistenceError> {
+    let mut metadata = extra_metadata.unwrap_or_default();
+    metadata.insert("secondary_id", optional_string_bson(secondary_id));
+    metadata.insert("campaign_id", optional_string_bson(campaign_id));
+    audits
+        .insert_one(doc! {
+            "_id": format!("privacy-audit:{}", Uuid::new_v4()),
+            "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+            "category": "private_inspiration",
+            "action": action,
+            "outcome": outcome,
+            "actor_account_id": SYSTEM_ACTOR_ID,
+            "scope_kind": subject_kind,
+            "scope_id": subject_id,
+            "campaign_id": optional_string_bson(campaign_id),
+            "metadata": metadata,
+            "created_at": now,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("insert inspiration privacy audit", error))?;
+    Ok(())
+}
+
+async fn load_global_control(
+    collection: &Collection<Document>,
+    session: Option<&mut ClientSession>,
+) -> Result<Option<GlobalInspirationControlProjection>, PersistenceError> {
+    let filter = doc! { "_id": GLOBAL_STATE_ID };
+    let stored = match session {
+        Some(session) => collection
+            .find_one(filter)
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("load private inspiration global control", error)
+            })?,
+        None => collection.find_one(filter).await.map_err(|error| {
+            PersistenceError::mongo("load private inspiration global control", error)
+        })?,
+    };
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let projection: GlobalInspirationControlProjection =
+        decode_field(&stored, "response", CollectionName::CommandReceipts)?;
+    if projection.schema_version != PRIVATE_INSPIRATION_SCHEMA_VERSION
+        || stored.get_i64("revision").ok() != i64::try_from(projection.revision).ok()
+    {
+        return Err(private_schema(
+            CollectionName::CommandReceipts,
+            "global inspiration control projection is invalid",
+        ));
+    }
+    Ok(Some(projection))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_global_control(
+    collection: &Collection<Document>,
+    session: &mut ClientSession,
+    current: &GlobalInspirationControlProjection,
+    next: &GlobalInspirationControlProjection,
+    command: &SetGlobalInspirationControlCommand,
+    request_fingerprint: &Sha256Digest,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    let existing = collection
+        .find_one(doc! { "_id": GLOBAL_STATE_ID })
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("lock private inspiration global control", error)
+        })?;
+    if existing.is_none() {
+        collection
+            .insert_one(doc! {
+                "_id": GLOBAL_STATE_ID,
+                "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                "scope_kind": GLOBAL_STATE_SCOPE,
+                "scope_id": GLOBAL_SCOPE_ID,
+                "actor_account_id": SYSTEM_ACTOR_ID,
+                "command_kind": "private_inspiration_global_state",
+                "idempotency_key": "private-inspiration-global-state",
+                "request_fingerprint": request_fingerprint.as_str(),
+                "state": "committed",
+                "revision": inspiration_i64_persistence(
+                    next.revision,
+                    CollectionName::CommandReceipts,
+                )?,
+                "operator_id": command.operator_id.as_str(),
+                "evidence_digest": command.evidence_digest.as_str(),
+                "response": bson_value(next, CollectionName::CommandReceipts)?,
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("insert private inspiration global control", error)
+            })?;
+        return Ok(());
+    }
+    let updated = collection
+        .update_one(
+            doc! {
+                "_id": GLOBAL_STATE_ID,
+                "revision": inspiration_i64_persistence(
+                    current.revision,
+                    CollectionName::CommandReceipts,
+                )?,
+            },
+            doc! {
+                "$set": {
+                    "request_fingerprint": request_fingerprint.as_str(),
+                    "revision": inspiration_i64_persistence(
+                        next.revision,
+                        CollectionName::CommandReceipts,
+                    )?,
+                    "operator_id": command.operator_id.as_str(),
+                    "evidence_digest": command.evidence_digest.as_str(),
+                    "response": bson_value(next, CollectionName::CommandReceipts)?,
+                    "updated_at": now,
+                }
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("update private inspiration global control", error)
+        })?;
+    if updated.matched_count != 1 {
+        return Err(PersistenceError::RevisionConflict {
+            entity: "private inspiration global control",
+            id: GLOBAL_SCOPE_ID.to_owned(),
+            expected: current.revision,
+            actual: current.revision,
+        });
+    }
+    Ok(())
+}
+
+async fn serialize_global_operation(
+    collection: &Collection<Document>,
+    session: &mut ClientSession,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    let existing = collection
+        .find_one(doc! { "_id": GLOBAL_STATE_ID })
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("lock private inspiration global operation", error)
+        })?;
+    if let Some(existing) = existing {
+        let revision = existing.get_i64("revision").map_err(|_| {
+            private_schema(
+                CollectionName::CommandReceipts,
+                "global inspiration state revision is missing",
+            )
+        })?;
+        let updated = collection
+            .update_one(
+                doc! { "_id": GLOBAL_STATE_ID, "revision": revision },
+                doc! { "$set": { "updated_at": now } },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("serialize private inspiration global operation", error)
+            })?;
+        if updated.matched_count != 1 {
+            return Err(PersistenceError::RevisionConflict {
+                entity: "private inspiration global control",
+                id: GLOBAL_SCOPE_ID.to_owned(),
+                expected: inspiration_u64_persistence(revision, CollectionName::CommandReceipts)?,
+                actual: inspiration_u64_persistence(revision, CollectionName::CommandReceipts)?,
+            });
         }
-        return Ok(hero.level.value());
+    } else {
+        let default = GlobalInspirationControlProjection {
+            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+            revision: 1,
+            generation_disabled: false,
+            updated_at_epoch: 0,
+        };
+        collection
+            .insert_one(doc! {
+                "_id": GLOBAL_STATE_ID,
+                "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                "scope_kind": GLOBAL_STATE_SCOPE,
+                "scope_id": GLOBAL_SCOPE_ID,
+                "actor_account_id": SYSTEM_ACTOR_ID,
+                "command_kind": "private_inspiration_global_state",
+                "idempotency_key": "private-inspiration-global-state",
+                "request_fingerprint":
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "state": "committed",
+                "revision": 1_i64,
+                "response": bson_value(&default, CollectionName::CommandReceipts)?,
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("initialize private inspiration global control", error)
+            })?;
     }
-    let character_payloads = sqlx::query_scalar::<_, String>(
-        "SELECT payload_json::text FROM characters
-         WHERE campaign_session_id = $1 ORDER BY id",
-    )
-    .bind(campaign_session_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    let mut party_level = None;
-    for payload in character_payloads {
-        let character: Character =
-            serde_json::from_str(&payload).map_err(|_| invalid("stored_character_payload"))?;
-        character
-            .validate()
-            .map_err(|_| invalid("stored_character_validation"))?;
-        party_level = Some(
-            party_level.map_or(character.level().value(), |current: u8| {
-                current.max(character.level().value())
-            }),
-        );
-    }
-    party_level.ok_or_else(|| invalid("campaign_party_missing"))
+    Ok(())
 }
 
-async fn trusted_theme_pack_id(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<String, PrivateInspirationError> {
-    let payload: String = sqlx::query_scalar(
-        "SELECT payload_json::text FROM campaign_content_pins
-         WHERE campaign_session_id = $1",
-    )
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?
-    .ok_or_else(|| invalid("campaign_theme_pins_missing"))?;
-    let pins: CampaignContentPins =
-        serde_json::from_str(&payload).map_err(|_| invalid("stored_campaign_pins"))?;
-    pins.validate()
-        .map_err(|_| invalid("stored_campaign_pins_validation"))?;
-    Ok(pins.hero.theme_id.pack_id().to_owned())
+async fn load_source(
+    sources: &Collection<SourceDocument>,
+    session: &mut ClientSession,
+    source_id: &str,
+    source_revision: u64,
+) -> Result<Option<SourceDocument>, PersistenceError> {
+    sources
+        .find_one(doc! {
+            "logical_id": source_id,
+            "revision": inspiration_i64_persistence(
+                source_revision,
+                CollectionName::PrivateInspirationSources,
+            )?,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load inspiration source version", error))
+}
+
+async fn participant_is_verified(
+    participants: &Collection<Document>,
+    session: &mut ClientSession,
+    participant_id: &str,
+) -> Result<bool, PersistenceError> {
+    let Some(participant) = participants
+        .find_one(doc! { "_id": participant_id, "participant_id": participant_id })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load inspiration participant", error))?
+    else {
+        return Ok(false);
+    };
+    let state = required_string(
+        &participant,
+        "state",
+        CollectionName::PrivateInspirationParticipants,
+    )?;
+    let method = required_string(
+        &participant,
+        "verification_method",
+        CollectionName::PrivateInspirationParticipants,
+    )?;
+    let projection: ParticipantVerificationProjection = decode_field(
+        &participant,
+        "projection",
+        CollectionName::PrivateInspirationParticipants,
+    )?;
+    if !matches!(
+        method.as_str(),
+        "participant_signed_confirmation" | "timestamped_two_channel_acknowledgement"
+    ) || projection.schema_version != PRIVATE_INSPIRATION_SCHEMA_VERSION
+        || projection.participant_id.as_str() != participant_id
+        || projection.method.as_str() != method
+        || projection.revoked != (state == "revoked")
+    {
+        return Err(private_schema(
+            CollectionName::PrivateInspirationParticipants,
+            "participant verification projection is invalid",
+        ));
+    }
+    Ok(state == "verified")
+}
+
+async fn all_source_participants_verified(
+    participants: &Collection<Document>,
+    session: &mut ClientSession,
+    source: &StoredSource,
+) -> Result<bool, PersistenceError> {
+    if source.participants.is_empty() {
+        return Ok(false);
+    }
+    for participant_id in &source.participants {
+        if !participant_is_verified(participants, session, participant_id).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn source_is_vetoed(
+    vetoes: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    source: &StoredSource,
+) -> Result<bool, PersistenceError> {
+    vetoes
+        .find_one(doc! {
+            "campaign_id": campaign_id,
+            "state": "active",
+            "$or": [
+                { "scope_kind": "campaign" },
+                {
+                    "scope_kind": "category",
+                    "category_id": source.projection.category_id.as_str(),
+                },
+                {
+                    "scope_kind": "source_version",
+                    "source_id": source.projection.source_id.as_str(),
+                    "source_revision": inspiration_i64_persistence(
+                        source.projection.source_version,
+                        CollectionName::PrivateInspirationVetoes,
+                    )?,
+                    "source_digest": source.projection.source_digest.as_str(),
+                },
+            ],
+        })
+        .session(&mut *session)
+        .await
+        .map(|value| value.is_some())
+        .map_err(|error| PersistenceError::mongo("check inspiration vetoes", error))
+}
+
+async fn source_has_complete_consent(
+    consents: &Collection<ConsentDocument>,
+    session: &mut ClientSession,
+    command: &RequestInspirationSelectionCommand,
+    source: &StoredSource,
+    now: u64,
+) -> Result<bool, PersistenceError> {
+    let mut cursor = consents
+        .find(doc! {
+            "campaign_id": command.campaign_session_id.as_str(),
+            "source_id": source.projection.source_id.as_str(),
+            "source_revision": inspiration_i64_persistence(
+                source.projection.source_version,
+                CollectionName::PrivateInspirationConsents,
+            )?,
+            "source_digest": source.projection.source_digest.as_str(),
+            "audience": command.audience.as_str(),
+            "media": command.media.as_str(),
+            "transformation": InspirationTransformation::HighFictionDistanceV1.as_str(),
+            "state": "active",
+            "expires_at_epoch": {
+                "$gt": inspiration_i64_persistence(
+                    now,
+                    CollectionName::PrivateInspirationConsents,
+                )?
+            },
+        })
+        .sort(doc! { "participant_id": 1_i64 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load complete inspiration consent", error))?;
+    let mut granted_participants = BTreeSet::new();
+    let mut count = 0_usize;
+    while cursor
+        .advance(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("read complete inspiration consent", error))?
+    {
+        let consent: ConsentDocument = cursor.deserialize_current().map_err(|_| {
+            private_schema(
+                CollectionName::PrivateInspirationConsents,
+                "selection consent document could not be decoded",
+            )
+        })?;
+        consent.checked_projection().map_err(domain_as_schema)?;
+        if consent
+            .sensitivities
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != source.sensitivities
+        {
+            return Ok(false);
+        }
+        granted_participants.insert(consent.participant_id);
+        count += 1;
+    }
+    Ok(count == source.participants.len() && granted_participants == source.participants)
+}
+
+fn normalized_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect()
+}
+
+fn normalized_stored_set(values: &BTreeSet<String>) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect()
 }
 
 fn empty_selection_audit(
@@ -2790,847 +1637,408 @@ fn empty_selection_audit(
         .map_err(PrivateInspirationError::Selection)
 }
 
-async fn all_source_participants_verified(
-    transaction: &mut Transaction<'_, Postgres>,
-    source: &StoredSource,
-) -> Result<bool, PrivateInspirationError> {
-    for participant in &source.participants {
-        let verified: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-               SELECT 1 FROM private_inspiration_participants
-               WHERE participant_id = $1 AND verification_state = 'verified'
-             )",
-        )
-        .bind(participant)
-        .fetch_one(&mut **transaction)
+async fn load_selection_replay(
+    selections: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    idempotency_key: &str,
+    request_fingerprint: &Sha256Digest,
+) -> Result<ReceiptReplay<PrivateInspirationSelection>, PersistenceError> {
+    let Some(document) = selections
+        .find_one(doc! {
+            "campaign_id": campaign_id,
+            "idempotency_key": idempotency_key,
+        })
+        .session(&mut *session)
         .await
-        .map_err(db)?;
-        if !verified {
-            return Ok(false);
-        }
+        .map_err(|error| PersistenceError::mongo("load inspiration selection replay", error))?
+    else {
+        return Ok(ReceiptReplay::Missing);
+    };
+    if required_string(
+        &document,
+        "request_fingerprint",
+        CollectionName::PrivateInspirationSelections,
+    )? != request_fingerprint.as_str()
+    {
+        return Ok(ReceiptReplay::Conflict);
     }
-    Ok(!source.participants.is_empty())
-}
-
-async fn source_has_complete_consent(
-    transaction: &mut Transaction<'_, Postgres>,
-    command: &RequestInspirationSelectionCommand,
-    source: &StoredSource,
-    now: u64,
-) -> Result<bool, PrivateInspirationError> {
-    let rows = sqlx::query(
-        "SELECT grant_id, participant_id
-         FROM private_inspiration_consent_grants
-         WHERE campaign_session_id = $1 AND source_id = $2
-           AND source_version = $3 AND source_digest = $4
-           AND audience = $5 AND media = $6
-           AND transformation = 'high_fiction_distance_v1'
-           AND state = 'active' AND expires_at_epoch > $7
-         ORDER BY participant_id",
-    )
-    .bind(command.campaign_session_id.as_str())
-    .bind(source.projection.source_id.as_str())
-    .bind(inspiration_to_i64(source.projection.source_version)?)
-    .bind(source.projection.source_digest.as_str())
-    .bind(command.audience.as_str())
-    .bind(command.media.as_str())
-    .bind(inspiration_to_i64(now)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    if rows.len() != source.participants.len() {
-        return Ok(false);
+    let selection: PrivateInspirationSelection = decode_field(
+        &document,
+        "projection",
+        CollectionName::PrivateInspirationSelections,
+    )?;
+    if selection.schema_version != PRIVATE_INSPIRATION_SCHEMA_VERSION
+        || selection.campaign_session_id.as_str() != campaign_id
+        || selection.audit.algorithm != RollAlgorithm::ChaCha20V1
+    {
+        return Err(private_schema(
+            CollectionName::PrivateInspirationSelections,
+            "stored selection replay is invalid",
+        ));
     }
-    let mut granted_participants = BTreeSet::new();
-    for row in rows {
-        let grant_id: String = row.try_get("grant_id").map_err(db)?;
-        let participant_id: String = row.try_get("participant_id").map_err(db)?;
-        let sensitivities = sqlx::query_scalar::<_, String>(
-            "SELECT sensitivity_code FROM private_inspiration_consent_sensitivities
-             WHERE grant_id = $1 ORDER BY sensitivity_code",
-        )
-        .bind(&grant_id)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        if sensitivities != source.sensitivities {
-            return Ok(false);
-        }
-        granted_participants.insert(participant_id);
-    }
-    Ok(granted_participants == source.participants)
+    Ok(ReceiptReplay::Replay(selection))
 }
 
 async fn load_last_triggered_turns(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<HashMap<String, u64>, PrivateInspirationError> {
-    let rows = sqlx::query(
-        "SELECT source_id, MAX(turn_number) AS turn_number
-         FROM private_inspiration_source_usage
-         WHERE campaign_session_id = $1 GROUP BY source_id",
-    )
-    .bind(campaign_session_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    rows.into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get("source_id").map_err(db)?,
-                to_u64(row.try_get("turn_number").map_err(db)?)?,
-            ))
+    selections: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<HashMap<String, u64>, PersistenceError> {
+    let mut cursor = selections
+        .find(doc! {
+            "campaign_id": campaign_id,
+            "source_id": { "$type": "string" },
         })
-        .collect()
+        .sort(doc! { "turn_number": 1_i64, "_id": 1_i64 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load inspiration cooldown history", error))?;
+    let mut turns = HashMap::new();
+    while cursor
+        .advance(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("read inspiration cooldown history", error))?
+    {
+        let document = cursor.deserialize_current().map_err(|_| {
+            private_schema(
+                CollectionName::PrivateInspirationSelections,
+                "cooldown selection document could not be decoded",
+            )
+        })?;
+        let source_id = required_string(
+            &document,
+            "source_id",
+            CollectionName::PrivateInspirationSelections,
+        )?;
+        let turn = inspiration_u64_persistence(
+            document.get_i64("turn_number").map_err(|_| {
+                private_schema(
+                    CollectionName::PrivateInspirationSelections,
+                    "selection turn number is missing",
+                )
+            })?,
+            CollectionName::PrivateInspirationSelections,
+        )?;
+        turns.insert(source_id, turn);
+    }
+    Ok(turns)
 }
 
-fn normalized_set(values: &[String]) -> BTreeSet<String> {
-    values
-        .iter()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .collect()
-}
-
-fn normalized_stored_set(values: &BTreeSet<String>) -> BTreeSet<String> {
-    values
-        .iter()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn persist_selection(
-    transaction: &mut Transaction<'_, Postgres>,
-    selection_id: &OpaqueInspirationId,
-    command: &RequestInspirationSelectionCommand,
-    request_fingerprint: &Sha256Digest,
-    authority: &ResolvedInspirationSelectionAuthority,
-    trigger_window_id: &OpaqueInspirationId,
-    turn_number: u64,
-    selected_source_version: Option<u64>,
-    durable_no_selection_reason: Option<DurableNoSelectionReason>,
-    audit: &EventSelectionAudit,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    sqlx::query(
-        "INSERT INTO private_inspiration_selection_audits
-         (selection_id, schema_version, campaign_session_id, idempotency_key,
-          request_fingerprint, trigger_window_id, campaign_revision, turn_number,
-          audience, media, seed_reference, eligible_set_digest,
-          eligible_source_count, selected_source_id, selected_source_version,
-          selected_source_digest, no_selection_reason, sample_numerator,
-          sample_denominator, algorithm, cursor_before, cursor_after,
-          created_at_epoch)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
-    )
-    .bind(selection_id.as_str())
-    .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-    .bind(command.campaign_session_id.as_str())
-    .bind(command.idempotency_key.as_str())
-    .bind(request_fingerprint.as_str())
-    .bind(trigger_window_id.as_str())
-    .bind(inspiration_to_i64(command.expected_campaign_revision)?)
-    .bind(inspiration_to_i64(turn_number)?)
-    .bind(command.audience.as_str())
-    .bind(command.media.as_str())
-    .bind(authority.seed_reference.as_str())
-    .bind(audit.eligible_set_digest.as_str())
-    .bind(i64::from(audit.eligible_source_count))
-    .bind(audit.selected_source_id.as_deref())
-    .bind(
-        selected_source_version
-            .map(inspiration_to_i64)
-            .transpose()?,
-    )
-    .bind(
-        audit
-            .selected_source_digest
-            .as_ref()
-            .map(Sha256Digest::as_str),
-    )
-    .bind(durable_no_selection_reason.map(DurableNoSelectionReason::as_str))
-    .bind(audit.sample_numerator.map(inspiration_to_i64).transpose()?)
-    .bind(
-        audit
-            .sample_denominator
-            .map(inspiration_to_i64)
-            .transpose()?,
-    )
-    .bind(audit.algorithm.as_str())
-    .bind(inspiration_to_i64(audit.cursor_before)?)
-    .bind(inspiration_to_i64(audit.cursor_after)?)
-    .bind(inspiration_to_i64(now)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(db)?;
-    Ok(())
-}
-
-async fn load_selection_replay(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    idempotency_key: &str,
-    request_fingerprint: &Sha256Digest,
-) -> Result<Option<PrivateInspirationSelection>, PrivateInspirationError> {
-    let row = sqlx::query(
-        "SELECT selection_id, schema_version, campaign_session_id,
-                request_fingerprint, eligible_set_digest, eligible_source_count,
-                selected_source_id, selected_source_version, selected_source_digest,
-                no_selection_reason, sample_numerator, sample_denominator,
-                algorithm, cursor_before, cursor_after, created_at_epoch
-         FROM private_inspiration_selection_audits
-         WHERE campaign_session_id = $1 AND idempotency_key = $2",
-    )
-    .bind(campaign_session_id)
-    .bind(idempotency_key)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?;
-    let Some(row) = row else {
+async fn trusted_trigger_window(
+    turn_events: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign: &InspirationCampaignDocument,
+) -> Result<Option<(u64, OpaqueInspirationId)>, PersistenceError> {
+    if campaign.session.status != SessionStatus::Active || campaign.session.last_event_sequence == 0
+    {
         return Ok(None);
-    };
-    let stored_fingerprint: String = row.try_get("request_fingerprint").map_err(db)?;
-    if stored_fingerprint != request_fingerprint.as_str() {
-        return Err(PrivateInspirationError::IdempotencyConflict);
     }
-    let schema = to_u64(row.try_get("schema_version").map_err(db)?)?;
-    let algorithm: String = row.try_get("algorithm").map_err(db)?;
-    if schema != u64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
-        || algorithm != RollAlgorithm::ChaCha20V1.as_str()
-    {
-        return Err(invalid("stored_selection_schema_or_algorithm"));
-    }
-    let durable_reason = row
-        .try_get::<Option<String>, _>("no_selection_reason")
-        .map_err(db)?
-        .map(|reason| DurableNoSelectionReason::parse(&reason))
-        .transpose()?;
-    let selected_source_id: Option<String> = row.try_get("selected_source_id").map_err(db)?;
-    let selected_source_digest = row
-        .try_get::<Option<String>, _>("selected_source_digest")
-        .map_err(db)?
-        .map(stored_digest)
-        .transpose()?;
-    let no_selection_reason = durable_reason.map(|reason| match reason {
-        DurableNoSelectionReason::NoEligibleSources => EventNoSelectionReason::NoEligibleSources,
-        DurableNoSelectionReason::DeploymentDisabled
-        | DurableNoSelectionReason::GlobalKillSwitch
-        | DurableNoSelectionReason::CampaignDisabled
-        | DurableNoSelectionReason::CampaignPaused
-        | DurableNoSelectionReason::SafetyIncomplete => EventNoSelectionReason::CampaignDisabled,
-    });
-    Ok(Some(PrivateInspirationSelection {
-        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        selection_id: OpaqueInspirationId::new(
-            row.try_get::<String, _>("selection_id").map_err(db)?,
-        )?,
-        campaign_session_id: OpaqueInspirationId::new(
-            row.try_get::<String, _>("campaign_session_id")
-                .map_err(db)?,
-        )?,
-        source_version: row
-            .try_get::<Option<i64>, _>("selected_source_version")
-            .map_err(db)?
-            .map(to_u64)
-            .transpose()?,
-        durable_no_selection_reason: durable_reason,
-        audit: EventSelectionAudit {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            eligible_set_digest: stored_digest(row.try_get("eligible_set_digest").map_err(db)?)?,
-            eligible_source_count: u32::try_from(to_u64(
-                row.try_get("eligible_source_count").map_err(db)?,
-            )?)
-            .map_err(|_| invalid("stored_eligible_count"))?,
-            selected_source_id,
-            selected_source_digest,
-            no_selection_reason,
-            sample_numerator: row
-                .try_get::<Option<i64>, _>("sample_numerator")
-                .map_err(db)?
-                .map(to_u64)
-                .transpose()?,
-            sample_denominator: row
-                .try_get::<Option<i64>, _>("sample_denominator")
-                .map_err(db)?
-                .map(to_u64)
-                .transpose()?,
-            algorithm: RollAlgorithm::ChaCha20V1,
-            cursor_before: to_u64(row.try_get("cursor_before").map_err(db)?)?,
-            cursor_after: to_u64(row.try_get("cursor_after").map_err(db)?)?,
-        },
-        created_at_epoch: to_u64(row.try_get("created_at_epoch").map_err(db)?)?,
-    }))
-}
-
-fn consent_projection_from_row(
-    row: PgRow,
-) -> Result<ConsentGrantProjection, PrivateInspirationError> {
-    let schema = to_u64(row.try_get("schema_version").map_err(db)?)?;
-    let audience: String = row.try_get("audience").map_err(db)?;
-    let transformation: String = row.try_get("transformation").map_err(db)?;
-    if schema != u64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
-        || audience != "private_campaign"
-        || transformation != "high_fiction_distance_v1"
-    {
-        return Err(invalid("stored_consent_policy"));
-    }
-    Ok(ConsentGrantProjection {
-        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        grant_id: OpaqueInspirationId::new(row.try_get::<String, _>("grant_id").map_err(db)?)?,
-        source_id: OpaqueInspirationId::new(row.try_get::<String, _>("source_id").map_err(db)?)?,
-        source_version: to_u64(row.try_get("source_version").map_err(db)?)?,
-        source_digest: stored_digest(row.try_get("source_digest").map_err(db)?)?,
-        participant_id: OpaqueInspirationId::new(
-            row.try_get::<String, _>("participant_id").map_err(db)?,
-        )?,
-        audience: InspirationAudience::PrivateCampaign,
-        media: InspirationMedia::parse(&row.try_get::<String, _>("media").map_err(db)?)?,
-        transformation: InspirationTransformation::HighFictionDistanceV1,
-        artifact_policy: DerivedArtifactPolicy::parse(
-            &row.try_get::<String, _>("artifact_policy").map_err(db)?,
-        )?,
-        expires_at_epoch: to_u64(row.try_get("expires_at_epoch").map_err(db)?)?,
-        state: ConsentGrantState::parse(&row.try_get::<String, _>("state").map_err(db)?)?,
-    })
-}
-
-async fn load_settings_for_update(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<Option<CampaignInspirationSettingsProjection>, PrivateInspirationError> {
-    let row = sqlx::query(&format!(
-        "SELECT {SETTINGS_COLUMNS} FROM campaign_inspiration_settings
-         WHERE campaign_session_id = $1 FOR UPDATE"
-    ))
-    .bind(campaign_session_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?;
-    row.map(settings_from_row).transpose()
-}
-
-fn settings_from_row(
-    row: PgRow,
-) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
-    let schema = to_u64(row.try_get("schema_version").map_err(db)?)?;
-    let fictional_distance: String = row.try_get("fictional_distance").map_err(db)?;
-    let audience: String = row.try_get("audience").map_err(db)?;
-    let media: String = row.try_get("media").map_err(db)?;
-    let q11_policy_id: String = row.try_get("q11_policy_id").map_err(db)?;
-    let tone = CampaignInspirationTone::parse(&row.try_get::<String, _>("tone").map_err(db)?)?;
-    let adults_only: bool = row.try_get("adults_only").map_err(db)?;
-    if schema != u64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION)
-        || fictional_distance != "high_locked"
-        || audience != "private_campaign"
-        || media != "text"
-        || q11_policy_id != Q11_CONSERVATIVE_POLICY_ID
-        || !adults_only
-    {
-        return Err(invalid("stored_settings_policy"));
-    }
-    Ok(CampaignInspirationSettingsProjection {
-        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        campaign_session_id: OpaqueInspirationId::new(
-            row.try_get::<String, _>("campaign_session_id")
-                .map_err(db)?,
-        )?,
-        revision: to_u64(row.try_get("revision").map_err(db)?)?,
-        enabled: row.try_get("enabled").map_err(db)?,
-        generation_paused: row.try_get("generation_paused").map_err(db)?,
-        safety_setup_complete: row.try_get("safety_setup_complete").map_err(db)?,
-        adults_only,
-        fictional_distance_locked_high: true,
-        tone,
-        line_count: u32::try_from(to_u64(row.try_get("line_count").map_err(db)?)?)
-            .map_err(|_| invalid("stored_line_count"))?,
-        veil_count: u32::try_from(to_u64(row.try_get("veil_count").map_err(db)?)?)
-            .map_err(|_| invalid("stored_veil_count"))?,
-        excluded_topic_count: u32::try_from(to_u64(
-            row.try_get("excluded_topic_count").map_err(db)?,
-        )?)
-        .map_err(|_| invalid("stored_excluded_topic_count"))?,
-        excluded_participant_count: u32::try_from(to_u64(
-            row.try_get("excluded_participant_count").map_err(db)?,
-        )?)
-        .map_err(|_| invalid("stored_excluded_participant_count"))?,
-        audience: InspirationAudience::PrivateCampaign,
-        media: InspirationMedia::Text,
-        q11_policy_id,
-        updated_at_epoch: to_u64(row.try_get("updated_at_epoch").map_err(db)?)?,
-    })
-}
-
-async fn ensure_verified_participant(
-    transaction: &mut Transaction<'_, Postgres>,
-    participant_id: &str,
-) -> Result<(), PrivateInspirationError> {
-    let row = sqlx::query(
-        "SELECT verification_state, verification_method
-         FROM private_inspiration_participants
-         WHERE participant_id = $1 FOR UPDATE",
-    )
-    .bind(participant_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?;
-    let Some(row) = row else {
-        return Err(PrivateInspirationError::ScopeDenied);
-    };
-    let state: String = row.try_get("verification_state").map_err(db)?;
-    ParticipantVerificationMethod::parse(
-        &row.try_get::<String, _>("verification_method")
-            .map_err(db)?,
-    )?;
-    if state != "verified" {
-        return Err(PrivateInspirationError::ScopeDenied);
-    }
-    Ok(())
-}
-
-async fn replace_campaign_safety_setup(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    setup: Option<&SafetySetupEvidence>,
-) -> Result<(), PrivateInspirationError> {
-    for table in [
-        "campaign_inspiration_allowed_sensitivities",
-        "campaign_inspiration_lines",
-        "campaign_inspiration_veils",
-        "campaign_inspiration_excluded_topics",
-        "campaign_inspiration_excluded_participants",
-    ] {
-        sqlx::query(&format!(
-            "DELETE FROM {table} WHERE campaign_session_id = $1"
-        ))
-        .bind(campaign_session_id)
-        .execute(&mut **transaction)
+    let turn_number = campaign.session.last_event_sequence;
+    let event_document = turn_events
+        .find_one(doc! {
+            "campaign_id": &campaign.id,
+            "sequence": inspiration_i64_persistence(
+                turn_number,
+                CollectionName::TurnEvents,
+            )?,
+        })
+        .session(&mut *session)
         .await
-        .map_err(db)?;
+        .map_err(|error| PersistenceError::mongo("load inspiration trigger event", error))?
+        .ok_or_else(|| {
+            private_schema(
+                CollectionName::TurnEvents,
+                "inspiration trigger event is missing",
+            )
+        })?;
+    let event: SessionEventDto =
+        decode_field(&event_document, "event", CollectionName::TurnEvents)?;
+    event.validate().map_err(|_| {
+        private_schema(
+            CollectionName::TurnEvents,
+            "inspiration trigger event is invalid",
+        )
+    })?;
+    if event.session_id != campaign.id || event.sequence != turn_number {
+        return Err(private_schema(
+            CollectionName::TurnEvents,
+            "inspiration trigger event identity is invalid",
+        ));
     }
-    let Some(setup) = setup else {
-        return Ok(());
+    let safe = match event.payload {
+        SessionEventPayload::AbilityCheckResolved { .. }
+        | SessionEventPayload::ExplorationSocialResolved { .. }
+        | SessionEventPayload::GmNarration { .. }
+        | SessionEventPayload::ExperienceAwarded { .. }
+        | SessionEventPayload::AiProposalAccepted { .. }
+        | SessionEventPayload::AiProposalRejected { .. } => true,
+        SessionEventPayload::EncounterResolved { outcome, .. } => {
+            matches!(outcome.resolution.state.status, EncounterStatus::Victory)
+                || (matches!(outcome.resolution.state.status, EncounterStatus::Defeat)
+                    && outcome
+                        .resolution
+                        .state
+                        .transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.story_recovery_applied))
+        }
+        SessionEventPayload::SessionStarted
+        | SessionEventPayload::PlayerIntent { .. }
+        | SessionEventPayload::DiceResolved { .. }
+        | SessionEventPayload::SessionEnded => false,
     };
-    for (table, column, codes) in [
-        (
-            "campaign_inspiration_allowed_sensitivities",
-            "sensitivity_code",
-            &setup.allowed_sensitivity_codes,
-        ),
-        (
-            "campaign_inspiration_lines",
-            "safety_code",
-            &setup.line_codes,
-        ),
-        (
-            "campaign_inspiration_veils",
-            "safety_code",
-            &setup.veil_codes,
-        ),
-        (
-            "campaign_inspiration_excluded_topics",
-            "safety_code",
-            &setup.excluded_topic_codes,
-        ),
-        (
-            "campaign_inspiration_excluded_participants",
-            "participant_id",
-            &setup.excluded_participant_ids,
-        ),
-    ] {
-        for code in codes {
-            sqlx::query(&format!(
-                "INSERT INTO {table} (campaign_session_id, {column}) VALUES ($1, $2)"
-            ))
-            .bind(campaign_session_id)
-            .bind(code.as_str())
-            .execute(&mut **transaction)
+    if !safe {
+        return Ok(None);
+    }
+    Ok(Some((
+        turn_number,
+        OpaqueInspirationId::new(format!("trigger-window:{turn_number}"))
+            .map_err(domain_as_schema)?,
+    )))
+}
+
+async fn trusted_party_level(
+    character_instances: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+) -> Result<u8, PersistenceError> {
+    let mut cursor = character_instances
+        .find(doc! { "campaign_id": campaign_id, "state": "active" })
+        .sort(doc! { "_id": 1_i64 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load inspiration party", error))?;
+    let mut party_level = None;
+    while cursor
+        .advance(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("read inspiration party", error))?
+    {
+        let document = cursor.deserialize_current().map_err(|_| {
+            private_schema(
+                CollectionName::CampaignCharacterInstances,
+                "party character document could not be decoded",
+            )
+        })?;
+        let runtime = document.get_document("runtime").map_err(|_| {
+            private_schema(
+                CollectionName::CampaignCharacterInstances,
+                "party character runtime is missing",
+            )
+        })?;
+        let level = if let Some(value) = runtime.get("hero_character") {
+            let hero: HeroCharacter = bson::from_bson(value.clone()).map_err(|_| {
+                private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "hero runtime could not be decoded",
+                )
+            })?;
+            hero.validate().map_err(|_| {
+                private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "hero runtime failed validation",
+                )
+            })?;
+            if hero.campaign_id != campaign_id {
+                return Err(private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "hero runtime belongs to another campaign",
+                ));
+            }
+            hero.level.value()
+        } else if let Some(value) = runtime.get("hero") {
+            let hero: HeroCharacter = bson::from_bson(value.clone()).map_err(|_| {
+                private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "campaign hero runtime could not be decoded",
+                )
+            })?;
+            hero.validate().map_err(|_| {
+                private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "campaign hero runtime failed validation",
+                )
+            })?;
+            if hero.campaign_id != campaign_id {
+                return Err(private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "campaign hero runtime belongs to another campaign",
+                ));
+            }
+            hero.level.value()
+        } else if let Some(value) = runtime.get("character_snapshot") {
+            let character: Character = bson::from_bson(value.clone()).map_err(|_| {
+                private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "core character runtime could not be decoded",
+                )
+            })?;
+            character.validate().map_err(|_| {
+                private_schema(
+                    CollectionName::CampaignCharacterInstances,
+                    "core character runtime failed validation",
+                )
+            })?;
+            character.level().value()
+        } else {
+            return Err(private_schema(
+                CollectionName::CampaignCharacterInstances,
+                "party character runtime kind is unsupported",
+            ));
+        };
+        party_level = Some(party_level.map_or(level, |current: u8| current.max(level)));
+    }
+    party_level.ok_or_else(|| {
+        private_schema(
+            CollectionName::CampaignCharacterInstances,
+            "campaign party is missing",
+        )
+    })
+}
+
+async fn load_work(
+    work: &Collection<WorkDocument>,
+    session: &mut ClientSession,
+    filter: Document,
+) -> Result<Vec<WorkDocument>, PersistenceError> {
+    let mut cursor = work
+        .find(filter)
+        .sort(doc! { "campaign_id": 1_i64, "_id": 1_i64 })
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("load private inspiration work", error))?;
+    let mut output = Vec::new();
+    while cursor
+        .advance(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("read private inspiration work", error))?
+    {
+        let item: WorkDocument = cursor.deserialize_current().map_err(|_| {
+            private_schema(
+                CollectionName::PrivateInspirationWork,
+                "private inspiration work document could not be decoded",
+            )
+        })?;
+        item.validate().map_err(domain_as_schema)?;
+        output.push(item);
+    }
+    Ok(output)
+}
+
+async fn cancel_pending_work(
+    work: &Collection<WorkDocument>,
+    audits: &Collection<Document>,
+    session: &mut ClientSession,
+    mut filter: Document,
+    now_epoch: u64,
+    now: DateTime,
+) -> Result<Vec<OpaqueInspirationId>, PersistenceError> {
+    filter.insert("state", "pending");
+    let pending = load_work(work, session, filter).await?;
+    let mut ids = Vec::with_capacity(pending.len());
+    for item in pending {
+        let cancellation_requested_at_epoch = item.created_at_epoch.max(
+            inspiration_i64_persistence(now_epoch, CollectionName::PrivateInspirationWork)?,
+        );
+        let updated = work
+            .update_one(
+                doc! {
+                    "_id": &item.id,
+                    "campaign_id": &item.campaign_id,
+                    "state": "pending",
+                },
+                doc! {
+                    "$set": {
+                        "state": "cancellation_requested",
+                        "cancellation_requested_at_epoch": cancellation_requested_at_epoch,
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *session)
             .await
-            .map_err(db)?;
+            .map_err(|error| PersistenceError::mongo("cancel private inspiration work", error))?;
+        if updated.matched_count != 1 {
+            return Err(private_schema(
+                CollectionName::PrivateInspirationWork,
+                "pending work changed during cancellation",
+            ));
         }
-    }
-    Ok(())
-}
-
-async fn load_allowed_sensitivities(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<BTreeSet<String>, PrivateInspirationError> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT sensitivity_code
-         FROM campaign_inspiration_allowed_sensitivities
-         WHERE campaign_session_id = $1 ORDER BY sensitivity_code",
-    )
-    .bind(campaign_session_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .collect())
-}
-
-async fn load_campaign_safety_exclusions(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-) -> Result<(BTreeSet<String>, BTreeSet<String>), PrivateInspirationError> {
-    let safety_codes = sqlx::query_scalar::<_, String>(
-        "SELECT safety_code FROM campaign_inspiration_lines
-         WHERE campaign_session_id = $1
-         UNION
-         SELECT safety_code FROM campaign_inspiration_veils
-         WHERE campaign_session_id = $1
-         UNION
-         SELECT safety_code FROM campaign_inspiration_excluded_topics
-         WHERE campaign_session_id = $1
-         ORDER BY 1",
-    )
-    .bind(campaign_session_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .collect();
-    let participants = sqlx::query_scalar::<_, String>(
-        "SELECT participant_id FROM campaign_inspiration_excluded_participants
-         WHERE campaign_session_id = $1 ORDER BY participant_id",
-    )
-    .bind(campaign_session_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .collect();
-    Ok((safety_codes, participants))
-}
-
-async fn source_is_vetoed(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    source: &StoredSource,
-) -> Result<bool, PrivateInspirationError> {
-    sqlx::query_scalar(
-        "SELECT EXISTS(
-           SELECT 1 FROM private_inspiration_vetoes
-           WHERE campaign_session_id = $1 AND state = 'active'
-             AND (
-               scope_kind = 'campaign'
-               OR (scope_kind = 'category' AND category_id = $2)
-               OR (scope_kind = 'source_version' AND source_id = $3
-                   AND source_version = $4 AND source_digest = $5)
-             )
-         )",
-    )
-    .bind(campaign_session_id)
-    .bind(source.projection.category_id.as_str())
-    .bind(source.projection.source_id.as_str())
-    .bind(inspiration_to_i64(source.projection.source_version)?)
-    .bind(source.projection.source_digest.as_str())
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(db)
-}
-
-async fn insert_owner_veto(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    scope: &InspirationVetoScope,
-    presentation_id: &str,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    let veto_id = internal_id("inspiration-veto")?;
-    let (scope_kind, category_id, source_id, source_version, source_digest) = match scope {
-        InspirationVetoScope::Campaign => ("campaign", None, None, None, None),
-        InspirationVetoScope::Category { category_id } => {
-            ("category", Some(category_id.as_str()), None, None, None)
-        }
-        InspirationVetoScope::SourceVersion {
-            source_id,
-            source_version,
-            source_digest,
-        } => (
-            "source_version",
-            None,
-            Some(source_id.as_str()),
-            Some(inspiration_to_i64(*source_version)?),
-            Some(source_digest.as_str()),
-        ),
-    };
-    sqlx::query(
-        "INSERT INTO private_inspiration_vetoes
-         (veto_id, schema_version, campaign_session_id, participant_id,
-          actor_kind, scope_kind, category_id, source_id, source_version,
-          source_digest, veto_code, created_at_epoch)
-         VALUES ($1, $2, $3, NULL, 'campaign_owner', $4, $5, $6, $7, $8,
-                 'safety_veto', $9)",
-    )
-    .bind(veto_id.as_str())
-    .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-    .bind(campaign_session_id)
-    .bind(scope_kind)
-    .bind(category_id)
-    .bind(source_id)
-    .bind(source_version)
-    .bind(source_digest)
-    .bind(inspiration_to_i64(now)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(db)?;
-    insert_privacy_audit(
-        transaction,
-        Some(campaign_session_id),
-        "owner_veto_applied",
-        "veto",
-        veto_id.as_str(),
-        Some(presentation_id),
-        "applied",
-        now,
-    )
-    .await
-}
-
-async fn cancel_source_pending_work(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    source_id: &str,
-    source_version: u64,
-    now: u64,
-) -> Result<Vec<OpaqueInspirationId>, PrivateInspirationError> {
-    let rows = sqlx::query(
-        "UPDATE private_inspiration_derived_work
-         SET state = 'cancellation_requested', cancellation_requested_at_epoch = $4
-         WHERE campaign_session_id = $1 AND source_id = $2
-           AND source_version = $3 AND state = 'pending'
-         RETURNING work_id",
-    )
-    .bind(campaign_session_id)
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .bind(inspiration_to_i64(now)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    audit_cancelled_work(transaction, campaign_session_id, rows, now).await
-}
-
-async fn cancel_vetoed_pending_work(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    scope: &InspirationVetoScope,
-    now: u64,
-) -> Result<Vec<OpaqueInspirationId>, PrivateInspirationError> {
-    let rows = match scope {
-        InspirationVetoScope::Campaign => sqlx::query(
-            "UPDATE private_inspiration_derived_work
-                 SET state = 'cancellation_requested', cancellation_requested_at_epoch = $2
-                 WHERE campaign_session_id = $1 AND state = 'pending'
-                 RETURNING work_id",
-        )
-        .bind(campaign_session_id)
-        .bind(inspiration_to_i64(now)?)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?,
-        InspirationVetoScope::Category { category_id } => sqlx::query(
-            "UPDATE private_inspiration_derived_work AS work
-                 SET state = 'cancellation_requested', cancellation_requested_at_epoch = $3
-                 FROM private_inspiration_sources AS source
-                 WHERE work.campaign_session_id = $1 AND work.state = 'pending'
-                   AND source.source_id = work.source_id
-                   AND source.source_version = work.source_version
-                   AND source.category_id = $2
-                 RETURNING work.work_id",
-        )
-        .bind(campaign_session_id)
-        .bind(category_id.as_str())
-        .bind(inspiration_to_i64(now)?)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?,
-        InspirationVetoScope::SourceVersion {
-            source_id,
-            source_version,
-            ..
-        } => sqlx::query(
-            "UPDATE private_inspiration_derived_work
-                 SET state = 'cancellation_requested', cancellation_requested_at_epoch = $4
-                 WHERE campaign_session_id = $1 AND source_id = $2
-                   AND source_version = $3 AND state = 'pending'
-                 RETURNING work_id",
-        )
-        .bind(campaign_session_id)
-        .bind(source_id.as_str())
-        .bind(inspiration_to_i64(*source_version)?)
-        .bind(inspiration_to_i64(now)?)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?,
-    };
-    audit_cancelled_work(transaction, campaign_session_id, rows, now).await
-}
-
-async fn audit_cancelled_work(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    rows: Vec<PgRow>,
-    now: u64,
-) -> Result<Vec<OpaqueInspirationId>, PrivateInspirationError> {
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id = OpaqueInspirationId::new(row.try_get::<String, _>("work_id").map_err(db)?)?;
         insert_privacy_audit(
-            transaction,
-            Some(campaign_session_id),
+            audits,
+            session,
+            Some(&item.campaign_id),
             "derived_work_cancel_requested",
             "derived_work",
-            id.as_str(),
+            &item.id,
             None,
             "cancel_requested",
             now,
+            None,
         )
         .await?;
-        ids.push(id);
+        ids.push(OpaqueInspirationId::new(item.id).map_err(domain_as_schema)?);
     }
     ids.sort();
     Ok(ids)
 }
 
-async fn apply_source_completed_work_policy(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    source_id: &str,
-    source_version: u64,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    let rows = sqlx::query(
-        "SELECT work_id, artifact_policy, completed_artifact_id
-         FROM private_inspiration_derived_work
-         WHERE campaign_session_id = $1 AND source_id = $2
-           AND source_version = $3 AND state IN ('completed', 'redacted')
-         ORDER BY work_id FOR UPDATE",
-    )
-    .bind(campaign_session_id)
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    apply_completed_work_policy(transaction, campaign_session_id, rows, now).await
-}
-
-async fn apply_campaign_completed_work_policy(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    let rows = sqlx::query(
-        "SELECT work_id, artifact_policy, completed_artifact_id
-         FROM private_inspiration_derived_work
-         WHERE campaign_session_id = $1 AND state IN ('completed', 'redacted')
-         ORDER BY work_id FOR UPDATE",
-    )
-    .bind(campaign_session_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    apply_completed_work_policy(transaction, campaign_session_id, rows, now).await
-}
-
-async fn apply_vetoed_completed_work_policy(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    scope: &InspirationVetoScope,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    let rows = match scope {
-        InspirationVetoScope::Campaign => sqlx::query(
-            "SELECT work_id, artifact_policy, completed_artifact_id
-                 FROM private_inspiration_derived_work
-                 WHERE campaign_session_id = $1
-                   AND state IN ('completed', 'redacted')
-                 ORDER BY work_id FOR UPDATE",
-        )
-        .bind(campaign_session_id)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?,
-        InspirationVetoScope::Category { category_id } => sqlx::query(
-            "SELECT work.work_id, work.artifact_policy,
-                        work.completed_artifact_id
-                 FROM private_inspiration_derived_work AS work
-                 JOIN private_inspiration_sources AS source
-                   ON source.source_id = work.source_id
-                  AND source.source_version = work.source_version
-                 WHERE work.campaign_session_id = $1
-                   AND work.state IN ('completed', 'redacted')
-                   AND source.category_id = $2
-                 ORDER BY work.work_id FOR UPDATE OF work",
-        )
-        .bind(campaign_session_id)
-        .bind(category_id.as_str())
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?,
-        InspirationVetoScope::SourceVersion {
-            source_id,
-            source_version,
-            ..
-        } => sqlx::query(
-            "SELECT work_id, artifact_policy, completed_artifact_id
-                 FROM private_inspiration_derived_work
-                 WHERE campaign_session_id = $1 AND source_id = $2
-                   AND source_version = $3
-                   AND state IN ('completed', 'redacted')
-                 ORDER BY work_id FOR UPDATE",
-        )
-        .bind(campaign_session_id)
-        .bind(source_id.as_str())
-        .bind(inspiration_to_i64(*source_version)?)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(db)?,
-    };
-    apply_completed_work_policy(transaction, campaign_session_id, rows, now).await
-}
-
 async fn apply_completed_work_policy(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    rows: Vec<PgRow>,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    for row in rows {
-        let work_id = OpaqueInspirationId::new(row.try_get::<String, _>("work_id").map_err(db)?)?;
-        let policy = DerivedArtifactPolicy::parse(
-            &row.try_get::<String, _>("artifact_policy").map_err(db)?,
-        )?;
-        let artifact_id: String = row
-            .try_get::<Option<String>, _>("completed_artifact_id")
-            .map_err(db)?
-            .ok_or_else(|| invalid("completed_work_artifact_missing"))?;
-        if !manchester_dnd_core::is_valid_opaque_id(&artifact_id) {
-            return Err(invalid("completed_work_artifact_invalid"));
+    work: &Collection<WorkDocument>,
+    presentations: &Collection<Document>,
+    audits: &Collection<Document>,
+    session: &mut ClientSession,
+    completed: Vec<WorkDocument>,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    for item in completed {
+        if !matches!(item.state.as_str(), "completed" | "redacted") {
+            return Err(private_schema(
+                CollectionName::PrivateInspirationWork,
+                "completed work policy received non-completed work",
+            ));
         }
-
-        let (state, retained_artifact_id, operation) = match policy {
+        let policy =
+            DerivedArtifactPolicy::parse(&item.artifact_policy).map_err(domain_as_schema)?;
+        let artifact_id = item.completed_artifact_id.as_deref().ok_or_else(|| {
+            private_schema(
+                CollectionName::PrivateInspirationWork,
+                "completed work artifact is missing",
+            )
+        })?;
+        if !manchester_dnd_core::is_valid_opaque_id(artifact_id) {
+            return Err(private_schema(
+                CollectionName::PrivateInspirationWork,
+                "completed work artifact id is invalid",
+            ));
+        }
+        let (state, retained_artifact, action) = match policy {
             DerivedArtifactPolicy::RedactDerived => {
-                let redacted = sqlx::query(
-                    "UPDATE generated_text_presentations
-                     SET body = $3, privacy_state = 'redacted',
-                         updated_at = CURRENT_TIMESTAMP
-                     WHERE id = $1 AND private_inspiration_work_id = $2",
-                )
-                .bind(&artifact_id)
-                .bind(work_id.as_str())
-                .bind(PRIVATE_INSPIRATION_REDACTION_BODY)
-                .execute(&mut **transaction)
-                .await
-                .map_err(db)?;
-                if redacted.rows_affected() == 1 {
+                let redacted = presentations
+                    .update_one(
+                        doc! {
+                            "_id": artifact_id,
+                            "campaign_id": &item.campaign_id,
+                            "private_inspiration_work_id": &item.id,
+                        },
+                        doc! {
+                            "$set": {
+                                "body": PRIVATE_INSPIRATION_REDACTION_BODY,
+                                "privacy_state": "redacted",
+                                "updated_at": now,
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("redact completed inspiration presentation", error)
+                    })?;
+                if redacted.matched_count == 1 {
                     (
                         "redacted",
-                        Some(artifact_id.as_str()),
+                        Some(artifact_id.to_owned()),
                         "derived_work_redacted",
                     )
                 } else {
@@ -3638,1275 +2046,3601 @@ async fn apply_completed_work_policy(
                 }
             }
             DerivedArtifactPolicy::DeleteDerived | DerivedArtifactPolicy::RetainMinimalAudit => {
-                sqlx::query(
-                    "DELETE FROM generated_text_presentations
-                     WHERE id = $1 AND private_inspiration_work_id = $2",
-                )
-                .bind(&artifact_id)
-                .bind(work_id.as_str())
-                .execute(&mut **transaction)
-                .await
-                .map_err(db)?;
+                presentations
+                    .delete_one(doc! {
+                        "_id": artifact_id,
+                        "campaign_id": &item.campaign_id,
+                        "private_inspiration_work_id": &item.id,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("delete completed inspiration presentation", error)
+                    })?;
                 ("deleted", None, "derived_work_deleted")
             }
         };
-        sqlx::query(
-            "UPDATE private_inspiration_derived_work
-             SET state = $2, completed_artifact_id = $3
-             WHERE work_id = $1 AND state IN ('completed', 'redacted')",
-        )
-        .bind(work_id.as_str())
-        .bind(state)
-        .bind(retained_artifact_id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(db)?;
+        let updated = work
+            .update_one(
+                doc! {
+                    "_id": &item.id,
+                    "state": { "$in": ["completed", "redacted"] },
+                },
+                doc! {
+                    "$set": {
+                        "state": state,
+                        "completed_artifact_id": retained_artifact
+                            .map_or(Bson::Null, Bson::String),
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("apply completed inspiration work policy", error)
+            })?;
+        if updated.matched_count != 1 {
+            return Err(private_schema(
+                CollectionName::PrivateInspirationWork,
+                "completed work changed during privacy transition",
+            ));
+        }
         insert_privacy_audit(
-            transaction,
-            Some(campaign_session_id),
-            operation,
+            audits,
+            session,
+            Some(&item.campaign_id),
+            action,
             "derived_work",
-            work_id.as_str(),
-            Some(&artifact_id),
+            &item.id,
+            Some(artifact_id),
             "applied",
             now,
+            None,
         )
         .await?;
     }
     Ok(())
 }
 
-const fn artifact_policy_rank(policy: DerivedArtifactPolicy) -> u8 {
-    match policy {
-        DerivedArtifactPolicy::DeleteDerived => 3,
-        DerivedArtifactPolicy::RedactDerived => 2,
-        DerivedArtifactPolicy::RetainMinimalAudit => 1,
+async fn quarantine_all_private_inspiration_work(
+    work: &Collection<WorkDocument>,
+    presentations: &Collection<Document>,
+    audits: &Collection<Document>,
+    session: &mut ClientSession,
+    now_epoch: u64,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    cancel_pending_work(work, audits, session, Document::new(), now_epoch, now).await?;
+    let completed = load_work(
+        work,
+        session,
+        doc! { "state": { "$in": ["completed", "redacted"] } },
+    )
+    .await?;
+    for item in completed {
+        let artifact_id = item.completed_artifact_id.as_deref().ok_or_else(|| {
+            private_schema(
+                CollectionName::PrivateInspirationWork,
+                "completed work artifact is missing",
+            )
+        })?;
+        let redacted = presentations
+            .update_one(
+                doc! {
+                    "_id": artifact_id,
+                    "campaign_id": &item.campaign_id,
+                    "private_inspiration_work_id": &item.id,
+                },
+                doc! {
+                    "$set": {
+                        "body": PRIVATE_INSPIRATION_REDACTION_BODY,
+                        "privacy_state": "redacted",
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                PersistenceError::mongo("quarantine inspiration presentation", error)
+            })?;
+        if redacted.matched_count == 0 {
+            continue;
+        }
+        let updated = work
+            .update_one(
+                doc! {
+                    "_id": &item.id,
+                    "state": { "$in": ["completed", "redacted"] },
+                },
+                doc! {
+                    "$set": {
+                        "state": "redacted",
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *session)
+            .await
+            .map_err(|error| PersistenceError::mongo("quarantine inspiration work", error))?;
+        if updated.matched_count != 1 {
+            return Err(private_schema(
+                CollectionName::PrivateInspirationWork,
+                "completed work changed during global quarantine",
+            ));
+        }
+        insert_privacy_audit(
+            audits,
+            session,
+            Some(&item.campaign_id),
+            "derived_work_redacted",
+            "derived_work",
+            &item.id,
+            Some(artifact_id),
+            "applied",
+            now,
+            None,
+        )
+        .await?;
     }
+    Ok(())
 }
 
-async fn load_source_for_update(
-    transaction: &mut Transaction<'_, Postgres>,
-    source_id: &str,
-    source_version: u64,
-) -> Result<Option<StoredSource>, PrivateInspirationError> {
-    let row = sqlx::query(
-        "SELECT source_id, source_version, source_digest, schema_version,
-                category_id, review_state, q11_screened, expires_at_epoch
-         FROM private_inspiration_sources
-         WHERE source_id = $1 AND source_version = $2 FOR UPDATE",
-    )
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let participants: BTreeSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT participant_id FROM private_inspiration_source_participants
-         WHERE source_id = $1 AND source_version = $2 ORDER BY participant_id",
-    )
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .collect();
-    let sensitivities: BTreeSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT sensitivity_code FROM private_inspiration_source_sensitivities
-         WHERE source_id = $1 AND source_version = $2 ORDER BY sensitivity_code",
-    )
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .collect();
-    let media = sqlx::query_scalar::<_, String>(
-        "SELECT media FROM private_inspiration_source_media
-         WHERE source_id = $1 AND source_version = $2 ORDER BY media",
-    )
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .map(|value| InspirationMedia::parse(&value))
-    .collect::<Result<BTreeSet<_>, _>>()?;
-    let theme_pack_ids = sqlx::query_scalar::<_, String>(
-        "SELECT theme_pack_id FROM private_inspiration_source_themes
-         WHERE source_id = $1 AND source_version = $2 ORDER BY theme_pack_id",
-    )
-    .bind(source_id)
-    .bind(inspiration_to_i64(source_version)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let projection = source_projection_from_row(
-        row,
-        participants.len(),
-        sensitivities.len(),
-        media,
-        &theme_pack_ids,
-    )?;
-    Ok(Some(StoredSource {
-        projection,
-        participants,
-        sensitivities,
-        theme_pack_ids,
-    }))
+async fn revoke_campaign_consents(
+    consents: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    now_epoch: u64,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    consents
+        .update_many(
+            doc! { "campaign_id": campaign_id, "state": "active" },
+            doc! {
+                "$set": {
+                    "state": "revoked",
+                    "projection.state": "revoked",
+                    "revoked_at_epoch": inspiration_i64_persistence(
+                        now_epoch,
+                        CollectionName::PrivateInspirationConsents,
+                    )?,
+                    "revocation_code": "campaign_disabled",
+                    "updated_at": now,
+                }
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| PersistenceError::mongo("revoke campaign inspiration consents", error))?;
+    Ok(())
 }
 
-fn source_projection_from_row(
-    row: PgRow,
-    participant_count: usize,
-    sensitivity_count: usize,
-    eligible_media: BTreeSet<InspirationMedia>,
-    theme_pack_ids: &BTreeSet<String>,
-) -> Result<SourceVersionProjection, PrivateInspirationError> {
-    let schema = to_u64(row.try_get("schema_version").map_err(db)?)?;
-    if schema != u64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION) {
-        return Err(invalid("stored_source_schema"));
-    }
-    Ok(SourceVersionProjection {
-        schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-        source_id: OpaqueInspirationId::new(row.try_get::<String, _>("source_id").map_err(db)?)?,
-        source_version: to_u64(row.try_get("source_version").map_err(db)?)?,
-        source_digest: stored_digest(row.try_get("source_digest").map_err(db)?)?,
-        category_id: OpaqueInspirationId::new(
-            row.try_get::<String, _>("category_id").map_err(db)?,
-        )?,
-        review_state: SourceReviewState::parse(
-            &row.try_get::<String, _>("review_state").map_err(db)?,
-        )?,
-        q11_screened: row.try_get("q11_screened").map_err(db)?,
-        participant_count: u32::try_from(participant_count)
-            .map_err(|_| invalid("stored_participant_count"))?,
-        sensitivity_count: u32::try_from(sensitivity_count)
-            .map_err(|_| invalid("stored_sensitivity_count"))?,
-        eligible_media,
-        eligible_theme_pack_ids: theme_pack_ids
-            .iter()
-            .map(|theme_pack_id| OpaqueInspirationId::new(theme_pack_id.clone()))
-            .collect::<Result<_, _>>()?,
-        expires_at_epoch: row
-            .try_get::<Option<i64>, _>("expires_at_epoch")
-            .map_err(db)?
-            .map(to_u64)
-            .transpose()?,
+fn source_key_filter(sources: &[SourceDocument]) -> Vec<Bson> {
+    sources
+        .iter()
+        .map(|source| {
+            Bson::Document(doc! {
+                "source_id": &source.logical_id,
+                "source_revision": source.revision,
+            })
+        })
+        .collect()
+}
+
+struct VetoScopeFields {
+    scope_kind: &'static str,
+    category_id: Bson,
+    source_id: Bson,
+    source_revision: Bson,
+    source_digest: Bson,
+}
+
+fn veto_scope_fields(
+    scope: &InspirationVetoScope,
+) -> Result<VetoScopeFields, PrivateInspirationError> {
+    Ok(match scope {
+        InspirationVetoScope::Campaign => VetoScopeFields {
+            scope_kind: "campaign",
+            category_id: Bson::Null,
+            source_id: Bson::Null,
+            source_revision: Bson::Null,
+            source_digest: Bson::Null,
+        },
+        InspirationVetoScope::Category { category_id } => VetoScopeFields {
+            scope_kind: "category",
+            category_id: Bson::String(category_id.to_string()),
+            source_id: Bson::Null,
+            source_revision: Bson::Null,
+            source_digest: Bson::Null,
+        },
+        InspirationVetoScope::SourceVersion {
+            source_id,
+            source_version,
+            source_digest,
+        } => VetoScopeFields {
+            scope_kind: "source_version",
+            category_id: Bson::Null,
+            source_id: Bson::String(source_id.to_string()),
+            source_revision: Bson::Int64(inspiration_i64(
+                *source_version,
+                "veto_source_revision_range",
+            )?),
+            source_digest: Bson::String(source_digest.as_str().to_owned()),
+        },
     })
 }
 
-async fn load_receipt<T: DeserializeOwned>(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    idempotency_key: &str,
-    operation_code: &str,
-    request_fingerprint: &Sha256Digest,
-) -> Result<Option<T>, PrivateInspirationError> {
-    let row = sqlx::query(
-        "SELECT operation_code, request_fingerprint, response_json
-         FROM private_inspiration_command_receipts
-         WHERE campaign_session_id = $1 AND idempotency_key = $2",
-    )
-    .bind(campaign_session_id)
-    .bind(idempotency_key)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(db)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let stored_operation: String = row.try_get("operation_code").map_err(db)?;
-    let stored_fingerprint: String = row.try_get("request_fingerprint").map_err(db)?;
-    if stored_operation != operation_code || stored_fingerprint != request_fingerprint.as_str() {
-        return Err(PrivateInspirationError::IdempotencyConflict);
+const fn veto_scope_name(scope: &InspirationVetoScope) -> &'static str {
+    match scope {
+        InspirationVetoScope::Campaign => "campaign",
+        InspirationVetoScope::Category { .. } => "category",
+        InspirationVetoScope::SourceVersion { .. } => "source_version",
     }
-    let response: String = row.try_get("response_json").map_err(db)?;
-    serde_json::from_str(&response)
-        .map(Some)
-        .map_err(|_| invalid("stored_receipt_response"))
 }
 
-async fn insert_receipt<T: Serialize>(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    idempotency_key: &str,
-    operation_code: &str,
-    request_fingerprint: &Sha256Digest,
-    response: &T,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    let response_json =
-        serde_json::to_string(response).map_err(PrivateInspirationError::Serialization)?;
-    sqlx::query(
-        "INSERT INTO private_inspiration_command_receipts
-         (campaign_session_id, idempotency_key, operation_code,
-          request_fingerprint, response_json, created_at_epoch)
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(campaign_session_id)
-    .bind(idempotency_key)
-    .bind(operation_code)
-    .bind(request_fingerprint.as_str())
-    .bind(response_json)
-    .bind(inspiration_to_i64(now)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(db)?;
-    Ok(())
+async fn work_filter_for_scope(
+    sources: &Collection<SourceDocument>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    scope: &InspirationVetoScope,
+) -> Result<Document, PersistenceError> {
+    match scope {
+        InspirationVetoScope::Campaign => Ok(doc! { "campaign_id": campaign_id }),
+        InspirationVetoScope::SourceVersion {
+            source_id,
+            source_version,
+            ..
+        } => Ok(doc! {
+            "campaign_id": campaign_id,
+            "source_id": source_id.as_str(),
+            "source_revision": inspiration_i64_persistence(
+                *source_version,
+                CollectionName::PrivateInspirationWork,
+            )?,
+        }),
+        InspirationVetoScope::Category { category_id } => {
+            let mut cursor = sources
+                .find(doc! { "category_id": category_id.as_str() })
+                .sort(doc! { "logical_id": 1_i64, "revision": 1_i64 })
+                .session(&mut *session)
+                .await
+                .map_err(|error| {
+                    PersistenceError::mongo("load category inspiration sources", error)
+                })?;
+            let mut keys = Vec::new();
+            while cursor.advance(&mut *session).await.map_err(|error| {
+                PersistenceError::mongo("read category inspiration sources", error)
+            })? {
+                let source: SourceDocument = cursor.deserialize_current().map_err(|_| {
+                    private_schema(
+                        CollectionName::PrivateInspirationSources,
+                        "category source document could not be decoded",
+                    )
+                })?;
+                keys.push(Bson::Document(doc! {
+                    "source_id": source.logical_id,
+                    "source_revision": source.revision,
+                }));
+            }
+            if keys.is_empty() {
+                Ok(doc! {
+                    "campaign_id": campaign_id,
+                    "_id": { "$exists": false },
+                })
+            } else {
+                Ok(doc! { "campaign_id": campaign_id, "$or": keys })
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn insert_privacy_audit(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: Option<&str>,
-    operation_code: &str,
-    subject_kind: &str,
-    subject_id: &str,
-    secondary_id: Option<&str>,
-    result_code: &str,
-    now: u64,
-) -> Result<(), PrivateInspirationError> {
-    let audit_id = internal_id("privacy-audit")?;
-    sqlx::query(
-        "INSERT INTO private_inspiration_privacy_audits
-         (audit_id, schema_version, campaign_session_id, operation_code,
-          subject_kind, subject_id, secondary_id, result_code, occurred_at_epoch)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+async fn insert_owner_veto(
+    vetoes: &Collection<Document>,
+    audits: &Collection<Document>,
+    session: &mut ClientSession,
+    campaign_id: &str,
+    scope: &InspirationVetoScope,
+    presentation_id: &str,
+    now_epoch: u64,
+    now: DateTime,
+) -> Result<(), PersistenceError> {
+    let veto_id = internal_id("inspiration-veto").map_err(domain_as_schema)?;
+    let fields = veto_scope_fields(scope).map_err(domain_as_schema)?;
+    vetoes
+        .insert_one(doc! {
+            "_id": veto_id.as_str(),
+            "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+            "campaign_id": campaign_id,
+            "actor_participant_id": "participant:campaign-owner",
+            "actor_kind": "campaign_owner",
+            "scope_kind": fields.scope_kind,
+            "category_id": fields.category_id,
+            "source_id": fields.source_id,
+            "source_revision": fields.source_revision,
+            "source_digest": fields.source_digest,
+            "state": "active",
+            "veto_code": "safety_veto",
+            "scope": bson_value(scope, CollectionName::PrivateInspirationVetoes)?,
+            "created_at_epoch": inspiration_i64_persistence(
+                now_epoch,
+                CollectionName::PrivateInspirationVetoes,
+            )?,
+            "created_at": now,
+            "updated_at": now,
+        })
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            PersistenceError::mongo("insert campaign-owner inspiration veto", error)
+        })?;
+    insert_privacy_audit(
+        audits,
+        session,
+        Some(campaign_id),
+        "owner_veto_applied",
+        "veto",
+        veto_id.as_str(),
+        Some(presentation_id),
+        "applied",
+        now,
+        Some(doc! { "scope_kind": veto_scope_name(scope) }),
     )
-    .bind(audit_id.as_str())
-    .bind(i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION))
-    .bind(campaign_session_id)
-    .bind(operation_code)
-    .bind(subject_kind)
-    .bind(subject_id)
-    .bind(secondary_id)
-    .bind(result_code)
-    .bind(inspiration_to_i64(now)?)
-    .execute(&mut **transaction)
     .await
-    .map_err(db)?;
-    Ok(())
 }
 
-async fn cancel_campaign_pending_work(
-    transaction: &mut Transaction<'_, Postgres>,
-    campaign_session_id: &str,
-    now: u64,
-) -> Result<Vec<OpaqueInspirationId>, PrivateInspirationError> {
-    let rows = sqlx::query(
-        "UPDATE private_inspiration_derived_work
-         SET state = 'cancellation_requested', cancellation_requested_at_epoch = $2
-         WHERE campaign_session_id = $1 AND state = 'pending'
-         RETURNING work_id",
-    )
-    .bind(campaign_session_id)
-    .bind(inspiration_to_i64(now)?)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(db)?;
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id = OpaqueInspirationId::new(row.try_get::<String, _>("work_id").map_err(db)?)?;
-        insert_privacy_audit(
-            transaction,
-            Some(campaign_session_id),
-            "derived_work_cancel_requested",
-            "derived_work",
-            id.as_str(),
-            None,
-            "cancel_requested",
-            now,
-        )
-        .await?;
-        ids.push(id);
+impl MongoRepository {
+    pub(crate) async fn load_private_inspiration_redacted_export(
+        &self,
+        campaign_session_id: &OpaqueInspirationId,
+        requesting_participant_id: &OpaqueInspirationId,
+    ) -> Result<CampaignInspirationRedactedExportV1, PrivateInspirationError> {
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let consents = self
+            .store()
+            .collection::<ConsentDocument>(CollectionName::PrivateInspirationConsents);
+        let campaign_id = campaign_session_id.to_string();
+        let participant_id = requesting_participant_id.to_string();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let participants = participants.clone();
+            let sources = sources.clone();
+            let consents = consents.clone();
+            let campaign_id = campaign_id.clone();
+            let participant_id = participant_id.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(&campaigns, session, &campaign_id).await?;
+                if !participant_is_verified(&participants, session, &participant_id).await? {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let Some(safety) = campaign.safety.as_ref() else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let settings = safety.projection(&campaign_id).map_err(domain_as_schema)?;
+                let mut grant_cursor = consents
+                    .find(doc! {
+                        "campaign_id": &campaign_id,
+                        "participant_id": &participant_id,
+                    })
+                    .sort(doc! {
+                        "source_id": 1_i64,
+                        "source_revision": 1_i64,
+                        "_id": 1_i64,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load inspiration export consents", error)
+                    })?;
+                let mut requester_grants = Vec::new();
+                let mut source_keys = BTreeSet::new();
+                while grant_cursor.advance(&mut *session).await.map_err(|error| {
+                    PersistenceError::mongo("read inspiration export consents", error)
+                })? {
+                    let consent: ConsentDocument =
+                        grant_cursor.deserialize_current().map_err(|_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationConsents,
+                                "export consent document could not be decoded",
+                            )
+                        })?;
+                    let projection = consent.checked_projection().map_err(domain_as_schema)?;
+                    source_keys
+                        .insert((projection.source_id.to_string(), projection.source_version));
+                    requester_grants.push(projection);
+                }
+                if requester_grants.is_empty() {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let mut source_projections = Vec::with_capacity(source_keys.len());
+                for (source_id, source_revision) in source_keys {
+                    let Some(source_document) =
+                        load_source(&sources, session, &source_id, source_revision).await?
+                    else {
+                        return Err(private_schema(
+                            CollectionName::PrivateInspirationSources,
+                            "export source is missing",
+                        ));
+                    };
+                    let source = source_document.stored().map_err(domain_as_schema)?;
+                    if !source.participants.contains(&participant_id) {
+                        return Err(private_schema(
+                            CollectionName::PrivateInspirationSources,
+                            "export source participant scope is invalid",
+                        ));
+                    }
+                    source_projections.push(source.projection);
+                }
+                Ok(Ok(CampaignInspirationRedactedExportV1 {
+                    schema_version: PRIVATE_INSPIRATION_EXPORT_SCHEMA_VERSION,
+                    campaign_session_id: OpaqueInspirationId::new(campaign_id)
+                        .map_err(domain_as_schema)?,
+                    requesting_participant_id: OpaqueInspirationId::new(participant_id)
+                        .map_err(domain_as_schema)?,
+                    settings,
+                    sources: source_projections,
+                    requester_grants,
+                }))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
     }
-    ids.sort();
-    Ok(ids)
 }
 
-fn stored_digest(value: String) -> Result<Sha256Digest, PrivateInspirationError> {
-    Sha256Digest::new(value).map_err(|_| invalid("stored_digest"))
-}
+impl MongoRepository {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn reserve_private_inspiration_selection(
+        &self,
+        deployment_enabled: bool,
+        command: &RequestInspirationSelectionCommand,
+        authority: &ResolvedInspirationSelectionAuthority,
+        prompts: &[EventPrompt],
+        now: u64,
+    ) -> Result<PrivateInspirationSelection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "selection_time_range")?;
+        let request_fingerprint = fingerprint(command)?;
+        let selection_id = internal_id("inspiration-selection")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let global_state = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let consents = self
+            .store()
+            .collection::<ConsentDocument>(CollectionName::PrivateInspirationConsents);
+        let vetoes = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationVetoes);
+        let selections = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationSelections);
+        let character_instances = self
+            .store()
+            .document_collection(CollectionName::CampaignCharacterInstances);
+        let turn_events = self.store().document_collection(CollectionName::TurnEvents);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let command = command.clone();
+        let authority_seed_reference = authority.seed_reference.clone();
+        let authority_seed = authority.seed;
+        let prompts = prompts.to_vec();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let global_state = global_state.clone();
+            let sources = sources.clone();
+            let participants = participants.clone();
+            let consents = consents.clone();
+            let vetoes = vetoes.clone();
+            let selections = selections.clone();
+            let character_instances = character_instances.clone();
+            let turn_events = turn_events.clone();
+            let audits = audits.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            let selection_id = selection_id.clone();
+            let authority_seed_reference = authority_seed_reference.clone();
+            let prompts = prompts.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_selection_replay(
+                    &selections,
+                    session,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(selection) => return Ok(Ok(selection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let campaign_revision =
+                    inspiration_u64_persistence(campaign.revision, CollectionName::Campaigns)?;
+                if campaign_revision != command.expected_campaign_revision {
+                    return Ok(Err(PrivateInspirationError::RevisionConflict {
+                        expected: command.expected_campaign_revision,
+                        current: campaign_revision,
+                    }));
+                }
+                let Some(safety) = campaign.safety.as_ref() else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let settings_revision =
+                    inspiration_u64_persistence(safety.revision, CollectionName::Campaigns)?;
+                if settings_revision != command.expected_settings_revision {
+                    return Ok(Err(PrivateInspirationError::RevisionConflict {
+                        expected: command.expected_settings_revision,
+                        current: settings_revision,
+                    }));
+                }
+                let global = load_global_control(&global_state, Some(session))
+                    .await?
+                    .unwrap_or_else(default_global_control);
+                let Some((turn_number, trigger_window_id)) =
+                    trusted_trigger_window(&turn_events, session, &campaign).await?
+                else {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                };
+                let cursor =
+                    inspiration_u64_persistence(safety.rng_cursor, CollectionName::Campaigns)?;
+                let early_reason = if !deployment_enabled {
+                    Some(DurableNoSelectionReason::DeploymentDisabled)
+                } else if global.generation_disabled {
+                    Some(DurableNoSelectionReason::GlobalKillSwitch)
+                } else if !safety.enabled {
+                    Some(DurableNoSelectionReason::CampaignDisabled)
+                } else if safety.generation_paused {
+                    Some(DurableNoSelectionReason::CampaignPaused)
+                } else if !safety.safety_setup_complete {
+                    Some(DurableNoSelectionReason::SafetyIncomplete)
+                } else {
+                    None
+                };
 
-fn db(error: sqlx::Error) -> PrivateInspirationError {
-    RepositoryError::Database(error).into()
-}
+                let mut selected_source_version = None;
+                let (audit, durable_no_selection_reason, selected_cooldown) = if let Some(reason) =
+                    early_reason
+                {
+                    (
+                        empty_selection_audit(authority_seed, cursor).map_err(domain_as_schema)?,
+                        Some(reason),
+                        None,
+                    )
+                } else {
+                    let party_level = trusted_party_level(
+                        &character_instances,
+                        session,
+                        command.campaign_session_id.as_str(),
+                    )
+                    .await?;
+                    if campaign.theme_id.is_empty() {
+                        return Err(private_schema(
+                            CollectionName::Campaigns,
+                            "campaign theme is missing",
+                        ));
+                    }
+                    let allowed_sensitivities = safety
+                        .allowed_sensitivities
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let excluded_safety_codes = safety
+                        .lines
+                        .iter()
+                        .chain(&safety.veils)
+                        .chain(&safety.excluded_topics)
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let excluded_participants = safety
+                        .excluded_participant_ids
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let mut source_cursor = sources
+                        .find(doc! {
+                            "review_state": SourceReviewState::Approved.as_str(),
+                            "q11_screened": true,
+                            "media": command.media.as_str(),
+                            "$or": [
+                                { "expires_at_epoch": { "$exists": false } },
+                                { "expires_at_epoch": Bson::Null },
+                                {
+                                    "expires_at_epoch": {
+                                        "$gt": inspiration_i64_persistence(
+                                            now,
+                                            CollectionName::PrivateInspirationSources,
+                                        )?
+                                    }
+                                },
+                            ],
+                        })
+                        .sort(doc! { "logical_id": 1_i64, "revision": 1_i64 })
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("load eligible inspiration sources", error)
+                        })?;
+                    let mut authenticated_prompts = Vec::new();
+                    let mut source_versions = BTreeMap::<(String, String), u64>::new();
+                    let mut consenting_participants = BTreeSet::new();
+                    while source_cursor
+                        .advance(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("read eligible inspiration sources", error)
+                        })?
+                    {
+                        let source_document =
+                            source_cursor.deserialize_current().map_err(|_| {
+                                private_schema(
+                                    CollectionName::PrivateInspirationSources,
+                                    "eligible source document could not be decoded",
+                                )
+                            })?;
+                        let source = source_document.stored().map_err(domain_as_schema)?;
+                        if !source.sensitivities.is_subset(&allowed_sensitivities)
+                            || !source.sensitivities.is_disjoint(&excluded_safety_codes)
+                            || !source.participants.is_disjoint(&excluded_participants)
+                            || !source.theme_pack_ids.contains(&campaign.theme_id)
+                            || source_is_vetoed(
+                                &vetoes,
+                                session,
+                                command.campaign_session_id.as_str(),
+                                &source,
+                            )
+                            .await?
+                            || !all_source_participants_verified(&participants, session, &source)
+                                .await?
+                            || !source_has_complete_consent(
+                                &consents, session, &command, &source, now,
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
+                        let Some(prompt) = prompts.iter().find(|prompt| {
+                            prompt.privacy_source_id() == source.projection.source_id.as_str()
+                                && prompt.source_digest() == &source.projection.source_digest
+                                && prompt.metadata.enabled
+                                && normalized_set(&prompt.metadata.sensitivity_tags)
+                                    == normalized_stored_set(&source.sensitivities)
+                                && normalized_set(&prompt.metadata.participant_aliases)
+                                    == normalized_stored_set(&source.participants)
+                        }) else {
+                            continue;
+                        };
+                        source_versions.insert(
+                            (
+                                source.projection.source_id.to_string(),
+                                source.projection.source_digest.as_str().to_owned(),
+                            ),
+                            source.projection.source_version,
+                        );
+                        consenting_participants.extend(normalized_stored_set(&source.participants));
+                        authenticated_prompts.push(prompt.clone());
+                    }
+                    let last_triggered_turn = load_last_triggered_turns(
+                        &selections,
+                        session,
+                        command.campaign_session_id.as_str(),
+                    )
+                    .await?;
+                    let normalized_allowed = normalized_stored_set(&allowed_sensitivities);
+                    let context = EventEligibility {
+                        inspiration_enabled: true,
+                        party_level,
+                        current_turn: turn_number,
+                        allowed_sensitivity_tags: &normalized_allowed,
+                        consenting_participant_aliases: &consenting_participants,
+                        last_triggered_turn: &last_triggered_turn,
+                    };
+                    let mut random = DeterministicEventRandom::new(authority_seed, cursor);
+                    let selected = EventPromptLoader
+                        .select_with_audit(&authenticated_prompts, &context, &mut random)
+                        .map_err(|_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationSelections,
+                                "deterministic inspiration selection failed",
+                            )
+                        })?;
+                    let selected_cooldown =
+                        selected.prompt.map(|prompt| prompt.metadata.cooldown_turns);
+                    if let (Some(source_id), Some(source_digest)) = (
+                        selected.audit.selected_source_id.as_ref(),
+                        selected.audit.selected_source_digest.as_ref(),
+                    ) {
+                        selected_source_version = source_versions
+                            .get(&(source_id.clone(), source_digest.as_str().to_owned()))
+                            .copied();
+                        if selected_source_version.is_none() {
+                            return Err(private_schema(
+                                CollectionName::PrivateInspirationSelections,
+                                "selected source version is missing",
+                            ));
+                        }
+                    }
+                    let reason = selected
+                        .prompt
+                        .is_none()
+                        .then_some(DurableNoSelectionReason::NoEligibleSources);
+                    (selected.audit, reason, selected_cooldown)
+                };
 
-#[cfg(test)]
-mod tests {
-    use std::{sync::Arc, time::Duration};
-
-    use manchester_dnd_core::{
-        AbilityScores, CharacterDraft, EventActor, RULESET, SESSION_SCHEMA_VERSION,
-        hero::{EMBERLINE_THEME_PACK_ID, RAINBOUND_THEME_PACK_ID, ThemeId},
-    };
-    use sqlx::PgPool;
-    use tempfile::tempdir;
-
-    use crate::{
-        campaign_pins::CampaignPinRuntime,
-        events::EventPromptLoader,
-        inspiration::{
-            ApplyInspirationVetoCommand, ConfigureCampaignInspirationCommand,
-            ConsentRevocationCode, DeleteParticipantPrivateDataCommand, DerivedArtifactPolicy,
-            DerivedWorkKind, GrantConsentCommand, InspirationAudience, InspirationMedia,
-            InspirationTransformation, InspirationVetoCode, InspirationVetoScope, OpaqueOperatorId,
-            ParticipantVerificationMethod, PrivateInspirationApplicationService,
-            PurgeExpiredParticipantDeletionTombstonesCommand, RegisterDerivedWorkCommand,
-            RegisterSourceVersionCommand, RequestInspirationSelectionCommand,
-            ReviewSourceVersionCommand, RevokeConsentCommand, SafetySetupEvidence,
-            SourceReviewState, VerifyParticipantCommand,
-        },
-        repository::{
-            GeneratedTextPresentationSource, MIGRATOR, NewGeneratedTextPresentation,
-            jobs::{
-                GenerationClaim, GenerationPurpose, GenerationUsage, NewGenerationJob,
-                SuccessRetention,
-            },
-        },
-        seed::SeedVault,
-    };
-
-    use super::*;
-
-    const CAMPAIGN_ID: &str = "campaign:private-inspiration-test";
-    const CHARACTER_ID: &str = "character:private-inspiration-test";
-    const PARTICIPANT_ID: &str = "participant:11111111111111111111111111111111";
-    const OPERATOR_ID: &str = "operator:22222222222222222222222222222222";
-    const NOW: u64 = 1_000;
-
-    fn opaque(value: &str) -> OpaqueInspirationId {
-        OpaqueInspirationId::new(value).expect("valid opaque id")
-    }
-
-    fn operator() -> OpaqueOperatorId {
-        OpaqueOperatorId::new(OPERATOR_ID).expect("valid operator id")
-    }
-
-    fn digest(byte: u8) -> Sha256Digest {
-        Sha256Digest::from_bytes([byte; 32])
-    }
-
-    async fn seed_safe_campaign(pool: &PgPool) {
-        let session = SessionDto {
-            schema_version: SESSION_SCHEMA_VERSION,
-            id: CAMPAIGN_ID.to_owned(),
-            ruleset: RULESET,
-            title: "Private rain over Manchester".to_owned(),
-            status: SessionStatus::Active,
-            character_ids: vec![CHARACTER_ID.to_owned()],
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 2,
-            last_event_sequence: 1,
-        };
-        session.validate().expect("valid session");
-        let character = CharacterDraft {
-            id: CHARACTER_ID.to_owned(),
-            name: "The Canal Warden".to_owned(),
-            theme: "rainbound occultist".to_owned(),
-            ability_scores: AbilityScores::new(12, 14, 10, 16, 13, 8).expect("valid scores"),
-            experience_points: 0,
-            current_hit_points: 8,
-            maximum_hit_points: 8,
-        }
-        .build()
-        .expect("valid character");
-        let event = SessionEventDto {
-            schema_version: SESSION_SCHEMA_VERSION,
-            session_id: CAMPAIGN_ID.to_owned(),
-            sequence: 1,
-            occurred_at_unix_ms: 2,
-            actor: EventActor::AiGameMaster,
-            payload: SessionEventPayload::GmNarration {
-                text: "The rain stills at a safe scene boundary.".to_owned(),
-                image_prompt: None,
-                source_prompt_id: None,
-            },
-        };
-        event.validate().expect("valid event");
-        sqlx::query(
-            "INSERT INTO campaign_sessions
-             (id, schema_version, revision, payload_json)
-             VALUES ($1, $2, 2, $3::jsonb)",
-        )
-        .bind(CAMPAIGN_ID)
-        .bind(i64::from(SESSION_SCHEMA_VERSION))
-        .bind(serde_json::to_string(&session).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-        let pins = CampaignPinRuntime::bundled_for_tests()
-            .pins_for_theme(ThemeId::RainboundBorough)
-            .expect("bundled rainbound pins");
-        sqlx::query(
-            "INSERT INTO campaign_content_pins
-             (campaign_session_id, schema_version, seal_reason, payload_json)
-             VALUES ($1, 1, 'selected_theme', $2::jsonb)",
-        )
-        .bind(CAMPAIGN_ID)
-        .bind(serde_json::to_string(&pins).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO characters
-             (id, campaign_session_id, schema_version, revision, payload_json)
-             VALUES ($1, $2, 1, 1, $3::jsonb)",
-        )
-        .bind(CHARACTER_ID)
-        .bind(CAMPAIGN_ID)
-        .bind(serde_json::to_string(&character).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO turn_audits
-             (id, campaign_session_id, turn_number, actor_id, schema_version, payload_json)
-             VALUES ('turn:private-inspiration-test', $1, 1, NULL, $2, $3::jsonb)",
-        )
-        .bind(CAMPAIGN_ID)
-        .bind(i64::from(SESSION_SCHEMA_VERSION))
-        .bind(serde_json::to_string(&event).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    async fn complete_text_work(
-        repository: &PostgresRepository,
-        work_id: &str,
-        suffix: &str,
-    ) -> String {
-        let job_id = format!("private-presentation-job:{suffix}");
-        repository
-            .enqueue_generation_job(&NewGenerationJob {
-                id: job_id.clone(),
-                campaign_session_id: CAMPAIGN_ID.to_owned(),
-                origin_turn_id: Some("turn:private-inspiration-test".to_owned()),
-                origin_campaign_revision: 2,
-                purpose: GenerationPurpose::Narration,
-                idempotency_key: format!("private-presentation-job-key:{suffix}"),
-                input_digest: digest(10),
-                prompt_digest: digest(11),
-                policy_digest: digest(12),
-                config_digest: digest(13),
-                correlation_id: Some(format!("correlation:{suffix}")),
-                max_attempts: 1,
-                success_retention: SuccessRetention::UnselectedPresentation30Days,
-                governance: None,
-            })
-            .await
-            .expect("private narration job should enqueue");
-        let claimed = repository
-            .claim_generation_job_by_id(
-                CAMPAIGN_ID,
-                &job_id,
-                &GenerationClaim {
-                    worker_id: format!("worker:{suffix}"),
-                    provider: "deterministic-fake".to_owned(),
-                    model: "fake-v1".to_owned(),
-                    lease_duration: Duration::from_secs(60),
-                },
-            )
-            .await
-            .expect("private narration claim should succeed")
-            .expect("private narration job should be ready");
-        let presentation_id = format!("private-presentation:{suffix}");
-        repository
-            .finish_generation_with_text_presentation(
-                &claimed.lease,
-                &NewGeneratedTextPresentation {
-                    id: presentation_id.clone(),
-                    campaign_session_id: CAMPAIGN_ID.to_owned(),
-                    origin_turn_id: "turn:private-inspiration-test".to_owned(),
-                    generation_job_id: claimed.job.id,
-                    generation_attempt_id: claimed.attempt.id,
-                    client_idempotency_key: format!("private-presentation-client:{suffix}"),
-                    source: GeneratedTextPresentationSource::Provider,
-                    body: format!("A high-distance fictional scene for {suffix}."),
-                    config_digest: digest(13),
-                    prompt_digest: digest(11),
-                    policy_digest: digest(12),
-                    output_digest: digest(14),
-                    private_inspiration_work_id: Some(work_id.to_owned()),
-                },
-                &GenerationUsage::default(),
-                None,
-            )
-            .await
-            .expect("private presentation and work should complete atomically");
-        presentation_id
-    }
-
-    fn load_prompt() -> EventPrompt {
-        let root = tempdir().expect("temporary prompt root");
-        std::fs::write(
-            root.path().join("quiet-delay.md"),
-            format!(
-                r#"---
-{{
-  "id": "quiet-delay",
-  "title": "The Clockwork Carriage Pauses",
-  "weight": 1,
-  "minimum_level": 1,
-  "cooldown_turns": 2,
-  "sensitivity_tags": ["general"],
-  "participant_aliases": ["{PARTICIPANT_ID}"],
-  "enabled": true
-}}
----
-
-## Inspiration
-
-A harmless delay changed the rhythm of a journey.
-"#,
-            ),
-        )
-        .expect("write prompt");
-        let review = EventPromptLoader
-            .load_dir_reviewed(root.path())
-            .expect("review prompt tree");
-        assert!(review.quarantined_sources.is_empty());
-        review
-            .approved_prompts
-            .into_iter()
-            .next()
-            .expect("one approved prompt")
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn consent_selection_revocation_veto_and_export_are_atomic_and_redacted(pool: PgPool) {
-        seed_safe_campaign(&pool).await;
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let service = PrivateInspirationApplicationService::with_clock(
-            repository.clone(),
-            true,
-            Arc::new(SeedVault::from_key([7; 32])),
-            || NOW,
-        );
-        let campaign = opaque(CAMPAIGN_ID);
-        let participant = opaque(PARTICIPANT_ID);
-        let sensitivity = opaque("general");
-        let safety = SafetySetupEvidence {
-            evidence_digest: digest(1),
-            reviewer_id: operator(),
-            tone: CampaignInspirationTone::GothicAdventure,
-            allowed_sensitivity_codes: BTreeSet::from([sensitivity.clone()]),
-            line_codes: BTreeSet::new(),
-            veil_codes: BTreeSet::new(),
-            excluded_topic_codes: BTreeSet::new(),
-            excluded_participant_ids: BTreeSet::new(),
-        };
-        let disabled = service
-            .configure_campaign(ConfigureCampaignInspirationCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("settings:prepare"),
-                expected_revision: 0,
-                enabled: false,
-                safety_setup: Some(safety.clone()),
-            })
-            .await
-            .expect("prepare settings");
-        assert_eq!(disabled.revision, 1);
-        let enabled_command = ConfigureCampaignInspirationCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            campaign_session_id: campaign.clone(),
-            idempotency_key: opaque("settings:enable"),
-            expected_revision: 1,
-            enabled: true,
-            safety_setup: Some(safety.clone()),
-        };
-        let enabled = service
-            .configure_campaign(enabled_command.clone())
-            .await
-            .expect("enable settings");
-        assert_eq!(enabled.revision, 2);
-        let diagnostic_command = RecordRestrictedDiagnosticAccessCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            idempotency_key: opaque("restricted-access:restore-drill"),
-            campaign_session_id: Some(campaign.clone()),
-            operator_id: operator(),
-            access_kind: RestrictedDiagnosticAccessKind::SourceBackup,
-            purpose: RestrictedDiagnosticPurpose::RestoreDrill,
-            subject_id: opaque("source-vault:restore-drill"),
-            evidence_digest: digest(18),
-            decision: RestrictedDiagnosticDecision::Allowed,
-        };
-        let diagnostic = service
-            .record_restricted_diagnostic_access(diagnostic_command.clone())
-            .await
-            .expect("restricted access is explicitly audited");
-        assert_eq!(
-            service
-                .record_restricted_diagnostic_access(diagnostic_command)
-                .await
-                .expect("restricted access audit replays exactly"),
-            diagnostic
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM private_inspiration_restricted_access_audits
-                 WHERE idempotency_key = 'restricted-access:restore-drill'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            service
-                .configure_campaign(enabled_command)
-                .await
-                .expect("exact setting replay"),
-            enabled
-        );
-        assert_eq!(
-            service
-                .campaign_status(&campaign)
-                .await
-                .expect("load inspiration status")
-                .settings,
-            Some(enabled.clone())
-        );
-
-        service
-            .verify_participant(VerifyParticipantCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("participant:verify-command"),
-                participant_id: participant.clone(),
-                method: ParticipantVerificationMethod::ParticipantSignedConfirmation,
-                evidence_digest: digest(2),
-                verifier_id: operator(),
-            })
-            .await
-            .expect("verify participant");
-        let prompt = load_prompt();
-        let source_id = opaque(prompt.privacy_source_id());
-        service
-            .register_source_version(RegisterSourceVersionCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("source:register"),
-                source_id: source_id.clone(),
-                source_version: 1,
-                source_digest: prompt.source_digest().clone(),
-                category_id: opaque("category:journey"),
-                owner_participant_id: participant.clone(),
-                participant_ids: BTreeSet::from([participant.clone()]),
-                sensitivity_codes: BTreeSet::from([sensitivity.clone()]),
-                eligible_media: BTreeSet::from([InspirationMedia::Text]),
-                eligible_theme_pack_ids: BTreeSet::from([opaque(RAINBOUND_THEME_PACK_ID)]),
-                provenance_digest: digest(3),
-                expires_at_epoch: Some(NOW + 10_000),
-                runtime_prompt: prompt.runtime_projection(),
-            })
-            .await
-            .expect("register source");
-        service
-            .review_source_version(ReviewSourceVersionCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("source:review"),
-                source_id: source_id.clone(),
-                source_version: 1,
-                source_digest: prompt.source_digest().clone(),
-                decision: SourceReviewState::Approved,
-                q11_screened: true,
-                reviewer_id: operator(),
-                review_evidence_digest: digest(4),
-            })
-            .await
-            .expect("approve source");
-
-        let grant = |key: &str| GrantConsentCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            campaign_session_id: campaign.clone(),
-            idempotency_key: opaque(key),
-            source_id: source_id.clone(),
-            source_version: 1,
-            source_digest: prompt.source_digest().clone(),
-            participant_id: participant.clone(),
-            audience: InspirationAudience::PrivateCampaign,
-            media: InspirationMedia::Text,
-            transformation: InspirationTransformation::HighFictionDistanceV1,
-            sensitivity_codes: BTreeSet::from([sensitivity.clone()]),
-            expires_at_epoch: NOW + 5_000,
-            reviewer_id: operator(),
-            participant_confirmation_digest: digest(5),
-            review_evidence_digest: digest(6),
-            artifact_policy: DerivedArtifactPolicy::RedactDerived,
-        };
-        let first_grant = service
-            .grant_consent(grant("consent:first"))
-            .await
-            .expect("grant consent");
-        let paused = service
-            .set_campaign_pause(SetCampaignInspirationPauseCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("settings:pause"),
-                expected_revision: 2,
-                paused: true,
-            })
-            .await
-            .expect("pause private generation");
-        assert!(paused.generation_paused);
-        let paused_selection = service
-            .request_selection(RequestInspirationSelectionCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("selection:paused"),
-                expected_campaign_revision: 2,
-                expected_settings_revision: 3,
-                audience: InspirationAudience::PrivateCampaign,
-                media: InspirationMedia::Text,
-            })
-            .await
-            .expect("pause returns an audited no-selection");
-        assert_eq!(
-            paused_selection.outcome.durable_no_selection_reason,
-            Some(DurableNoSelectionReason::CampaignPaused)
-        );
-        assert_eq!(paused_selection.outcome.audit.cursor_after, 0);
-        let resumed = service
-            .set_campaign_pause(SetCampaignInspirationPauseCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("settings:resume"),
-                expected_revision: 3,
-                paused: false,
-            })
-            .await
-            .expect("resume private generation");
-        assert_eq!(resumed.revision, 4);
-        assert!(!resumed.generation_paused);
-        let mut excluded_safety = safety.clone();
-        excluded_safety
-            .excluded_participant_ids
-            .insert(participant.clone());
-        let excluded = service
-            .configure_campaign(ConfigureCampaignInspirationCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("settings:exclude-participant"),
-                expected_revision: 4,
-                enabled: true,
-                safety_setup: Some(excluded_safety),
-            })
-            .await
-            .expect("participant exclusion is persisted");
-        assert_eq!(excluded.excluded_participant_count, 1);
-        let excluded_selection = service
-            .request_selection(RequestInspirationSelectionCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("selection:participant-excluded"),
-                expected_campaign_revision: 2,
-                expected_settings_revision: 5,
-                audience: InspirationAudience::PrivateCampaign,
-                media: InspirationMedia::Text,
-            })
-            .await
-            .expect("excluded participant produces no selection");
-        assert!(excluded_selection.prompt.is_none());
-        assert_eq!(excluded_selection.outcome.audit.cursor_after, 0);
-        let restored = service
-            .configure_campaign(ConfigureCampaignInspirationCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("settings:restore-safety"),
-                expected_revision: 5,
-                enabled: true,
-                safety_setup: Some(safety),
-            })
-            .await
-            .expect("restore eligible safety setup");
-        assert_eq!(restored.revision, 6);
-        assert_eq!(restored.excluded_participant_count, 0);
-        sqlx::query(
-            "UPDATE private_inspiration_source_themes
-             SET theme_pack_id = $3 WHERE source_id = $1 AND source_version = $2",
-        )
-        .bind(source_id.as_str())
-        .bind(1_i64)
-        .bind(EMBERLINE_THEME_PACK_ID)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let theme_mismatch = service
-            .request_selection(RequestInspirationSelectionCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("selection:theme-mismatch"),
-                expected_campaign_revision: 2,
-                expected_settings_revision: 6,
-                audience: InspirationAudience::PrivateCampaign,
-                media: InspirationMedia::Text,
-            })
-            .await
-            .expect("wrong-theme source produces no selection");
-        assert!(theme_mismatch.prompt.is_none());
-        assert_eq!(theme_mismatch.outcome.audit.cursor_after, 0);
-        sqlx::query(
-            "UPDATE private_inspiration_source_themes
-             SET theme_pack_id = $3 WHERE source_id = $1 AND source_version = $2",
-        )
-        .bind(source_id.as_str())
-        .bind(1_i64)
-        .bind(RAINBOUND_THEME_PACK_ID)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let selection_command = RequestInspirationSelectionCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            campaign_session_id: campaign.clone(),
-            idempotency_key: opaque("selection:first"),
-            expected_campaign_revision: 2,
-            expected_settings_revision: 6,
-            audience: InspirationAudience::PrivateCampaign,
-            media: InspirationMedia::Text,
-        };
-        let selected = service
-            .request_selection(selection_command.clone())
-            .await
-            .expect("reserve selection");
-        assert_eq!(
-            selected
-                .prompt
-                .as_ref()
-                .map(|value| value.privacy_source_id()),
-            Some(source_id.as_str())
-        );
-        assert_eq!(selected.outcome.source_version, Some(1));
-        assert_eq!(selected.outcome.audit.cursor_after, 1);
-        assert_eq!(
-            service
-                .request_selection(selection_command.clone())
-                .await
-                .expect("exact selection replay")
-                .outcome,
-            selected.outcome
-        );
-
-        assert!(matches!(
-            service
-                .register_derived_work(RegisterDerivedWorkCommand {
+                let next_eligible_turn = match (
+                    audit.selected_source_id.as_deref(),
+                    selected_source_version,
+                    audit.selected_source_digest.as_ref(),
+                    selected_cooldown,
+                ) {
+                    (Some(_), Some(_), Some(_), Some(cooldown)) => {
+                        let next = turn_number.checked_add(cooldown).ok_or_else(|| {
+                            private_schema(
+                                CollectionName::PrivateInspirationSelections,
+                                "source cooldown turn overflow",
+                            )
+                        })?;
+                        if next <= turn_number {
+                            return Err(private_schema(
+                                CollectionName::PrivateInspirationSelections,
+                                "selected source cooldown is invalid",
+                            ));
+                        }
+                        Some(next)
+                    }
+                    (None, None, None, None) => None,
+                    _ => {
+                        return Err(private_schema(
+                            CollectionName::PrivateInspirationSelections,
+                            "selected source binding is incomplete",
+                        ));
+                    }
+                };
+                let selection = PrivateInspirationSelection {
                     schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                    campaign_session_id: campaign.clone(),
-                    idempotency_key: opaque("derived:image-forbidden-command"),
-                    work_id: opaque("derived:image-forbidden"),
-                    selection_id: selected.outcome.selection_id.clone(),
-                    kind: DerivedWorkKind::Image,
-                    artifact_policy: DerivedArtifactPolicy::DeleteDerived,
+                    selection_id: selection_id.clone(),
+                    campaign_session_id: command.campaign_session_id.clone(),
+                    source_version: selected_source_version,
+                    durable_no_selection_reason,
+                    audit: audit.clone(),
+                    created_at_epoch: now,
+                };
+                selections
+                    .insert_one(doc! {
+                        "_id": selection_id.as_str(),
+                        "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                        "campaign_id": command.campaign_session_id.as_str(),
+                        "idempotency_key": command.idempotency_key.as_str(),
+                        "request_fingerprint": request_fingerprint.as_str(),
+                        "trigger_window_id": trigger_window_id.as_str(),
+                        "campaign_revision": inspiration_i64_persistence(
+                            command.expected_campaign_revision,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "settings_revision": inspiration_i64_persistence(
+                            command.expected_settings_revision,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "turn_number": inspiration_i64_persistence(
+                            turn_number,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "audience": command.audience.as_str(),
+                        "media": command.media.as_str(),
+                        "seed_reference": authority_seed_reference.as_str(),
+                        "eligible_set_digest": audit.eligible_set_digest.as_str(),
+                        "eligible_source_count": i64::from(audit.eligible_source_count),
+                        "source_id": optional_string_bson(
+                            audit.selected_source_id.as_deref(),
+                        ),
+                        "source_revision": optional_u64_bson(
+                            selected_source_version,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "source_digest": optional_string_bson(
+                            audit
+                                .selected_source_digest
+                                .as_ref()
+                                .map(Sha256Digest::as_str),
+                        ),
+                        "next_eligible_turn": optional_u64_bson(
+                            next_eligible_turn,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "no_selection_reason": optional_string_bson(
+                            durable_no_selection_reason
+                                .map(DurableNoSelectionReason::as_str),
+                        ),
+                        "sample_numerator": optional_u64_bson(
+                            audit.sample_numerator,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "sample_denominator": optional_u64_bson(
+                            audit.sample_denominator,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "algorithm": audit.algorithm.as_str(),
+                        "cursor_before": inspiration_i64_persistence(
+                            audit.cursor_before,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "cursor_after": inspiration_i64_persistence(
+                            audit.cursor_after,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "projection": bson_value(
+                            &selection,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "created_at_epoch": inspiration_i64_persistence(
+                            now,
+                            CollectionName::PrivateInspirationSelections,
+                        )?,
+                        "created_at": now_date,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("reserve inspiration selection", error)
+                    })?;
+                let updated = campaigns
+                    .update_one(
+                        doc! {
+                            "_id": command.campaign_session_id.as_str(),
+                            "safety.revision": safety.revision,
+                            "safety.rng_cursor": safety.rng_cursor,
+                        },
+                        doc! {
+                            "$set": {
+                                "safety.rng_cursor": inspiration_i64_persistence(
+                                    audit.cursor_after,
+                                    CollectionName::Campaigns,
+                                )?,
+                                "updated_at": now_date,
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("advance inspiration RNG cursor", error)
+                    })?;
+                if updated.matched_count != 1 {
+                    return Err(PersistenceError::RevisionConflict {
+                        entity: "private inspiration settings",
+                        id: command.campaign_session_id.to_string(),
+                        expected: command.expected_settings_revision,
+                        actual: settings_revision,
+                    });
+                }
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "selection_reserved",
+                    "selection",
+                    selection_id.as_str(),
+                    audit.selected_source_id.as_deref(),
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "eligible_set_digest": audit.eligible_set_digest.as_str(),
+                        "eligible_source_count": i64::from(audit.eligible_source_count),
+                        "turn_number": inspiration_i64_persistence(
+                            turn_number,
+                            CollectionName::AuditEvents,
+                        )?,
+                    }),
+                )
+                .await?;
+                Ok(Ok(selection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+}
+
+impl MongoRepository {
+    pub(crate) async fn apply_private_inspiration_presentation_control(
+        &self,
+        command: &ApplyPresentationPrivacyCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<PresentationPrivacyOutcome, PrivateInspirationError> {
+        let now_date = epoch_date(now, "presentation_privacy_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let vetoes = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationVetoes);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let sources = sources.clone();
+            let vetoes = vetoes.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_receipt::<PresentationPrivacyOutcome>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "presentation_control",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(outcome) => return Ok(Ok(outcome)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(presentation) = presentations
+                    .find_one(doc! {
+                        "_id": command.presentation_id.as_str(),
+                        "campaign_id": command.campaign_session_id.as_str(),
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load private inspiration presentation", error)
+                    })?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let Ok(work_id) = presentation.get_str("private_inspiration_work_id") else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let work_id = work_id.to_owned();
+                let Some(stored_work) = work
+                    .find_one(doc! {
+                        "_id": &work_id,
+                        "campaign_id": command.campaign_session_id.as_str(),
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load presentation inspiration work", error)
+                    })?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                stored_work.validate().map_err(domain_as_schema)?;
+                if !matches!(stored_work.state.as_str(), "completed" | "redacted") {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let source_revision = inspiration_u64_persistence(
+                    stored_work.source_revision,
+                    CollectionName::PrivateInspirationWork,
+                )?;
+                let Some(source_document) =
+                    load_source(&sources, session, &stored_work.source_id, source_revision).await?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let source = source_document.stored().map_err(domain_as_schema)?;
+                if source.projection.source_digest.as_str() != stored_work.source_digest {
+                    return Err(private_schema(
+                        CollectionName::PrivateInspirationWork,
+                        "presentation work source digest does not match registry",
+                    ));
+                }
+
+                let mut settings_revision = None;
+                match command.action {
+                    PresentationPrivacyAction::Veil | PresentationPrivacyAction::Report => {
+                        presentations
+                            .update_one(
+                                doc! {
+                                    "_id": command.presentation_id.as_str(),
+                                    "campaign_id": command.campaign_session_id.as_str(),
+                                    "private_inspiration_work_id": &work_id,
+                                },
+                                doc! {
+                                    "$set": {
+                                        "body": PRIVATE_INSPIRATION_REDACTION_BODY,
+                                        "privacy_state": "redacted",
+                                        "updated_at": now_date,
+                                    }
+                                },
+                            )
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo(
+                                    "redact private inspiration presentation",
+                                    error,
+                                )
+                            })?;
+                        work.update_one(
+                            doc! {
+                                "_id": &work_id,
+                                "state": { "$in": ["completed", "redacted"] },
+                            },
+                            doc! {
+                                "$set": { "state": "redacted", "updated_at": now_date }
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("redact private inspiration work", error)
+                        })?;
+                        let operation = if command.action == PresentationPrivacyAction::Report {
+                            let Some(mut safety) = campaign.safety.clone() else {
+                                return Ok(Err(PrivateInspirationError::NotFound));
+                            };
+                            let current_revision = inspiration_u64_persistence(
+                                safety.revision,
+                                CollectionName::Campaigns,
+                            )?;
+                            safety.revision = safety.revision.checked_add(1).ok_or_else(|| {
+                                private_schema(
+                                    CollectionName::Campaigns,
+                                    "settings revision overflow",
+                                )
+                            })?;
+                            safety.generation_paused = true;
+                            safety.updated_at_epoch =
+                                inspiration_i64_persistence(now, CollectionName::Campaigns)?;
+                            replace_campaign_safety(
+                                &campaigns,
+                                session,
+                                &campaign.id,
+                                Some(current_revision),
+                                &safety,
+                                now_date,
+                            )
+                            .await?;
+                            settings_revision = Some(inspiration_u64_persistence(
+                                safety.revision,
+                                CollectionName::Campaigns,
+                            )?);
+                            "privacy_reported"
+                        } else {
+                            "presentation_veiled"
+                        };
+                        insert_privacy_audit(
+                            &audits,
+                            session,
+                            Some(command.campaign_session_id.as_str()),
+                            operation,
+                            "derived_work",
+                            &work_id,
+                            Some(command.presentation_id.as_str()),
+                            "applied",
+                            now_date,
+                            None,
+                        )
+                        .await?;
+                    }
+                    PresentationPrivacyAction::VetoSource
+                    | PresentationPrivacyAction::VetoCategory => {
+                        let scope = if command.action == PresentationPrivacyAction::VetoSource {
+                            InspirationVetoScope::SourceVersion {
+                                source_id: source.projection.source_id.clone(),
+                                source_version: source.projection.source_version,
+                                source_digest: source.projection.source_digest.clone(),
+                            }
+                        } else {
+                            InspirationVetoScope::Category {
+                                category_id: source.projection.category_id.clone(),
+                            }
+                        };
+                        insert_owner_veto(
+                            &vetoes,
+                            &audits,
+                            session,
+                            command.campaign_session_id.as_str(),
+                            &scope,
+                            command.presentation_id.as_str(),
+                            now,
+                            now_date,
+                        )
+                        .await?;
+                        let work_filter = work_filter_for_scope(
+                            &sources,
+                            session,
+                            command.campaign_session_id.as_str(),
+                            &scope,
+                        )
+                        .await?;
+                        cancel_pending_work(
+                            &work,
+                            &audits,
+                            session,
+                            work_filter.clone(),
+                            now,
+                            now_date,
+                        )
+                        .await?;
+                        let mut completed_filter = work_filter;
+                        completed_filter.insert("state", doc! { "$in": ["completed", "redacted"] });
+                        let completed = load_work(&work, session, completed_filter).await?;
+                        apply_completed_work_policy(
+                            &work,
+                            &presentations,
+                            &audits,
+                            session,
+                            completed,
+                            now_date,
+                        )
+                        .await?;
+                    }
+                }
+                let outcome = PresentationPrivacyOutcome {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    presentation_id: command.presentation_id.clone(),
+                    action: command.action,
+                    presentation_hidden: true,
+                    settings_revision,
+                    effective_at_epoch: now,
+                };
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "presentation_control",
+                    &request_fingerprint,
+                    &outcome,
+                    now_date,
+                )
+                .await?;
+                Ok(Ok(outcome))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+}
+
+impl MongoRepository {
+    pub(crate) async fn apply_private_inspiration_veto(
+        &self,
+        command: &ApplyInspirationVetoCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<(VetoProjection, PrivacyTransitionOutcome), PrivateInspirationError> {
+        let now_date = epoch_date(now, "veto_time_range")?;
+        let veto_id = internal_id("inspiration-veto")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let vetoes = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationVetoes);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let participants = participants.clone();
+            let sources = sources.clone();
+            let vetoes = vetoes.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            let veto_id = veto_id.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, command.campaign_session_id.as_str())
+                    .await?;
+                match load_receipt::<VetoReceipt>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "veto_apply",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(receipt) => {
+                        return Ok(Ok((receipt.veto, receipt.transition)));
+                    }
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                if !participant_is_verified(&participants, session, command.participant_id.as_str())
+                    .await?
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                if let InspirationVetoScope::SourceVersion {
+                    source_id,
+                    source_version,
+                    source_digest,
+                } = &command.scope
+                {
+                    let Some(source) =
+                        load_source(&sources, session, source_id.as_str(), *source_version).await?
+                    else {
+                        return Ok(Err(PrivateInspirationError::NotFound));
+                    };
+                    let source = source.stored().map_err(domain_as_schema)?;
+                    if source.projection.source_digest != *source_digest
+                        || !source
+                            .participants
+                            .contains(command.participant_id.as_str())
+                    {
+                        return Ok(Err(PrivateInspirationError::ScopeDenied));
+                    }
+                }
+                let veto = VetoProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    veto_id: veto_id.clone(),
+                    campaign_session_id: command.campaign_session_id.clone(),
+                    participant_id: command.participant_id.clone(),
+                    scope: command.scope.clone(),
+                    code: command.code,
+                    created_at_epoch: now,
+                };
+                let fields = veto_scope_fields(&command.scope).map_err(domain_as_schema)?;
+                vetoes
+                    .insert_one(doc! {
+                        "_id": veto_id.as_str(),
+                        "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                        "campaign_id": command.campaign_session_id.as_str(),
+                        "actor_participant_id": command.participant_id.as_str(),
+                        "actor_kind": "participant",
+                        "scope_kind": fields.scope_kind,
+                        "category_id": fields.category_id,
+                        "source_id": fields.source_id,
+                        "source_revision": fields.source_revision,
+                        "source_digest": fields.source_digest,
+                        "state": "active",
+                        "veto_code": command.code.as_str(),
+                        "scope": bson_value(
+                            &command.scope,
+                            CollectionName::PrivateInspirationVetoes,
+                        )?,
+                        "projection": bson_value(
+                            &veto,
+                            CollectionName::PrivateInspirationVetoes,
+                        )?,
+                        "created_at_epoch": inspiration_i64_persistence(
+                            now,
+                            CollectionName::PrivateInspirationVetoes,
+                        )?,
+                        "created_at": now_date,
+                        "updated_at": now_date,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("insert inspiration veto", error))?;
+                let work_filter = work_filter_for_scope(
+                    &sources,
+                    session,
+                    command.campaign_session_id.as_str(),
+                    &command.scope,
+                )
+                .await?;
+                let pending_work_cancellation_ids = cancel_pending_work(
+                    &work,
+                    &audits,
+                    session,
+                    work_filter.clone(),
+                    now,
+                    now_date,
+                )
+                .await?;
+                let mut completed_filter = work_filter;
+                completed_filter.insert("state", doc! { "$in": ["completed", "redacted"] });
+                let completed = load_work(&work, session, completed_filter).await?;
+                apply_completed_work_policy(
+                    &work,
+                    &presentations,
+                    &audits,
+                    session,
+                    completed,
+                    now_date,
+                )
+                .await?;
+                let transition = PrivacyTransitionOutcome {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    subject_id: veto_id.clone(),
+                    pending_work_cancellation_ids,
+                    effective_at_epoch: now,
+                };
+                let receipt = VetoReceipt {
+                    veto: veto.clone(),
+                    transition: transition.clone(),
+                };
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "veto_apply",
+                    &request_fingerprint,
+                    &receipt,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "veto_applied",
+                    "veto",
+                    veto.veto_id.as_str(),
+                    Some(command.participant_id.as_str()),
+                    "applied",
+                    now_date,
+                    Some(doc! { "scope_kind": veto_scope_name(&command.scope) }),
+                )
+                .await?;
+                Ok(Ok((veto, transition)))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+
+    pub(crate) async fn register_private_inspiration_derived_work(
+        &self,
+        command: &RegisterDerivedWorkCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<DerivedWorkProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "derived_work_registration_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let selections = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationSelections);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let vetoes = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationVetoes);
+        let consents = self
+            .store()
+            .collection::<ConsentDocument>(CollectionName::PrivateInspirationConsents);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let selections = selections.clone();
+            let sources = sources.clone();
+            let vetoes = vetoes.clone();
+            let consents = consents.clone();
+            let work = work.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, command.campaign_session_id.as_str())
+                    .await?;
+                match load_receipt::<DerivedWorkProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "derived_work_register",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(selection_document) = selections
+                    .find_one(doc! {
+                        "_id": command.selection_id.as_str(),
+                        "campaign_id": command.campaign_session_id.as_str(),
+                        "source_id": { "$ne": Bson::Null },
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load inspiration selection for work", error)
+                    })?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let selection: PrivateInspirationSelection = decode_field(
+                    &selection_document,
+                    "projection",
+                    CollectionName::PrivateInspirationSelections,
+                )?;
+                let media = required_string(
+                    &selection_document,
+                    "media",
+                    CollectionName::PrivateInspirationSelections,
+                )?;
+                let (Some(source_id), Some(source_revision), Some(source_digest)) = (
+                    selection.audit.selected_source_id.as_deref(),
+                    selection.source_version,
+                    selection.audit.selected_source_digest.as_ref(),
+                ) else {
+                    return Err(private_schema(
+                        CollectionName::PrivateInspirationSelections,
+                        "selected source binding is incomplete",
+                    ));
+                };
+                if media != command.kind.as_str() {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let Some(source_document) =
+                    load_source(&sources, session, source_id, source_revision).await?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let source = source_document.stored().map_err(domain_as_schema)?;
+                if source.projection.source_digest != *source_digest
+                    || source_is_vetoed(
+                        &vetoes,
+                        session,
+                        command.campaign_session_id.as_str(),
+                        &source,
+                    )
+                    .await?
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let mut consent_cursor = consents
+                    .find(doc! {
+                        "campaign_id": command.campaign_session_id.as_str(),
+                        "source_id": source_id,
+                        "source_revision": inspiration_i64_persistence(
+                            source_revision,
+                            CollectionName::PrivateInspirationConsents,
+                        )?,
+                        "source_digest": source_digest.as_str(),
+                        "media": &media,
+                        "state": "active",
+                        "expires_at_epoch": {
+                            "$gt": inspiration_i64_persistence(
+                                now,
+                                CollectionName::PrivateInspirationConsents,
+                            )?
+                        },
+                    })
+                    .sort(doc! { "participant_id": 1_i64 })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load derived work consent policies", error)
+                    })?;
+                let mut policies = Vec::new();
+                while consent_cursor
+                    .advance(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("read derived work consent policies", error)
+                    })?
+                {
+                    let consent: ConsentDocument =
+                        consent_cursor.deserialize_current().map_err(|_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationConsents,
+                                "derived work consent could not be decoded",
+                            )
+                        })?;
+                    policies.push(
+                        consent
+                            .checked_projection()
+                            .map_err(domain_as_schema)?
+                            .artifact_policy,
+                    );
+                }
+                if policies.len() != source.participants.len()
+                    || policies.iter().any(|stored| {
+                        artifact_policy_rank(command.artifact_policy)
+                            < artifact_policy_rank(*stored)
+                    })
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let storage_selection_id = if work
+                    .find_one(doc! { "selection_id": command.selection_id.as_str() })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check inspiration selection work binding", error)
+                    })?
+                    .is_some()
+                {
+                    command.work_id.to_string()
+                } else {
+                    command.selection_id.to_string()
+                };
+                let projection = DerivedWorkProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    work_id: command.work_id.clone(),
+                    selection_id: command.selection_id.clone(),
+                    source_id: OpaqueInspirationId::new(source_id.to_owned())
+                        .map_err(domain_as_schema)?,
+                    source_version: source_revision,
+                    source_digest: source_digest.clone(),
+                    kind: command.kind,
+                    artifact_policy: command.artifact_policy,
+                };
+                work.insert_one(WorkDocument {
+                    id: command.work_id.to_string(),
+                    schema_version: i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                    campaign_id: command.campaign_session_id.to_string(),
+                    selection_id: storage_selection_id,
+                    source_selection_id: command.selection_id.to_string(),
+                    source_id: source_id.to_owned(),
+                    source_revision: inspiration_i64_persistence(
+                        source_revision,
+                        CollectionName::PrivateInspirationWork,
+                    )?,
+                    source_digest: source_digest.as_str().to_owned(),
+                    work_kind: command.kind.as_str().to_owned(),
+                    state: "pending".to_owned(),
+                    artifact_policy: command.artifact_policy.as_str().to_owned(),
+                    completed_artifact_id: None,
+                    cancellation_requested_at_epoch: None,
+                    created_at_epoch: inspiration_i64_persistence(
+                        now,
+                        CollectionName::PrivateInspirationWork,
+                    )?,
+                    created_at: now_date,
+                    updated_at: now_date,
                 })
-                .await,
-            Err(PrivateInspirationError::ScopeDenied)
-        ));
-
-        service
-            .register_derived_work(RegisterDerivedWorkCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("derived:first-command"),
-                work_id: opaque("derived:first"),
-                selection_id: selected.outcome.selection_id.clone(),
-                kind: DerivedWorkKind::Text,
-                artifact_policy: DerivedArtifactPolicy::DeleteDerived,
+                .session(&mut *session)
+                .await
+                .map_err(|error| {
+                    PersistenceError::mongo("register private inspiration work", error)
+                })?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "derived_work_register",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "derived_work_registered",
+                    "derived_work",
+                    command.work_id.as_str(),
+                    Some(command.selection_id.as_str()),
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "kind": command.kind.as_str(),
+                        "artifact_policy": command.artifact_policy.as_str(),
+                    }),
+                )
+                .await?;
+                Ok(Ok(projection))
             })
-            .await
-            .expect("register derived work");
-        service
-            .register_derived_work(RegisterDerivedWorkCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("derived:pending-command"),
-                work_id: opaque("derived:pending"),
-                selection_id: selected.outcome.selection_id.clone(),
-                kind: DerivedWorkKind::Text,
-                artifact_policy: DerivedArtifactPolicy::DeleteDerived,
-            })
-            .await
-            .expect("register pending derived work");
-        let deleted_presentation =
-            complete_text_work(&repository, "derived:first", "delete-on-revoke").await;
-        let revoked = service
-            .revoke_consent(RevokeConsentCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("consent:revoke-command"),
-                grant_id: first_grant.grant_id.clone(),
-                requester_participant_id: participant.clone(),
-                reason: ConsentRevocationCode::ParticipantRevoked,
-            })
-            .await
-            .expect("revoke consent");
-        assert_eq!(
-            revoked.pending_work_cancellation_ids,
-            [opaque("derived:pending")]
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM private_inspiration_derived_work WHERE work_id = 'derived:first'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "deleted"
-        );
-        assert!(
-            !sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM generated_text_presentations WHERE id = $1)",
-            )
-            .bind(&deleted_presentation)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-        );
-        assert!(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM generated_text_presentation_receipts WHERE presentation_id = $1)",
-        )
-        .bind(&deleted_presentation)
-        .fetch_one(&pool)
+        })
         .await
-        .unwrap());
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM private_inspiration_derived_work WHERE work_id = 'derived:pending'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "cancellation_requested"
-        );
+        .map_err(private_persistence)?
+    }
+}
 
-        service
-            .grant_consent(grant("consent:second"))
-            .await
-            .expect("grant consent again after revocation");
-        service
-            .register_derived_work(RegisterDerivedWorkCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("derived:second-command"),
-                work_id: opaque("derived:second"),
-                selection_id: selected.outcome.selection_id.clone(),
-                kind: DerivedWorkKind::Text,
-                artifact_policy: DerivedArtifactPolicy::RedactDerived,
+impl MongoRepository {
+    pub(crate) async fn grant_private_inspiration_consent(
+        &self,
+        command: &GrantConsentCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<ConsentGrantProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "consent_grant_time_range")?;
+        let expires_at = epoch_date(command.expires_at_epoch, "consent_expiry_range")?;
+        let grant_id = internal_id("consent-grant")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let consents = self
+            .store()
+            .collection::<ConsentDocument>(CollectionName::PrivateInspirationConsents);
+        let vetoes = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationVetoes);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let participants = participants.clone();
+            let sources = sources.clone();
+            let consents = consents.clone();
+            let vetoes = vetoes.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            let grant_id = grant_id.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_receipt::<ConsentGrantProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "consent_grant",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(safety) = campaign.safety.as_ref() else {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                };
+                safety.projection(&campaign.id).map_err(domain_as_schema)?;
+                if !safety.enabled || !safety.safety_setup_complete {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                if !participant_is_verified(&participants, session, command.participant_id.as_str())
+                    .await?
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let Some(source_document) = load_source(
+                    &sources,
+                    session,
+                    command.source_id.as_str(),
+                    command.source_version,
+                )
+                .await?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let source = source_document.stored().map_err(domain_as_schema)?;
+                let command_sensitivities = command
+                    .sensitivity_codes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>();
+                let allowed_sensitivities = safety.allowed_sensitivities.iter().cloned().collect();
+                if source.projection.source_digest != command.source_digest
+                    || source.projection.review_state != SourceReviewState::Approved
+                    || !source.projection.q11_screened
+                    || source
+                        .projection
+                        .expires_at_epoch
+                        .is_some_and(|expiry| expiry <= now)
+                    || !source
+                        .participants
+                        .contains(command.participant_id.as_str())
+                    || !source.projection.eligible_media.contains(&command.media)
+                    || source.sensitivities != command_sensitivities
+                    || !source.sensitivities.is_subset(&allowed_sensitivities)
+                    || source_is_vetoed(
+                        &vetoes,
+                        session,
+                        command.campaign_session_id.as_str(),
+                        &source,
+                    )
+                    .await?
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                consents
+                    .update_many(
+                        doc! {
+                            "campaign_id": command.campaign_session_id.as_str(),
+                            "state": "active",
+                            "expires_at_epoch": {
+                                "$lte": inspiration_i64_persistence(
+                                    now,
+                                    CollectionName::PrivateInspirationConsents,
+                                )?
+                            },
+                        },
+                        doc! {
+                            "$set": {
+                                "state": "expired",
+                                "projection.state": "expired",
+                                "updated_at": now_date,
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("expire inspiration consents", error)
+                    })?;
+                let exact_scope = doc! {
+                    "campaign_id": command.campaign_session_id.as_str(),
+                    "source_id": command.source_id.as_str(),
+                    "source_revision": inspiration_i64_persistence(
+                        command.source_version,
+                        CollectionName::PrivateInspirationConsents,
+                    )?,
+                    "participant_id": command.participant_id.as_str(),
+                    "audience": command.audience.as_str(),
+                    "media": command.media.as_str(),
+                    "transformation": command.transformation.as_str(),
+                };
+                let mut active_filter = exact_scope.clone();
+                active_filter.insert("state", "active");
+                if consents
+                    .find_one(active_filter)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check active inspiration consent", error)
+                    })?
+                    .is_some()
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let next_version = consents
+                    .find_one(doc! {
+                        "campaign_id": command.campaign_session_id.as_str(),
+                        "source_id": command.source_id.as_str(),
+                        "participant_id": command.participant_id.as_str(),
+                    })
+                    .sort(doc! { "version": -1_i64 })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load latest inspiration consent version", error)
+                    })?
+                    .map_or(Ok(1_i64), |stored| {
+                        stored.version.checked_add(1).ok_or_else(|| {
+                            private_schema(
+                                CollectionName::PrivateInspirationConsents,
+                                "consent version overflow",
+                            )
+                        })
+                    })?;
+                let projection = ConsentGrantProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    grant_id: grant_id.clone(),
+                    source_id: command.source_id.clone(),
+                    source_version: command.source_version,
+                    source_digest: command.source_digest.clone(),
+                    participant_id: command.participant_id.clone(),
+                    audience: command.audience,
+                    media: command.media,
+                    transformation: command.transformation,
+                    artifact_policy: command.artifact_policy,
+                    expires_at_epoch: command.expires_at_epoch,
+                    state: ConsentGrantState::Active,
+                };
+                consents
+                    .insert_one(ConsentDocument {
+                        id: grant_id.to_string(),
+                        schema_version: i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                        campaign_id: command.campaign_session_id.to_string(),
+                        source_id: command.source_id.to_string(),
+                        source_revision: inspiration_i64_persistence(
+                            command.source_version,
+                            CollectionName::PrivateInspirationConsents,
+                        )?,
+                        source_digest: command.source_digest.as_str().to_owned(),
+                        participant_id: command.participant_id.to_string(),
+                        version: next_version,
+                        audience: command.audience.as_str().to_owned(),
+                        media: command.media.as_str().to_owned(),
+                        transformation: command.transformation.as_str().to_owned(),
+                        artifact_policy: command.artifact_policy.as_str().to_owned(),
+                        sensitivities: command
+                            .sensitivity_codes
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        reviewer_id: command.reviewer_id.as_str().to_owned(),
+                        participant_confirmation_digest: command
+                            .participant_confirmation_digest
+                            .as_str()
+                            .to_owned(),
+                        review_evidence_digest: command.review_evidence_digest.as_str().to_owned(),
+                        state: "active".to_owned(),
+                        projection: projection.clone(),
+                        granted_at_epoch: inspiration_i64_persistence(
+                            now,
+                            CollectionName::PrivateInspirationConsents,
+                        )?,
+                        expires_at_epoch: inspiration_i64_persistence(
+                            command.expires_at_epoch,
+                            CollectionName::PrivateInspirationConsents,
+                        )?,
+                        expires_at,
+                        revoked_at_epoch: None,
+                        revocation_code: None,
+                        created_at: now_date,
+                        updated_at: now_date,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("grant inspiration consent", error))?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "consent_grant",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "consent_granted",
+                    "consent_grant",
+                    projection.grant_id.as_str(),
+                    Some(command.source_id.as_str()),
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "participant_id": command.participant_id.as_str(),
+                        "media": command.media.as_str(),
+                    }),
+                )
+                .await?;
+                Ok(Ok(projection))
             })
-            .await
-            .expect("register second derived work");
-        service
-            .register_derived_work(RegisterDerivedWorkCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("derived:redacted-command"),
-                work_id: opaque("derived:redacted"),
-                selection_id: selected.outcome.selection_id.clone(),
-                kind: DerivedWorkKind::Text,
-                artifact_policy: DerivedArtifactPolicy::RedactDerived,
-            })
-            .await
-            .expect("register redaction-policy work");
-        let redacted_presentation =
-            complete_text_work(&repository, "derived:redacted", "redact-on-veto").await;
-        let killed = service
-            .set_global_control(SetGlobalInspirationControlCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                idempotency_key: opaque("global-control:disable"),
-                expected_revision: 1,
-                generation_disabled: true,
-                operator_id: operator(),
-                evidence_digest: digest(15),
-            })
-            .await
-            .expect("global kill switch applies without restart");
-        assert_eq!(killed.revision, 2);
-        assert!(killed.generation_disabled);
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM private_inspiration_derived_work WHERE work_id = 'derived:second'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "cancellation_requested"
-        );
-        let globally_blocked = service
-            .request_selection(RequestInspirationSelectionCommand {
-                idempotency_key: opaque("selection:global-kill-switch"),
-                ..selection_command.clone()
-            })
-            .await
-            .expect("global kill switch returns durable no-selection");
-        assert_eq!(
-            globally_blocked.outcome.durable_no_selection_reason,
-            Some(DurableNoSelectionReason::GlobalKillSwitch)
-        );
-        assert_eq!(globally_blocked.outcome.audit.cursor_after, 1);
-        let restored_global = service
-            .set_global_control(SetGlobalInspirationControlCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                idempotency_key: opaque("global-control:enable"),
-                expected_revision: 2,
-                generation_disabled: false,
-                operator_id: operator(),
-                evidence_digest: digest(16),
-            })
-            .await
-            .expect("operator can restore generation behind existing gates");
-        assert_eq!(restored_global.revision, 3);
-        assert!(!restored_global.generation_disabled);
-        let (_, veto_transition) = service
-            .apply_veto(ApplyInspirationVetoCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("veto:campaign-command"),
-                participant_id: participant.clone(),
-                scope: InspirationVetoScope::Campaign,
-                code: InspirationVetoCode::ParticipantVeto,
-            })
-            .await
-            .expect("apply immediate veto");
-        assert_eq!(veto_transition.pending_work_cancellation_ids, []);
-        let redacted = sqlx::query(
-            "SELECT body, privacy_state FROM generated_text_presentations WHERE id = $1",
-        )
-        .bind(&redacted_presentation)
-        .fetch_one(&pool)
+        })
         .await
-        .unwrap();
-        assert_eq!(
-            redacted.try_get::<String, _>("body").unwrap(),
-            PRIVATE_INSPIRATION_REDACTION_BODY
-        );
-        assert_eq!(
-            redacted.try_get::<String, _>("privacy_state").unwrap(),
-            "redacted"
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM private_inspiration_derived_work WHERE work_id = 'derived:redacted'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "redacted"
-        );
-        let no_selection = service
-            .request_selection(RequestInspirationSelectionCommand {
-                idempotency_key: opaque("selection:after-veto"),
-                ..selection_command
-            })
-            .await
-            .expect("veto produces an audited no-selection");
-        assert!(no_selection.prompt.is_none());
-        assert_eq!(
-            no_selection.outcome.durable_no_selection_reason,
-            Some(DurableNoSelectionReason::NoEligibleSources)
-        );
-        assert_eq!(no_selection.outcome.audit.cursor_before, 1);
-        assert_eq!(no_selection.outcome.audit.cursor_after, 1);
+        .map_err(private_persistence)?
+    }
 
-        let export = service
-            .redacted_export(&campaign, &participant)
-            .await
-            .expect("load participant-scoped export");
-        assert_eq!(export.requester_grants.len(), 2);
-        assert_eq!(export.sources.len(), 1);
-        let json = export.canonical_json().expect("serialize export");
-        assert!(!json.contains("A harmless delay"));
-        assert!(!json.contains(OPERATOR_ID));
-        assert!(!json.contains("confirmation_digest"));
-        assert!(!json.contains("evidence_digest"));
-        let metrics_debug = format!(
-            "{:?}",
-            repository
-                .generation_metrics_snapshot()
-                .await
-                .expect("load bounded operational metrics")
-        );
-        assert!(!metrics_debug.contains("A harmless delay"));
-        assert!(!metrics_debug.contains(PARTICIPANT_ID));
-        assert!(!metrics_debug.contains(source_id.as_str()));
+    pub(crate) async fn revoke_private_inspiration_consent(
+        &self,
+        command: &RevokeConsentCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<PrivacyTransitionOutcome, PrivateInspirationError> {
+        let now_date = epoch_date(now, "consent_revocation_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let consents = self
+            .store()
+            .collection::<ConsentDocument>(CollectionName::PrivateInspirationConsents);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let consents = consents.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, command.campaign_session_id.as_str())
+                    .await?;
+                match load_receipt::<PrivacyTransitionOutcome>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "consent_revoke",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(outcome) => return Ok(Ok(outcome)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(consent) = consents
+                    .find_one(doc! { "_id": command.grant_id.as_str() })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load inspiration consent for revocation", error)
+                    })?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                consent.checked_projection().map_err(domain_as_schema)?;
+                if consent.campaign_id != command.campaign_session_id.as_str()
+                    || consent.participant_id != command.requester_participant_id.as_str()
+                    || consent.state == "revoked"
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let updated = consents
+                    .update_one(
+                        doc! {
+                            "_id": command.grant_id.as_str(),
+                            "campaign_id": command.campaign_session_id.as_str(),
+                            "participant_id": command.requester_participant_id.as_str(),
+                            "state": { "$ne": "revoked" },
+                        },
+                        doc! {
+                            "$set": {
+                                "state": "revoked",
+                                "projection.state": "revoked",
+                                "revoked_at_epoch": inspiration_i64_persistence(
+                                    now,
+                                    CollectionName::PrivateInspirationConsents,
+                                )?,
+                                "revocation_code": command.reason.as_str(),
+                                "updated_at": now_date,
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("revoke inspiration consent", error)
+                    })?;
+                if updated.matched_count != 1 {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let source_filter = doc! {
+                    "campaign_id": command.campaign_session_id.as_str(),
+                    "source_id": &consent.source_id,
+                    "source_revision": consent.source_revision,
+                };
+                let pending_work_cancellation_ids = cancel_pending_work(
+                    &work,
+                    &audits,
+                    session,
+                    source_filter.clone(),
+                    now,
+                    now_date,
+                )
+                .await?;
+                let mut completed_filter = source_filter;
+                completed_filter.insert("state", doc! { "$in": ["completed", "redacted"] });
+                let completed = load_work(&work, session, completed_filter).await?;
+                apply_completed_work_policy(
+                    &work,
+                    &presentations,
+                    &audits,
+                    session,
+                    completed,
+                    now_date,
+                )
+                .await?;
+                let outcome = PrivacyTransitionOutcome {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    subject_id: command.grant_id.clone(),
+                    pending_work_cancellation_ids,
+                    effective_at_epoch: now,
+                };
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "consent_revoke",
+                    &request_fingerprint,
+                    &outcome,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "consent_revoked",
+                    "consent_grant",
+                    command.grant_id.as_str(),
+                    Some(command.requester_participant_id.as_str()),
+                    "applied",
+                    now_date,
+                    Some(doc! { "reason": command.reason.as_str() }),
+                )
+                .await?;
+                Ok(Ok(outcome))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+}
 
-        let veiled = service
-            .apply_presentation_privacy_control(ApplyPresentationPrivacyCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("presentation-control:veil"),
-                presentation_id: opaque(&redacted_presentation),
-                action: PresentationPrivacyAction::Veil,
-            })
-            .await
-            .expect("veil needs no justification");
-        assert!(veiled.presentation_hidden);
-        service
-            .apply_presentation_privacy_control(ApplyPresentationPrivacyCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("presentation-control:veto-source"),
-                presentation_id: opaque(&redacted_presentation),
-                action: PresentationPrivacyAction::VetoSource,
-            })
-            .await
-            .expect("owner source veto applies immediately");
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM private_inspiration_vetoes
-                 WHERE campaign_session_id = $1 AND actor_kind = 'campaign_owner'
-                   AND participant_id IS NULL",
-            )
-            .bind(CAMPAIGN_ID)
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            1
-        );
-        let report_command = ApplyPresentationPrivacyCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            campaign_session_id: campaign.clone(),
-            idempotency_key: opaque("presentation-control:report"),
-            presentation_id: opaque(&redacted_presentation),
-            action: PresentationPrivacyAction::Report,
-        };
-        let reported = service
-            .apply_presentation_privacy_control(report_command.clone())
-            .await
-            .expect("privacy report hides and pauses without report prose");
-        assert_eq!(reported.settings_revision, Some(7));
-        assert_eq!(
-            service
-                .apply_presentation_privacy_control(report_command)
-                .await
-                .expect("exact report replay must not increment twice"),
-            reported
-        );
+impl MongoRepository {
+    pub(crate) async fn delete_private_inspiration_participant_data(
+        &self,
+        command: &DeleteParticipantPrivateDataCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<ParticipantDeletionOutcome, PrivateInspirationError> {
+        let now_date = epoch_date(now, "participant_deletion_time_range")?;
+        let tombstone_delete_after_epoch = now
+            .checked_add(PARTICIPANT_DELETION_TOMBSTONE_SECONDS)
+            .ok_or_else(|| invalid("deletion_tombstone_expiry_overflow"))?;
+        let purge_at = epoch_date(
+            tombstone_delete_after_epoch,
+            "participant_tombstone_expiry_range",
+        )?;
+        let deletion_id = internal_id("participant-deletion")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let consents = self
+            .store()
+            .collection::<ConsentDocument>(CollectionName::PrivateInspirationConsents);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let tombstones = self
+            .store()
+            .document_collection(CollectionName::DeletionTombstones);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let participants = participants.clone();
+            let sources = sources.clone();
+            let consents = consents.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let tombstones = tombstones.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            let deletion_id = deletion_id.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, command.campaign_session_id.as_str())
+                    .await?;
+                match load_receipt::<ParticipantDeletionOutcome>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "participant_delete",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(outcome) => return Ok(Ok(outcome)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(participant) = participants
+                    .find_one(doc! { "_id": command.participant_id.as_str() })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load inspiration participant for deletion", error)
+                    })?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let state = required_string(
+                    &participant,
+                    "state",
+                    CollectionName::PrivateInspirationParticipants,
+                )?;
+                if !matches!(state.as_str(), "verified" | "revoked") {
+                    return Err(private_schema(
+                        CollectionName::PrivateInspirationParticipants,
+                        "participant verification state is invalid",
+                    ));
+                }
+                let verified_at_epoch = participant.get_i64("verified_at_epoch").map_err(|_| {
+                    private_schema(
+                        CollectionName::PrivateInspirationParticipants,
+                        "participant verification time is missing",
+                    )
+                })?;
+                if tombstones
+                    .find_one(doc! {
+                        "entity_kind": PARTICIPANT_TOMBSTONE_KIND,
+                        "entity_id": command.participant_id.as_str(),
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check participant deletion tombstone", error)
+                    })?
+                    .is_some()
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
 
-        let deletion_command = DeleteParticipantPrivateDataCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            campaign_session_id: campaign.clone(),
-            idempotency_key: opaque("participant:delete-command"),
-            participant_id: participant.clone(),
-            operator_id: operator(),
-            deletion_evidence_digest: digest(17),
-            protected_sources_removed: true,
-        };
-        let deletion = service
-            .delete_participant_private_data(deletion_command.clone())
-            .await
-            .expect("participant deletion quarantines all private data atomically");
-        assert_eq!(deletion.revoked_grant_count, 1);
-        assert_eq!(deletion.quarantined_source_count, 1);
-        assert!(deletion.pending_work_cancellation_ids.is_empty());
-        assert_eq!(deletion.affected_completed_artifact_count, 1);
-        assert_eq!(
-            deletion.tombstone_delete_after_epoch,
-            NOW + PARTICIPANT_DELETION_TOMBSTONE_SECONDS
-        );
-        assert_eq!(
-            service
-                .delete_participant_private_data(deletion_command)
-                .await
-                .expect("exact participant deletion replay"),
-            deletion
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT verification_state FROM private_inspiration_participants
-                 WHERE participant_id = $1",
-            )
-            .bind(PARTICIPANT_ID)
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "revoked"
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT review_state FROM private_inspiration_sources
-                 WHERE source_id = $1 AND source_version = 1",
-            )
-            .bind(source_id.as_str())
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "quarantined"
-        );
-        let reverify = service
-            .verify_participant(VerifyParticipantCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("participant:reverify-during-tombstone"),
-                participant_id: participant.clone(),
-                method: ParticipantVerificationMethod::ParticipantSignedConfirmation,
-                evidence_digest: digest(18),
-                verifier_id: operator(),
-            })
-            .await;
-        assert!(matches!(
-            reverify,
-            Err(PrivateInspirationError::ScopeDenied)
-        ));
+                let mut source_cursor = sources
+                    .find(doc! { "participants": command.participant_id.as_str() })
+                    .sort(doc! { "logical_id": 1_i64, "revision": 1_i64 })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load participant inspiration sources", error)
+                    })?;
+                let mut affected_sources = Vec::new();
+                while source_cursor
+                    .advance(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("read participant inspiration sources", error)
+                    })?
+                {
+                    affected_sources.push(source_cursor.deserialize_current().map_err(|_| {
+                        private_schema(
+                            CollectionName::PrivateInspirationSources,
+                            "participant source document could not be decoded",
+                        )
+                    })?);
+                }
 
-        let tombstone_expiry = deletion.tombstone_delete_after_epoch;
-        let retention_service = PrivateInspirationApplicationService::with_clock(
-            repository.clone(),
-            true,
-            Arc::new(SeedVault::from_key([7; 32])),
-            move || tombstone_expiry,
-        );
-        let purge_command = PurgeExpiredParticipantDeletionTombstonesCommand {
-            schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-            idempotency_key: opaque("participant:purge-expired-tombstone"),
-            delete_after_epoch_inclusive: tombstone_expiry,
-            operator_id: operator(),
-            evidence_digest: digest(19),
-        };
-        let purged = retention_service
-            .purge_expired_deletion_tombstones(purge_command.clone())
-            .await
-            .expect("expired deletion tombstones are purged deterministically");
-        assert_eq!(purged.purged_count, 1);
-        assert_eq!(
-            retention_service
-                .purge_expired_deletion_tombstones(purge_command)
-                .await
-                .expect("exact tombstone purge replay"),
-            purged
-        );
-        retention_service
-            .verify_participant(VerifyParticipantCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("participant:reverify-after-retention"),
-                participant_id: participant,
-                method: ParticipantVerificationMethod::ParticipantSignedConfirmation,
-                evidence_digest: digest(20),
-                verifier_id: operator(),
-            })
-            .await
-            .expect("fresh verification is possible only after tombstone expiry");
+                let participant_update = participants
+                    .update_one(
+                        doc! { "_id": command.participant_id.as_str() },
+                        doc! {
+                            "$set": {
+                                "state": "revoked",
+                                "verification_evidence_digest":
+                                    command.deletion_evidence_digest.as_str(),
+                                "verifier_id": command.operator_id.as_str(),
+                                "revoked_at_epoch": verified_at_epoch.max(
+                                    inspiration_i64_persistence(
+                                        now,
+                                        CollectionName::PrivateInspirationParticipants,
+                                    )?,
+                                ),
+                                "projection.revoked": true,
+                                "updated_at": now_date,
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("revoke inspiration participant", error)
+                    })?;
+                if participant_update.matched_count != 1 {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                }
 
-        let disabled = service
-            .disable_campaign(DisableCampaignInspirationCommand {
-                schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
-                campaign_session_id: campaign.clone(),
-                idempotency_key: opaque("settings:disable"),
-                expected_revision: 7,
+                let mut consent_cursor = consents
+                    .find(doc! {
+                        "participant_id": command.participant_id.as_str(),
+                        "state": { "$in": ["active", "expired"] },
+                    })
+                    .sort(doc! { "_id": 1_i64 })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo(
+                            "load participant inspiration consents for revocation",
+                            error,
+                        )
+                    })?;
+                let mut revoked_grants = 0_u64;
+                while consent_cursor
+                    .advance(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo(
+                            "read participant inspiration consents for revocation",
+                            error,
+                        )
+                    })?
+                {
+                    let consent: ConsentDocument =
+                        consent_cursor.deserialize_current().map_err(|_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationConsents,
+                                "participant consent document could not be decoded",
+                            )
+                        })?;
+                    consent.checked_projection().map_err(domain_as_schema)?;
+                    let revoked_at_epoch =
+                        consent.granted_at_epoch.max(inspiration_i64_persistence(
+                            now,
+                            CollectionName::PrivateInspirationConsents,
+                        )?);
+                    let updated = consents
+                        .update_one(
+                            doc! {
+                                "_id": &consent.id,
+                                "state": { "$in": ["active", "expired"] },
+                            },
+                            doc! {
+                                "$set": {
+                                    "state": "revoked",
+                                    "projection.state": "revoked",
+                                    "revoked_at_epoch": revoked_at_epoch,
+                                    "revocation_code": "privacy_request",
+                                    "updated_at": now_date,
+                                }
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("revoke participant inspiration consent", error)
+                        })?;
+                    if updated.matched_count != 1 {
+                        return Err(private_schema(
+                            CollectionName::PrivateInspirationConsents,
+                            "participant consent changed during revocation",
+                        ));
+                    }
+                    revoked_grants = revoked_grants
+                        .checked_add(updated.modified_count)
+                        .ok_or_else(|| {
+                            private_schema(
+                                CollectionName::PrivateInspirationConsents,
+                                "revoked participant grant count overflow",
+                            )
+                        })?;
+                }
+
+                for source in &affected_sources {
+                    let mut projection = source.stored().map_err(domain_as_schema)?.projection;
+                    projection.review_state = SourceReviewState::Quarantined;
+                    projection.q11_screened = false;
+                    let updated = sources
+                        .update_one(
+                            doc! { "_id": &source.id },
+                            doc! {
+                                "$set": {
+                                    "review_state": SourceReviewState::Quarantined.as_str(),
+                                    "q11_screened": false,
+                                    "review_evidence_digest":
+                                        command.deletion_evidence_digest.as_str(),
+                                    "reviewer_id": command.operator_id.as_str(),
+                                    "reviewed_at_epoch": inspiration_i64_persistence(
+                                        now,
+                                        CollectionName::PrivateInspirationSources,
+                                    )?,
+                                    "projection": bson_value(
+                                        &projection,
+                                        CollectionName::PrivateInspirationSources,
+                                    )?,
+                                    "updated_at": now_date,
+                                }
+                            },
+                        )
+                        .session(&mut *session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo(
+                                "quarantine participant inspiration source",
+                                error,
+                            )
+                        })?;
+                    if updated.matched_count != 1 {
+                        return Err(private_schema(
+                            CollectionName::PrivateInspirationSources,
+                            "participant source disappeared during deletion",
+                        ));
+                    }
+                    insert_privacy_audit(
+                        &audits,
+                        session,
+                        Some(command.campaign_session_id.as_str()),
+                        "source_quarantined",
+                        "source_version",
+                        &source.logical_id,
+                        Some(&source.revision.to_string()),
+                        "applied",
+                        now_date,
+                        None,
+                    )
+                    .await?;
+                }
+
+                let source_filter = source_key_filter(&affected_sources);
+                let pending_work_cancellation_ids = if source_filter.is_empty() {
+                    Vec::new()
+                } else {
+                    cancel_pending_work(
+                        &work,
+                        &audits,
+                        session,
+                        doc! { "$or": source_filter.clone() },
+                        now,
+                        now_date,
+                    )
+                    .await?
+                };
+                let completed = if source_filter.is_empty() {
+                    Vec::new()
+                } else {
+                    load_work(
+                        &work,
+                        session,
+                        doc! {
+                            "$and": [
+                                { "$or": source_filter },
+                                { "state": { "$in": ["completed", "redacted"] } },
+                            ],
+                        },
+                    )
+                    .await?
+                };
+                let affected_completed_artifact_count =
+                    u32::try_from(completed.len()).map_err(|_| {
+                        private_schema(
+                            CollectionName::PrivateInspirationWork,
+                            "completed participant work count exceeds u32",
+                        )
+                    })?;
+                apply_completed_work_policy(
+                    &work,
+                    &presentations,
+                    &audits,
+                    session,
+                    completed,
+                    now_date,
+                )
+                .await?;
+
+                tombstones
+                    .insert_one(doc! {
+                        "_id": deletion_id.as_str(),
+                        "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                        "entity_kind": PARTICIPANT_TOMBSTONE_KIND,
+                        "entity_id": command.participant_id.as_str(),
+                        "deletion_id": deletion_id.as_str(),
+                        "digest": command.deletion_evidence_digest.as_str(),
+                        "requested_by_operator_id": command.operator_id.as_str(),
+                        "requested_at_epoch": inspiration_i64_persistence(
+                            now,
+                            CollectionName::DeletionTombstones,
+                        )?,
+                        "delete_after_epoch": inspiration_i64_persistence(
+                            tombstone_delete_after_epoch,
+                            CollectionName::DeletionTombstones,
+                        )?,
+                        "purge_at": purge_at,
+                        "created_at": now_date,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("insert participant deletion tombstone", error)
+                    })?;
+
+                let outcome = ParticipantDeletionOutcome {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    participant_id: command.participant_id.clone(),
+                    revoked_grant_count: u32::try_from(revoked_grants).map_err(|_| {
+                        private_schema(
+                            CollectionName::PrivateInspirationConsents,
+                            "revoked participant grant count exceeds u32",
+                        )
+                    })?,
+                    quarantined_source_count: u32::try_from(affected_sources.len()).map_err(
+                        |_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationSources,
+                                "quarantined participant source count exceeds u32",
+                            )
+                        },
+                    )?,
+                    pending_work_cancellation_ids,
+                    affected_completed_artifact_count,
+                    effective_at_epoch: now,
+                    tombstone_delete_after_epoch,
+                };
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "participant_delete",
+                    &request_fingerprint,
+                    &outcome,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "participant_deletion_requested",
+                    "participant",
+                    command.participant_id.as_str(),
+                    None,
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "operator_id": command.operator_id.as_str(),
+                        "tombstone_delete_after_epoch":
+                            inspiration_i64_persistence(
+                                tombstone_delete_after_epoch,
+                                CollectionName::DeletionTombstones,
+                            )?,
+                    }),
+                )
+                .await?;
+                Ok(Ok(outcome))
             })
-            .await
-            .expect("disable campaign inspiration");
-        assert_eq!(disabled.revision, 8);
-        assert!(!disabled.enabled);
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+}
+
+impl MongoRepository {
+    pub(crate) async fn register_private_inspiration_source(
+        &self,
+        command: &RegisterSourceVersionCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<SourceVersionProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "source_registration_time_range")?;
+        let expires_at = command
+            .expires_at_epoch
+            .map(|value| epoch_date(value, "source_expiry_range"))
+            .transpose()?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let participants = participants.clone();
+            let sources = sources.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, command.campaign_session_id.as_str())
+                    .await?;
+                match load_receipt::<SourceVersionProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "source_register",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                for participant in &command.participant_ids {
+                    if !participant_is_verified(&participants, session, participant.as_str())
+                        .await?
+                    {
+                        return Ok(Err(PrivateInspirationError::ScopeDenied));
+                    }
+                }
+                if sources
+                    .find_one(doc! {
+                        "logical_id": command.source_id.as_str(),
+                        "revision": inspiration_i64_persistence(
+                            command.source_version,
+                            CollectionName::PrivateInspirationSources,
+                        )?,
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check inspiration source version", error)
+                    })?
+                    .is_some()
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let projection = SourceVersionProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    source_id: command.source_id.clone(),
+                    source_version: command.source_version,
+                    source_digest: command.source_digest.clone(),
+                    category_id: command.category_id.clone(),
+                    review_state: SourceReviewState::Pending,
+                    q11_screened: false,
+                    participant_count: u32::try_from(command.participant_ids.len()).map_err(
+                        |_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationSources,
+                                "source participant count exceeds u32",
+                            )
+                        },
+                    )?,
+                    sensitivity_count: u32::try_from(command.sensitivity_codes.len()).map_err(
+                        |_| {
+                            private_schema(
+                                CollectionName::PrivateInspirationSources,
+                                "source sensitivity count exceeds u32",
+                            )
+                        },
+                    )?,
+                    eligible_media: command.eligible_media.clone(),
+                    eligible_theme_pack_ids: command.eligible_theme_pack_ids.clone(),
+                    expires_at_epoch: command.expires_at_epoch,
+                };
+                let runtime_projection_digest =
+                    fingerprint(&command.runtime_prompt).map_err(domain_as_schema)?;
+                let source = SourceDocument {
+                    id: format!(
+                        "private-source:{}:{}",
+                        command.source_id.as_str(),
+                        command.source_version
+                    ),
+                    schema_version: i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                    logical_id: command.source_id.as_str().to_owned(),
+                    revision: inspiration_i64_persistence(
+                        command.source_version,
+                        CollectionName::PrivateInspirationSources,
+                    )?,
+                    source_digest: command.source_digest.as_str().to_owned(),
+                    category_id: command.category_id.as_str().to_owned(),
+                    owner_participant_id: command.owner_participant_id.as_str().to_owned(),
+                    review_state: SourceReviewState::Pending.as_str().to_owned(),
+                    q11_screened: false,
+                    audience: InspirationAudience::PrivateCampaign.as_str().to_owned(),
+                    transformation: InspirationTransformation::HighFictionDistanceV1
+                        .as_str()
+                        .to_owned(),
+                    provenance_digest: command.provenance_digest.as_str().to_owned(),
+                    expires_at,
+                    expires_at_epoch: command
+                        .expires_at_epoch
+                        .map(|value| {
+                            inspiration_i64_persistence(
+                                value,
+                                CollectionName::PrivateInspirationSources,
+                            )
+                        })
+                        .transpose()?,
+                    participants: command
+                        .participant_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sensitivities: command
+                        .sensitivity_codes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    media: command
+                        .eligible_media
+                        .iter()
+                        .map(|media| media.as_str().to_owned())
+                        .collect(),
+                    themes: command
+                        .eligible_theme_pack_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    runtime_facts: RuntimeFactsDocument {
+                        neutral_facts: command.runtime_prompt.neutral_facts.clone(),
+                    },
+                    runtime_projection: command.runtime_prompt.clone(),
+                    projection_digest: runtime_projection_digest.as_str().to_owned(),
+                    projection: projection.clone(),
+                    review_evidence_digest: None,
+                    reviewer_id: None,
+                    reviewed_at_epoch: None,
+                    registered_at_epoch: inspiration_i64_persistence(
+                        now,
+                        CollectionName::PrivateInspirationSources,
+                    )?,
+                    created_at: now_date,
+                    updated_at: now_date,
+                };
+                sources
+                    .insert_one(source)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("register inspiration source", error)
+                    })?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "source_register",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "source_registered",
+                    "source_version",
+                    command.source_id.as_str(),
+                    Some(&command.source_version.to_string()),
+                    "applied",
+                    now_date,
+                    None,
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+
+    pub(crate) async fn review_private_inspiration_source(
+        &self,
+        command: &ReviewSourceVersionCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<SourceVersionProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "source_review_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let sources = self
+            .store()
+            .collection::<SourceDocument>(CollectionName::PrivateInspirationSources);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let sources = sources.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, command.campaign_session_id.as_str())
+                    .await?;
+                match load_receipt::<SourceVersionProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "source_review",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(source) = load_source(
+                    &sources,
+                    session,
+                    command.source_id.as_str(),
+                    command.source_version,
+                )
+                .await?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let stored = source.stored().map_err(domain_as_schema)?;
+                if stored.projection.source_digest != command.source_digest
+                    || stored.projection.review_state != SourceReviewState::Pending
+                {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let mut projection = stored.projection;
+                projection.review_state = command.decision;
+                projection.q11_screened = command.q11_screened;
+                let updated = sources
+                    .update_one(
+                        doc! {
+                            "_id": &source.id,
+                            "review_state": SourceReviewState::Pending.as_str(),
+                            "source_digest": command.source_digest.as_str(),
+                        },
+                        doc! {
+                            "$set": {
+                                "review_state": command.decision.as_str(),
+                                "q11_screened": command.q11_screened,
+                                "review_evidence_digest": command.review_evidence_digest.as_str(),
+                                "reviewer_id": command.reviewer_id.as_str(),
+                                "reviewed_at_epoch": inspiration_i64_persistence(
+                                    now,
+                                    CollectionName::PrivateInspirationSources,
+                                )?,
+                                "projection": bson_value(
+                                    &projection,
+                                    CollectionName::PrivateInspirationSources,
+                                )?,
+                                "updated_at": now_date,
+                            }
+                        },
+                    )
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("review inspiration source", error))?;
+                if updated.matched_count != 1 {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "source_review",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "source_reviewed",
+                    "source_version",
+                    command.source_id.as_str(),
+                    Some(&command.source_version.to_string()),
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "decision": command.decision.as_str(),
+                        "q11_screened": command.q11_screened,
+                        "reviewer_id": command.reviewer_id.as_str(),
+                    }),
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+
+    pub(crate) async fn abandon_private_inspiration_derived_work(
+        &self,
+        campaign_session_id: &OpaqueInspirationId,
+        work_id: &OpaqueInspirationId,
+        now: u64,
+    ) -> Result<(), PrivateInspirationError> {
+        let now_date = epoch_date(now, "derived_work_abandon_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let campaign_id = campaign_session_id.to_string();
+        let work_id = work_id.to_string();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let work = work.clone();
+            let audits = audits.clone();
+            let campaign_id = campaign_id.clone();
+            let work_id = work_id.clone();
+            Box::pin(async move {
+                load_campaign_in_session(&campaigns, session, &campaign_id).await?;
+                let Some(stored) = work
+                    .find_one(doc! { "_id": &work_id, "campaign_id": &campaign_id })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load private inspiration work", error)
+                    })?
+                else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                stored.validate().map_err(domain_as_schema)?;
+                match stored.state.as_str() {
+                    "pending" => {
+                        let updated = work
+                            .update_one(
+                                doc! {
+                                    "_id": &work_id,
+                                    "campaign_id": &campaign_id,
+                                    "state": "pending",
+                                },
+                                doc! {
+                                    "$set": {
+                                        "state": "cancellation_requested",
+                                        "cancellation_requested_at_epoch":
+                                            inspiration_i64_persistence(
+                                                now,
+                                                CollectionName::PrivateInspirationWork,
+                                            )?,
+                                        "updated_at": now_date,
+                                    }
+                                },
+                            )
+                            .session(&mut *session)
+                            .await
+                            .map_err(|error| {
+                                PersistenceError::mongo("abandon private inspiration work", error)
+                            })?;
+                        if updated.matched_count != 1 {
+                            return Ok(Err(PrivateInspirationError::ScopeDenied));
+                        }
+                        insert_privacy_audit(
+                            &audits,
+                            session,
+                            Some(&campaign_id),
+                            "derived_work_cancel_requested",
+                            "derived_work",
+                            &work_id,
+                            None,
+                            "cancel_requested",
+                            now_date,
+                            None,
+                        )
+                        .await?;
+                    }
+                    "cancellation_requested" | "redacted" | "deleted" => {}
+                    "completed" => return Ok(Err(PrivateInspirationError::ScopeDenied)),
+                    _ => {
+                        return Err(private_schema(
+                            CollectionName::PrivateInspirationWork,
+                            "stored derived work state is invalid",
+                        ));
+                    }
+                }
+                Ok(Ok(()))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+}
+
+impl MongoRepository {
+    pub(crate) async fn set_private_inspiration_campaign_pause(
+        &self,
+        command: &SetCampaignInspirationPauseCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "settings_pause_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_receipt::<CampaignInspirationSettingsProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "settings_pause",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(mut safety) = campaign.safety else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let current_revision =
+                    inspiration_u64_persistence(safety.revision, CollectionName::Campaigns)?;
+                if current_revision != command.expected_revision {
+                    return Ok(Err(PrivateInspirationError::RevisionConflict {
+                        expected: command.expected_revision,
+                        current: current_revision,
+                    }));
+                }
+                safety.revision = safety.revision.checked_add(1).ok_or_else(|| {
+                    private_schema(CollectionName::Campaigns, "settings revision overflow")
+                })?;
+                safety.generation_paused = command.paused;
+                safety.updated_at_epoch =
+                    inspiration_i64_persistence(now, CollectionName::Campaigns)?;
+                replace_campaign_safety(
+                    &campaigns,
+                    session,
+                    &campaign.id,
+                    Some(current_revision),
+                    &safety,
+                    now_date,
+                )
+                .await?;
+                let projection = safety.projection(&campaign.id).map_err(domain_as_schema)?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    &campaign.id,
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "settings_pause",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(&campaign.id),
+                    "settings_changed",
+                    "campaign",
+                    &campaign.id,
+                    None,
+                    "applied",
+                    now_date,
+                    Some(doc! { "paused": command.paused, "revision": safety.revision }),
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+
+    pub(crate) async fn disable_private_inspiration_campaign(
+        &self,
+        command: &DisableCampaignInspirationCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "settings_disable_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let consents = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationConsents);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let consents = consents.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_receipt::<CampaignInspirationSettingsProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "settings_disable",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let Some(mut safety) = campaign.safety else {
+                    return Ok(Err(PrivateInspirationError::NotFound));
+                };
+                let current_revision =
+                    inspiration_u64_persistence(safety.revision, CollectionName::Campaigns)?;
+                if current_revision != command.expected_revision {
+                    return Ok(Err(PrivateInspirationError::RevisionConflict {
+                        expected: command.expected_revision,
+                        current: current_revision,
+                    }));
+                }
+                safety.revision = safety.revision.checked_add(1).ok_or_else(|| {
+                    private_schema(CollectionName::Campaigns, "settings revision overflow")
+                })?;
+                safety.enabled = false;
+                safety.generation_paused = false;
+                safety.updated_at_epoch =
+                    inspiration_i64_persistence(now, CollectionName::Campaigns)?;
+                replace_campaign_safety(
+                    &campaigns,
+                    session,
+                    &campaign.id,
+                    Some(current_revision),
+                    &safety,
+                    now_date,
+                )
+                .await?;
+                revoke_campaign_consents(&consents, session, &campaign.id, now, now_date).await?;
+                cancel_pending_work(
+                    &work,
+                    &audits,
+                    session,
+                    doc! { "campaign_id": &campaign.id },
+                    now,
+                    now_date,
+                )
+                .await?;
+                let completed = load_work(
+                    &work,
+                    session,
+                    doc! {
+                        "campaign_id": &campaign.id,
+                        "state": { "$in": ["completed", "redacted"] },
+                    },
+                )
+                .await?;
+                apply_completed_work_policy(
+                    &work,
+                    &presentations,
+                    &audits,
+                    session,
+                    completed,
+                    now_date,
+                )
+                .await?;
+                let projection = safety.projection(&campaign.id).map_err(domain_as_schema)?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    &campaign.id,
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "settings_disable",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(&campaign.id),
+                    "settings_changed",
+                    "campaign",
+                    &campaign.id,
+                    None,
+                    "applied",
+                    now_date,
+                    Some(doc! { "enabled": false, "revision": safety.revision }),
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+
+    pub(crate) async fn configure_private_inspiration_campaign(
+        &self,
+        command: &ConfigureCampaignInspirationCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<CampaignInspirationSettingsProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "settings_change_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let consents = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationConsents);
+        let work = self
+            .store()
+            .collection::<WorkDocument>(CollectionName::PrivateInspirationWork);
+        let presentations = self
+            .store()
+            .document_collection(CollectionName::GeneratedPresentations);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let consents = consents.clone();
+            let work = work.clone();
+            let presentations = presentations.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                let campaign = load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_receipt::<CampaignInspirationSettingsProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "settings_change",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                let current_revision = campaign
+                    .safety
+                    .as_ref()
+                    .map(|safety| {
+                        inspiration_u64_persistence(safety.revision, CollectionName::Campaigns)
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                if current_revision != command.expected_revision {
+                    return Ok(Err(PrivateInspirationError::RevisionConflict {
+                        expected: command.expected_revision,
+                        current: current_revision,
+                    }));
+                }
+                let revision = current_revision.checked_add(1).ok_or_else(|| {
+                    private_schema(CollectionName::Campaigns, "settings revision overflow")
+                })?;
+                let mut safety = CampaignSafetyDocument::from_command(&command, revision, now)
+                    .map_err(domain_as_schema)?;
+                if let Some(current) = &campaign.safety {
+                    safety.rng_cursor = current.rng_cursor;
+                }
+                replace_campaign_safety(
+                    &campaigns,
+                    session,
+                    &campaign.id,
+                    campaign.safety.as_ref().map(|_| current_revision),
+                    &safety,
+                    now_date,
+                )
+                .await?;
+                if !command.enabled {
+                    revoke_campaign_consents(&consents, session, &campaign.id, now, now_date)
+                        .await?;
+                    cancel_pending_work(
+                        &work,
+                        &audits,
+                        session,
+                        doc! { "campaign_id": &campaign.id },
+                        now,
+                        now_date,
+                    )
+                    .await?;
+                    let completed = load_work(
+                        &work,
+                        session,
+                        doc! {
+                            "campaign_id": &campaign.id,
+                            "state": { "$in": ["completed", "redacted"] },
+                        },
+                    )
+                    .await?;
+                    apply_completed_work_policy(
+                        &work,
+                        &presentations,
+                        &audits,
+                        session,
+                        completed,
+                        now_date,
+                    )
+                    .await?;
+                }
+                let projection = safety.projection(&campaign.id).map_err(domain_as_schema)?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    &campaign.id,
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "settings_change",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(&campaign.id),
+                    "settings_changed",
+                    "campaign",
+                    &campaign.id,
+                    None,
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "enabled": command.enabled,
+                        "safety_setup_complete": safety.safety_setup_complete,
+                        "revision": safety.revision,
+                    }),
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
+    }
+
+    pub(crate) async fn verify_private_inspiration_participant(
+        &self,
+        command: &VerifyParticipantCommand,
+        request_fingerprint: &Sha256Digest,
+        now: u64,
+    ) -> Result<ParticipantVerificationProjection, PrivateInspirationError> {
+        let now_date = epoch_date(now, "participant_verification_time_range")?;
+        let campaigns = self
+            .campaigns()
+            .clone_with_type::<InspirationCampaignDocument>();
+        let receipts = self
+            .store()
+            .document_collection(CollectionName::CommandReceipts);
+        let audits = self
+            .store()
+            .document_collection(CollectionName::AuditEvents);
+        let participants = self
+            .store()
+            .document_collection(CollectionName::PrivateInspirationParticipants);
+        let tombstones = self
+            .store()
+            .document_collection(CollectionName::DeletionTombstones);
+        let command = command.clone();
+        let request_fingerprint = request_fingerprint.clone();
+        self.with_transaction(move |session| {
+            let campaigns = campaigns.clone();
+            let receipts = receipts.clone();
+            let audits = audits.clone();
+            let participants = participants.clone();
+            let tombstones = tombstones.clone();
+            let command = command.clone();
+            let request_fingerprint = request_fingerprint.clone();
+            Box::pin(async move {
+                load_campaign_in_session(
+                    &campaigns,
+                    session,
+                    command.campaign_session_id.as_str(),
+                )
+                .await?;
+                match load_receipt::<ParticipantVerificationProjection>(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    command.idempotency_key.as_str(),
+                    "participant_verify",
+                    &request_fingerprint,
+                )
+                .await?
+                {
+                    ReceiptReplay::Replay(projection) => return Ok(Ok(projection)),
+                    ReceiptReplay::Conflict => {
+                        return Ok(Err(PrivateInspirationError::IdempotencyConflict));
+                    }
+                    ReceiptReplay::Missing => {}
+                }
+                tombstones
+                    .delete_many(doc! {
+                        "entity_kind": PARTICIPANT_TOMBSTONE_KIND,
+                        "entity_id": command.participant_id.as_str(),
+                        "purge_at": { "$lte": now_date },
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("clear expired participant tombstone", error)
+                    })?;
+                let deletion_pending = tombstones
+                    .find_one(doc! {
+                        "entity_kind": PARTICIPANT_TOMBSTONE_KIND,
+                        "entity_id": command.participant_id.as_str(),
+                    })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("check participant tombstone", error)
+                    })?
+                    .is_some();
+                if deletion_pending {
+                    return Ok(Err(PrivateInspirationError::ScopeDenied));
+                }
+                let existing = participants
+                    .find_one(doc! { "_id": command.participant_id.as_str() })
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("load inspiration participant", error)
+                    })?;
+                let created_at = existing
+                    .as_ref()
+                    .and_then(|document| document.get_datetime("created_at").ok())
+                    .copied()
+                    .unwrap_or(now_date);
+                let projection = ParticipantVerificationProjection {
+                    schema_version: PRIVATE_INSPIRATION_SCHEMA_VERSION,
+                    participant_id: command.participant_id.clone(),
+                    method: command.method,
+                    verified_at_epoch: now,
+                    revoked: false,
+                };
+                participants
+                    .replace_one(
+                        doc! { "_id": command.participant_id.as_str() },
+                        doc! {
+                            "_id": command.participant_id.as_str(),
+                            "schema_version": i64::from(PRIVATE_INSPIRATION_SCHEMA_VERSION),
+                            "participant_id": command.participant_id.as_str(),
+                            "state": "verified",
+                            "verification_method": command.method.as_str(),
+                            "verification_evidence_digest": command.evidence_digest.as_str(),
+                            "verifier_id": command.verifier_id.as_str(),
+                            "verified_at_epoch": inspiration_i64_persistence(now, CollectionName::PrivateInspirationParticipants)?,
+                            "revoked_at_epoch": Bson::Null,
+                            "projection": bson_value(&projection, CollectionName::PrivateInspirationParticipants)?,
+                            "created_at": created_at,
+                            "updated_at": now_date,
+                        },
+                    )
+                    .upsert(true)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("verify inspiration participant", error)
+                    })?;
+                insert_receipt(
+                    &receipts,
+                    session,
+                    CAMPAIGN_COMMAND_SCOPE,
+                    command.campaign_session_id.as_str(),
+                    SYSTEM_ACTOR_ID,
+                    command.idempotency_key.as_str(),
+                    "participant_verify",
+                    &request_fingerprint,
+                    &projection,
+                    now_date,
+                )
+                .await?;
+                insert_privacy_audit(
+                    &audits,
+                    session,
+                    Some(command.campaign_session_id.as_str()),
+                    "participant_verified",
+                    "participant",
+                    command.participant_id.as_str(),
+                    None,
+                    "applied",
+                    now_date,
+                    Some(doc! {
+                        "verification_method": command.method.as_str(),
+                        "verifier_id": command.verifier_id.as_str(),
+                    }),
+                )
+                .await?;
+                Ok(Ok(projection))
+            })
+        })
+        .await
+        .map_err(private_persistence)?
     }
 }

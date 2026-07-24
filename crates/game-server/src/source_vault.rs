@@ -1,7 +1,7 @@
 //! Authenticated encrypted storage for private source trees and backups.
 //!
 //! Only the offline operator binary uses this module. The ordinary game and
-//! image workers consume minimized PostgreSQL projections and never receive a
+//! image workers consume minimized MongoDB projections and never receive a
 //! vault key or decrypted source mount.
 
 use std::{

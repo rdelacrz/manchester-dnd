@@ -1,31 +1,42 @@
-//! Account and opaque server-side session domain types.
+//! Account authentication and opaque server-side session service.
 //!
-//! Password verification and raw token generation belong to `AuthService` in
-//! the next phase. These types deliberately keep hashes redacted from `Debug`.
+//! MongoDB is authoritative. DragonflyDB is a bounded read-through session
+//! cache and throttle fast path; every cache error falls back to MongoDB.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use mongodb::bson::DateTime;
 use rand::TryRngCore;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
+    cache::{CacheService, SessionCacheEntry},
     config::AuthenticationConfig,
-    error::{AuthenticationError, RepositoryError},
-    repository::PostgresRepository,
+    error::{AuthenticationError, MongoFailureKind, PersistenceError},
+    persistence::{
+        EmailCrypto, MongoAccountRepository,
+        auth::{
+            CompleteSignupWrite, MongoLoginAccount, MongoSessionRecord, NewMongoAccount,
+            NewMongoAccountSession, NewSignupAccessToken, NewSignupSession, add_duration,
+            purge_after,
+        },
+    },
 };
-
-use serde::{Deserialize, Serialize};
 
 pub const LOCAL_ACCOUNT_ID: &str = "account:local";
 pub const SHA256_DIGEST_PREFIX: &str = "sha256:";
+const SIGNUP_SESSION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+const SESSION_CACHE_MAX_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PasswordPhc(String);
@@ -57,6 +68,8 @@ pub struct AccountPrincipal {
     pub session_id: String,
 }
 
+/// Transitional SQL shape retained only so untouched SQL repository modules
+/// compile during the MongoDB vertical migration.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NewAccount {
     pub id: String,
@@ -77,6 +90,7 @@ impl fmt::Debug for NewAccount {
     }
 }
 
+/// Transitional SQL shape retained only for untouched repositories.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoginAccount {
     pub id: String,
@@ -108,6 +122,7 @@ pub struct AccountSummary {
     pub updated_at: String,
 }
 
+/// Transitional SQL shape retained only for untouched repositories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAccountSession {
     pub id: String,
@@ -136,6 +151,7 @@ pub enum AuthenticationEventKind {
 }
 
 impl AuthenticationEventKind {
+    #[allow(dead_code)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::SignUp => "signup",
@@ -157,6 +173,7 @@ pub enum AuthenticationOutcomeClass {
 }
 
 impl AuthenticationOutcomeClass {
+    #[allow(dead_code)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -200,7 +217,9 @@ pub struct AuthenticationThrottleBucket {
 
 #[derive(Clone)]
 pub struct AuthService {
-    repository: PostgresRepository,
+    repository: MongoAccountRepository,
+    cache: CacheService,
+    email_crypto: EmailCrypto,
     config: Arc<AuthenticationConfig>,
     argon2: Argon2<'static>,
     dummy_password_phc: PasswordPhc,
@@ -214,9 +233,7 @@ impl AuthenticationSecret {
         Self(value.into())
     }
 
-    /// Exposes the raw value only to the trusted HTTP cookie/CSRF boundary.
-    /// Callers must never serialize it into logs, URLs, local storage, or
-    /// Leptos shared state.
+    /// Exposes a raw value only to trusted cookie, CSRF, or one-time CLI output.
     pub fn expose_secret(&self) -> &str {
         &self.0
     }
@@ -244,11 +261,38 @@ pub struct IssuedSession {
     pub absolute_expires_at: String,
 }
 
+#[derive(Debug)]
+pub struct IssuedSignupAccessToken {
+    pub id: String,
+    pub token: AuthenticationSecret,
+    pub expires_at: String,
+}
+
+#[derive(Debug)]
+pub struct IssuedSignupSession {
+    pub id: String,
+    pub session_token: AuthenticationSecret,
+    pub csrf_token: AuthenticationSecret,
+    pub expires_at: String,
+}
+
 impl AuthService {
     pub fn new(
-        repository: PostgresRepository,
+        repository: MongoAccountRepository,
+        cache: CacheService,
         config: AuthenticationConfig,
     ) -> Result<Self, AuthenticationError> {
+        if config.session_idle_lifetime.is_zero()
+            || config.session_absolute_lifetime.is_zero()
+            || config.session_idle_lifetime > config.session_absolute_lifetime
+            || config.max_active_sessions == 0
+            || config.max_hash_concurrency == 0
+            || config.throttle_hmac_key.expose_secret().len() < 32
+        {
+            return Err(AuthenticationError::InvalidInput(
+                AuthenticationInputError::InvalidConfiguration,
+            ));
+        }
         let params = Params::new(
             config.argon2_memory_kib,
             config.argon2_iterations,
@@ -259,8 +303,11 @@ impl AuthService {
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let dummy_password_phc = hash_password_with(&argon2, "dummy-password-not-a-login")?;
         let hash_permits = Arc::new(Semaphore::new(config.max_hash_concurrency));
+        let email_crypto = EmailCrypto::from_config(&config)?;
         Ok(Self {
             repository,
+            cache,
+            email_crypto,
             config: Arc::new(config),
             argon2,
             dummy_password_phc,
@@ -268,43 +315,184 @@ impl AuthService {
         })
     }
 
+    /// Legacy direct signup is intentionally closed. Admission must first
+    /// create a signup session through `begin_signup`.
     pub async fn sign_up(
         &self,
+        _email: &str,
+        _display_name: &str,
+        _password: &AuthenticationSecret,
+    ) -> Result<IssuedSession, AuthenticationError> {
+        Err(AuthenticationError::AccountUnavailable)
+    }
+
+    pub async fn issue_signup_access_token(
+        &self,
+        allowed_role: &str,
+        issued_by: &str,
+        lifetime: Duration,
+    ) -> Result<IssuedSignupAccessToken, AuthenticationError> {
+        if !matches!(allowed_role, "user" | "admin")
+            || !valid_opaque_identifier(issued_by)
+            || lifetime.is_zero()
+            || lifetime > MAX_ACCESS_TOKEN_LIFETIME
+        {
+            return Err(AuthenticationError::InvalidSignupAccess);
+        }
+        let token = random_token()?;
+        let now = DateTime::now();
+        let expires_at = add_duration(now, lifetime);
+        let id = format!("signup-access-token:{}", Uuid::new_v4());
+        self.repository
+            .issue_signup_access_token(NewSignupAccessToken {
+                id: id.clone(),
+                token_digest: sha256_digest(token.expose_secret().as_bytes()),
+                allowed_role: allowed_role.to_owned(),
+                issued_by: issued_by.to_owned(),
+                expires_at,
+                purge_at: purge_after(expires_at),
+            })
+            .await
+            .map_err(map_access_token_persistence)?;
+        Ok(IssuedSignupAccessToken {
+            id,
+            token,
+            expires_at: date_string(expires_at)?,
+        })
+    }
+
+    pub async fn begin_signup(
+        &self,
+        access_token: &AuthenticationSecret,
+    ) -> Result<IssuedSignupSession, AuthenticationError> {
+        let throttle_identifier = sha256_digest(access_token.expose_secret().as_bytes());
+        let throttle_digest =
+            self.throttle_key_digest(&throttle_identifier, AuthenticationActionKind::SignUp);
+        let bucket = self
+            .record_authentication_attempt(&throttle_digest, AuthenticationActionKind::SignUp)
+            .await?;
+        if Self::is_throttled(&bucket) {
+            return Err(AuthenticationError::Throttled);
+        }
+        let session_token = random_token()?;
+        let csrf_token = random_token()?;
+        let now = DateTime::now();
+        let expires_at = add_duration(now, SIGNUP_SESSION_LIFETIME);
+        let id = format!("signup-session:{}", Uuid::new_v4());
+        self.repository
+            .begin_signup(NewSignupSession {
+                id: id.clone(),
+                bearer_digest: sha256_digest(session_token.expose_secret().as_bytes()),
+                csrf_digest: sha256_digest(csrf_token.expose_secret().as_bytes()),
+                access_token_digest: sha256_digest(access_token.expose_secret().as_bytes()),
+                expires_at,
+                purge_at: purge_after(expires_at),
+            })
+            .await
+            .map_err(map_access_token_persistence)?;
+        Ok(IssuedSignupSession {
+            id,
+            session_token,
+            csrf_token,
+            expires_at: date_string(expires_at)?,
+        })
+    }
+
+    pub async fn revoke_signup_access_token(
+        &self,
+        token_id: &str,
+    ) -> Result<(), AuthenticationError> {
+        if !token_id.starts_with("signup-access-token:") {
+            return Err(AuthenticationError::InvalidSignupAccess);
+        }
+        if self.repository.revoke_signup_access_token(token_id).await? {
+            Ok(())
+        } else {
+            Err(AuthenticationError::InvalidSignupAccess)
+        }
+    }
+
+    pub async fn complete_signup(
+        &self,
+        signup_session_token: &AuthenticationSecret,
+        signup_csrf_token: &AuthenticationSecret,
         email: &str,
         display_name: &str,
         password: &AuthenticationSecret,
     ) -> Result<IssuedSession, AuthenticationError> {
-        let normalized_email = normalize_email(email)?;
-        validate_display_name(display_name)?;
+        let normalized_email =
+            EmailCrypto::normalize(email).map_err(|_| AuthenticationError::AccountUnavailable)?;
+        let username_normalized = normalize_username(display_name)?;
         validate_password(password.expose_secret())?;
         let password_phc = self.hash_password(password).await?;
         let account_id = format!("account:{}", Uuid::new_v4());
-        let (raw_session, new_session) = self.new_session(&account_id)?;
-        let new_account = NewAccount {
-            id: account_id,
-            normalized_email,
-            display_name: display_name.to_owned(),
-            password_phc,
-        };
-        let (account, authenticated) = self
+        let email_lookup_hmac = self.email_crypto.lookup_hmac(&normalized_email)?;
+        let email_ciphertext = self
+            .email_crypto
+            .encrypt(&account_id, 1, &normalized_email)?;
+        let (raw_session, account_session) = self.new_account_session(&account_id, 1)?;
+        let outcome = self
             .repository
-            .create_account_with_session(&new_account, &new_session)
+            .complete_signup(CompleteSignupWrite {
+                signup_bearer_digest: sha256_digest(
+                    signup_session_token.expose_secret().as_bytes(),
+                ),
+                signup_csrf_digest: sha256_digest(signup_csrf_token.expose_secret().as_bytes()),
+                account: NewMongoAccount {
+                    id: account_id,
+                    username: display_name.to_owned(),
+                    username_normalized,
+                    email_ciphertext,
+                    email_lookup_hmac,
+                    password_phc,
+                },
+                account_session,
+            })
             .await
-            .map_err(|error| match error {
-                RepositoryError::AlreadyExists { .. } => AuthenticationError::AccountUnavailable,
-                other => AuthenticationError::Repository(other),
-            })?;
-        Ok(issued_session(account, authenticated, raw_session))
+            .map_err(map_complete_signup_persistence)?;
+        self.cache_session(
+            &raw_session.0,
+            &outcome.session,
+            DateTime::now().timestamp_millis(),
+        )
+        .await;
+        Ok(issued_session(
+            outcome.account,
+            outcome.session.authenticated,
+            raw_session,
+        ))
     }
 
+    /// `identifier` accepts either username or email. Failure remains generic.
     pub async fn login(
         &self,
-        email: &str,
+        identifier: &str,
         password: &AuthenticationSecret,
     ) -> Result<IssuedSession, AuthenticationError> {
-        let normalized_email = normalize_email(email).ok();
-        let account = match normalized_email {
-            Some(ref email) => self.repository.load_login_account(email).await?,
+        let login_identifier = LoginIdentifier::parse(identifier, &self.email_crypto).ok();
+        let throttle_identifier = login_identifier
+            .as_ref()
+            .map_or("invalid-login-identifier", LoginIdentifier::normalized);
+        let throttle_digest =
+            self.throttle_key_digest(throttle_identifier, AuthenticationActionKind::Login);
+        let bucket = self
+            .record_authentication_attempt(&throttle_digest, AuthenticationActionKind::Login)
+            .await?;
+        if Self::is_throttled(&bucket) {
+            return Err(AuthenticationError::Throttled);
+        }
+
+        let account = match login_identifier.as_ref() {
+            Some(LoginIdentifier::Email { lookup_hmac, .. }) => {
+                self.repository
+                    .load_login_account(None, Some(lookup_hmac))
+                    .await?
+            }
+            Some(LoginIdentifier::Username(normalized)) => {
+                self.repository
+                    .load_login_account(Some(normalized), None)
+                    .await?
+            }
             None => None,
         };
         let candidate_phc = account
@@ -313,53 +501,102 @@ impl AuthService {
         let verified = self
             .verify_password(candidate_phc.clone(), password)
             .await?;
-        let Some(account) = account.filter(|account| account.login_enabled && verified) else {
+        let Some(mut account) = account.filter(|account| account.login_enabled && verified) else {
             return Err(AuthenticationError::InvalidCredentials);
         };
+
         if password_needs_rehash(&account.password_phc, &self.config) {
             let replacement = self.hash_password(password).await?;
-            self.repository
-                .update_account_password_phc(&account.id, &replacement)
+            let updated = self
+                .repository
+                .update_password_and_revoke_sessions(&account.id, &replacement)
                 .await?;
+            account.password_role_version = updated.password_role_version;
+            for digest in updated.revoked_bearer_digests {
+                let _ = self.cache.del_session(&digest).await;
+            }
         }
-        let (raw_session, new_session) = self.new_session(&account.id)?;
-        let authenticated = self.repository.create_account_session(&new_session).await?;
-        self.repository
-            .revoke_excess_account_sessions(&account.id, self.config.max_active_sessions)
+        let (raw_session, new_session) =
+            self.new_account_session(&account.id, account.password_role_version)?;
+        let outcome = self
+            .repository
+            .create_login_session(new_session, self.config.max_active_sessions)
             .await?;
-        let summary = AccountSummary {
-            id: account.id,
-            display_name: account.display_name,
-            login_enabled: true,
-            created_at: account.created_at,
-            updated_at: account.updated_at,
-        };
-        Ok(issued_session(summary, authenticated, raw_session))
+        for digest in outcome.revoked_bearer_digests {
+            let _ = self.cache.del_session(&digest).await;
+        }
+        self.cache_session(
+            &raw_session.0,
+            &outcome.session,
+            DateTime::now().timestamp_millis(),
+        )
+        .await;
+        Ok(issued_session(
+            account_summary(&account)?,
+            outcome.session.authenticated,
+            raw_session,
+        ))
     }
 
     pub async fn authenticate(
         &self,
         raw_session_token: &AuthenticationSecret,
     ) -> Result<AuthenticatedSession, AuthenticationError> {
-        self.repository
-            .authenticate_session_digest(
-                &sha256_digest(raw_session_token.expose_secret().as_bytes()),
-                self.config.session_idle_lifetime.as_secs(),
-            )
+        let digest = sha256_digest(raw_session_token.expose_secret().as_bytes());
+        let now_millis = DateTime::now().timestamp_millis();
+        if let Some(entry) = self.cache.get_session(&digest).await {
+            if valid_cached_session(&entry, now_millis) {
+                if self
+                    .repository
+                    .account_version_is_current(&entry.account_id, entry.password_role_version)
+                    .await?
+                {
+                    let refresh_interval = self
+                        .config
+                        .session_idle_lifetime
+                        .checked_div(2)
+                        .unwrap_or(Duration::from_secs(1))
+                        .min(Duration::from_secs(60))
+                        .max(Duration::from_secs(1));
+                    if now_millis.saturating_sub(entry.last_persisted_at_millis)
+                        < duration_millis(refresh_interval)
+                    {
+                        return cached_authenticated_session(&entry);
+                    }
+                } else {
+                    let _ = self.cache.del_session(&digest).await;
+                }
+            } else {
+                let _ = self.cache.del_session(&digest).await;
+            }
+        }
+        let session = self
+            .repository
+            .authenticate_session_digest(&digest, self.config.session_idle_lifetime)
             .await?
-            .ok_or(AuthenticationError::InvalidSession)
+            .ok_or(AuthenticationError::InvalidSession)?;
+        self.cache_session(raw_session_token, &session, now_millis)
+            .await;
+        Ok(session.authenticated)
     }
 
     pub async fn logout(&self, principal: &AccountPrincipal) -> Result<(), AuthenticationError> {
-        if self
+        self.revoke_session(&principal.account_id, &principal.session_id)
+            .await
+    }
+
+    pub async fn revoke_session(
+        &self,
+        account_id: &str,
+        session_id: &str,
+    ) -> Result<(), AuthenticationError> {
+        let digest = self
             .repository
-            .revoke_account_session(&principal.account_id, &principal.session_id)
+            .revoke_account_session(account_id, session_id)
             .await?
-        {
-            Ok(())
-        } else {
-            Err(AuthenticationError::InvalidSession)
-        }
+            .ok_or(AuthenticationError::InvalidSession)?;
+        let _ = self.cache.del_session(&digest).await;
+        Ok(())
     }
 
     pub async fn cleanup_expired_sessions(&self) -> Result<u64, AuthenticationError> {
@@ -373,8 +610,8 @@ impl AuthService {
         Ok(self.repository.load_account_summary(account_id).await?)
     }
 
-    /// HMAC-SHA256 digest of a throttle identifier. Raw emails and IPs are
-    /// never persisted in throttle buckets.
+    /// HMAC-SHA256 digest of a throttle identifier. Raw emails and IPs never
+    /// enter DragonflyDB or MongoDB throttle keys.
     pub fn throttle_key_digest(
         &self,
         identifier: &str,
@@ -386,6 +623,7 @@ impl AuthService {
         )
         .expect("HMAC accepts any key length");
         mac.update(identifier.as_bytes());
+        mac.update(&[0]);
         mac.update(action.as_str().as_bytes());
         format!("hmac-sha256:{:x}", mac.finalize().into_bytes())
     }
@@ -403,11 +641,44 @@ impl AuthService {
         key_digest: &str,
         action: AuthenticationActionKind,
     ) -> Result<AuthenticationThrottleBucket, AuthenticationError> {
-        let (window, threshold, block) = self.throttle_config();
-        Ok(self
-            .repository
-            .record_authentication_attempt(key_digest, action, window, threshold, block)
-            .await?)
+        if !valid_hmac_digest(key_digest) {
+            return Err(AuthenticationError::InvalidInput(
+                AuthenticationInputError::InvalidThrottleDigest,
+            ));
+        }
+        let (window_seconds, threshold, block_seconds) = self.throttle_config();
+        let ttl = Duration::from_secs(window_seconds.max(block_seconds));
+        match self
+            .cache
+            .increment_throttle(action.as_str(), key_digest, ttl)
+            .await
+        {
+            Ok(Some(count)) => {
+                let count = u32::try_from(count).unwrap_or(u32::MAX);
+                let blocked_until = if count >= threshold {
+                    Some(date_string(add_duration(
+                        DateTime::now(),
+                        Duration::from_secs(block_seconds),
+                    ))?)
+                } else {
+                    None
+                };
+                Ok(AuthenticationThrottleBucket {
+                    attempt_count: count,
+                    blocked_until,
+                })
+            }
+            Ok(None) | Err(_) => Ok(self
+                .repository
+                .record_authentication_attempt(
+                    key_digest,
+                    action,
+                    Duration::from_secs(window_seconds),
+                    threshold,
+                    Duration::from_secs(block_seconds),
+                )
+                .await?),
+        }
     }
 
     pub fn is_throttled(bucket: &AuthenticationThrottleBucket) -> bool {
@@ -459,27 +730,107 @@ impl AuthService {
         .map_err(|_| AuthenticationError::PasswordHash)
     }
 
-    fn new_session(
+    fn new_account_session(
         &self,
         account_id: &str,
+        password_role_version: u32,
     ) -> Result<
         (
             (AuthenticationSecret, AuthenticationSecret),
-            NewAccountSession,
+            NewMongoAccountSession,
         ),
         AuthenticationError,
     > {
         let session_token = random_token()?;
         let csrf_token = random_token()?;
-        let session = NewAccountSession {
+        let now = DateTime::now();
+        let absolute_expires_at = add_duration(now, self.config.session_absolute_lifetime);
+        let idle_expires_at = add_duration(now, self.config.session_idle_lifetime);
+        let session = NewMongoAccountSession {
             id: format!("session:{}", Uuid::new_v4()),
             account_id: account_id.to_owned(),
-            token_digest: sha256_digest(session_token.expose_secret().as_bytes()),
+            bearer_digest: sha256_digest(session_token.expose_secret().as_bytes()),
             csrf_digest: sha256_digest(csrf_token.expose_secret().as_bytes()),
-            idle_lifetime_seconds: self.config.session_idle_lifetime.as_secs(),
-            absolute_lifetime_seconds: self.config.session_absolute_lifetime.as_secs(),
+            password_role_version,
+            idle_expires_at,
+            absolute_expires_at,
+            purge_at: purge_after(absolute_expires_at),
         };
         Ok(((session_token, csrf_token), session))
+    }
+
+    async fn cache_session(
+        &self,
+        raw_session_token: &AuthenticationSecret,
+        session: &MongoSessionRecord,
+        persisted_at_millis: i64,
+    ) {
+        let digest = sha256_digest(raw_session_token.expose_secret().as_bytes());
+        let Ok(idle_expires_at) =
+            DateTime::parse_rfc3339_str(&session.authenticated.idle_expires_at)
+        else {
+            return;
+        };
+        let Ok(absolute_expires_at) =
+            DateTime::parse_rfc3339_str(&session.authenticated.absolute_expires_at)
+        else {
+            return;
+        };
+        let now = DateTime::now().timestamp_millis();
+        let remaining_millis = idle_expires_at
+            .timestamp_millis()
+            .min(absolute_expires_at.timestamp_millis())
+            .saturating_sub(now);
+        if remaining_millis <= 0 {
+            return;
+        }
+        let ttl = SESSION_CACHE_MAX_TTL.min(Duration::from_millis(
+            u64::try_from(remaining_millis).unwrap_or(1),
+        ));
+        let entry = SessionCacheEntry {
+            account_id: session.authenticated.principal.account_id.clone(),
+            session_id: session.authenticated.principal.session_id.clone(),
+            role: session.role.clone(),
+            csrf_digest: session.authenticated.csrf_digest.clone(),
+            idle_expires_at_millis: idle_expires_at.timestamp_millis(),
+            absolute_expires_at_millis: absolute_expires_at.timestamp_millis(),
+            password_role_version: session.password_role_version,
+            last_persisted_at_millis: session
+                .last_seen_at
+                .timestamp_millis()
+                .max(persisted_at_millis),
+        };
+        let _ = self.cache.set_session(&digest, &entry, ttl).await;
+    }
+}
+
+enum LoginIdentifier {
+    Email {
+        normalized: String,
+        lookup_hmac: String,
+    },
+    Username(String),
+}
+
+impl LoginIdentifier {
+    fn parse(identifier: &str, crypto: &EmailCrypto) -> Result<Self, AuthenticationError> {
+        if identifier.contains('@') {
+            let normalized = EmailCrypto::normalize(identifier)
+                .map_err(|_| AuthenticationError::InvalidCredentials)?;
+            let lookup_hmac = crypto.lookup_hmac(&normalized)?;
+            Ok(Self::Email {
+                normalized,
+                lookup_hmac,
+            })
+        } else {
+            Ok(Self::Username(normalize_username(identifier)?))
+        }
+    }
+
+    fn normalized(&self) -> &str {
+        match self {
+            Self::Email { normalized, .. } | Self::Username(normalized) => normalized,
+        }
     }
 }
 
@@ -496,6 +847,39 @@ fn issued_session(
         idle_expires_at: authenticated.idle_expires_at,
         absolute_expires_at: authenticated.absolute_expires_at,
     }
+}
+
+fn account_summary(account: &MongoLoginAccount) -> Result<AccountSummary, AuthenticationError> {
+    Ok(AccountSummary {
+        id: account.id.clone(),
+        display_name: account.username.clone(),
+        login_enabled: account.login_enabled,
+        created_at: date_string(account.created_at)?,
+        updated_at: date_string(account.updated_at)?,
+    })
+}
+
+fn cached_authenticated_session(
+    entry: &SessionCacheEntry,
+) -> Result<AuthenticatedSession, AuthenticationError> {
+    Ok(AuthenticatedSession {
+        principal: AccountPrincipal {
+            account_id: entry.account_id.clone(),
+            session_id: entry.session_id.clone(),
+        },
+        csrf_digest: entry.csrf_digest.clone(),
+        idle_expires_at: date_string(DateTime::from_millis(entry.idle_expires_at_millis))?,
+        absolute_expires_at: date_string(DateTime::from_millis(entry.absolute_expires_at_millis))?,
+    })
+}
+
+fn valid_cached_session(entry: &SessionCacheEntry, now_millis: i64) -> bool {
+    entry.account_id.starts_with("account:")
+        && entry.session_id.starts_with("session:")
+        && valid_sha256_digest(&entry.csrf_digest)
+        && entry.password_role_version > 0
+        && entry.idle_expires_at_millis > now_millis
+        && entry.absolute_expires_at_millis > now_millis
 }
 
 fn hash_password_with(
@@ -533,25 +917,16 @@ fn password_needs_rehash(phc: &PasswordPhc, config: &AuthenticationConfig) -> bo
         || hash.params.get_decimal("p") != Some(config.argon2_parallelism)
 }
 
-fn normalize_email(raw: &str) -> Result<String, AuthenticationError> {
-    let normalized = raw.trim().to_lowercase();
-    let valid = (3..=320).contains(&normalized.len())
-        && !normalized.chars().any(char::is_whitespace)
-        && normalized.matches('@').count() == 1
-        && normalized.split('@').all(|part| !part.is_empty());
-    if valid {
-        Ok(normalized)
-    } else {
-        Err(AuthenticationError::InvalidCredentials)
-    }
-}
-
-fn validate_display_name(display_name: &str) -> Result<(), AuthenticationError> {
-    if display_name.trim() == display_name && (1..=200).contains(&display_name.len()) {
-        Ok(())
-    } else {
-        Err(AuthenticationError::AccountUnavailable)
-    }
+fn normalize_username(raw: &str) -> Result<String, AuthenticationError> {
+    let trimmed = raw.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    let valid = trimmed == raw
+        && (1..=200).contains(&trimmed.len())
+        && !normalized.is_empty()
+        && !trimmed.chars().any(|c| c.is_control());
+    valid
+        .then_some(normalized)
+        .ok_or(AuthenticationError::AccountUnavailable)
 }
 
 fn validate_password(password: &str) -> Result<(), AuthenticationError> {
@@ -570,6 +945,13 @@ fn validate_password(password: &str) -> Result<(), AuthenticationError> {
     }
 }
 
+fn valid_opaque_identifier(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
 fn random_token() -> Result<AuthenticationSecret, AuthenticationError> {
     let mut bytes = [0_u8; 32];
     rand::rngs::OsRng
@@ -580,13 +962,49 @@ fn random_token() -> Result<AuthenticationSecret, AuthenticationError> {
     Ok(AuthenticationSecret::new(encoded))
 }
 
-fn sha256_digest(value: &[u8]) -> String {
+pub(crate) fn sha256_digest(value: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(value))
+}
+
+fn date_string(value: DateTime) -> Result<String, AuthenticationError> {
+    value
+        .try_to_rfc3339_string()
+        .map_err(|_| AuthenticationError::InvalidSession)
+}
+
+fn duration_millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn map_access_token_persistence(error: PersistenceError) -> AuthenticationError {
+    match error.mongo_failure_kind() {
+        Some(MongoFailureKind::DuplicateKey) => AuthenticationError::InvalidSignupAccess,
+        _ if matches!(error, PersistenceError::NotFound { .. }) => {
+            AuthenticationError::InvalidSignupAccess
+        }
+        _ => AuthenticationError::Persistence(error),
+    }
+}
+
+fn map_complete_signup_persistence(error: PersistenceError) -> AuthenticationError {
+    match error.mongo_failure_kind() {
+        Some(MongoFailureKind::DuplicateKey) => AuthenticationError::AccountUnavailable,
+        _ if matches!(
+            error,
+            PersistenceError::NotFound { .. } | PersistenceError::RevisionConflict { .. }
+        ) =>
+        {
+            AuthenticationError::InvalidSignupSession
+        }
+        _ => AuthenticationError::Persistence(error),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationInputError {
     InvalidPasswordHash,
+    InvalidConfiguration,
+    InvalidThrottleDigest,
 }
 
 impl fmt::Display for AuthenticationInputError {
@@ -605,32 +1023,17 @@ pub(crate) fn valid_sha256_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_hmac_digest(value: &str) -> bool {
+    value.len() == "hmac-sha256:".len() + 64
+        && value.starts_with("hmac-sha256:")
+        && value["hmac-sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use sqlx::{PgPool, Row};
-
     use super::*;
-    use crate::repository::MIGRATOR;
-
-    fn config() -> AuthenticationConfig {
-        AuthenticationConfig {
-            session_idle_lifetime: Duration::from_secs(60),
-            session_absolute_lifetime: Duration::from_secs(600),
-            max_active_sessions: 3,
-            max_hash_concurrency: 2,
-            throttle_window_seconds: 300,
-            throttle_block_after_attempts: 5,
-            throttle_block_seconds: 60,
-            throttle_hmac_key: crate::config::SecretString::new("test-throttle-key"),
-            cookie_secure: false,
-            canonical_origin: None,
-            argon2_memory_kib: 19_456,
-            argon2_iterations: 2,
-            argon2_parallelism: 1,
-        }
-    }
 
     #[test]
     fn password_policy_is_scalar_bounded_and_has_no_composition_rule() {
@@ -659,97 +1062,33 @@ mod tests {
         assert_eq!(format!("{secret:?}"), "AuthenticationSecret([REDACTED])");
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn signup_login_authenticate_and_logout_keep_raw_secrets_out_of_postgres(pool: PgPool) {
-        let service =
-            AuthService::new(PostgresRepository::from_pool(pool.clone()), config()).unwrap();
-        let password = AuthenticationSecret::new("a long local test passphrase");
-        let issued = service
-            .sign_up(" Player@Example.Test ", "Test Player", &password)
-            .await
-            .unwrap();
-        assert_eq!(issued.account.display_name, "Test Player");
-        let row = sqlx::query(
-            "SELECT normalized_email, password_phc, token_digest
-             FROM accounts JOIN account_sessions ON accounts.id = account_sessions.account_id
-             WHERE accounts.id = $1",
-        )
-        .bind(&issued.principal.account_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            row.get::<String, _>("normalized_email"),
-            "player@example.test"
-        );
-        let stored_phc: String = row.get("password_phc");
-        assert!(stored_phc.starts_with("$argon2id$"));
-        assert!(!stored_phc.contains(password.expose_secret()));
-        assert_ne!(
-            row.get::<String, _>("token_digest"),
-            issued.session_token.expose_secret()
-        );
-
-        let authenticated = service.authenticate(&issued.session_token).await.unwrap();
-        assert_eq!(authenticated.principal, issued.principal);
-        service.logout(&authenticated.principal).await.unwrap();
-        assert!(matches!(
-            service.authenticate(&issued.session_token).await,
-            Err(AuthenticationError::InvalidSession)
+    #[test]
+    fn cache_validation_rejects_expired_or_malformed_entries() {
+        let now = DateTime::now().timestamp_millis();
+        let valid = SessionCacheEntry {
+            account_id: format!("account:{}", Uuid::new_v4()),
+            session_id: format!("session:{}", Uuid::new_v4()),
+            role: "user".to_owned(),
+            csrf_digest: sha256_digest(b"csrf"),
+            idle_expires_at_millis: now + 1_000,
+            absolute_expires_at_millis: now + 2_000,
+            password_role_version: 1,
+            last_persisted_at_millis: now,
+        };
+        assert!(valid_cached_session(&valid, now));
+        assert!(!valid_cached_session(
+            &SessionCacheEntry {
+                idle_expires_at_millis: now,
+                ..valid.clone()
+            },
+            now
         ));
-
-        let login = service
-            .login("PLAYER@example.test", &password)
-            .await
-            .unwrap();
-        assert_eq!(login.principal.account_id, issued.principal.account_id);
-        assert!(matches!(
-            service
-                .login(
-                    "PLAYER@example.test",
-                    &AuthenticationSecret::new("a different wrong passphrase")
-                )
-                .await,
-            Err(AuthenticationError::InvalidCredentials)
+        assert!(!valid_cached_session(
+            &SessionCacheEntry {
+                csrf_digest: "raw-csrf".to_owned(),
+                ..valid
+            },
+            now
         ));
-        assert!(matches!(
-            service.login("unknown@example.test", &password).await,
-            Err(AuthenticationError::InvalidCredentials)
-        ));
-    }
-
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn successful_login_rehashes_parameters_below_policy(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let weak_argon = Argon2::new(
-            Algorithm::Argon2id,
-            Version::V0x13,
-            Params::new(8_192, 1, 1, Some(32)).unwrap(),
-        );
-        let password = AuthenticationSecret::new("another durable local passphrase");
-        let weak_phc = hash_password_with(&weak_argon, password.expose_secret()).unwrap();
-        let account_id = format!("account:{}", Uuid::new_v4());
-        repository
-            .create_account(&NewAccount {
-                id: account_id.clone(),
-                normalized_email: "rehash@example.test".to_owned(),
-                display_name: "Rehash Test".to_owned(),
-                password_phc: weak_phc,
-            })
-            .await
-            .unwrap();
-        let service = AuthService::new(repository, config()).unwrap();
-        service
-            .login("rehash@example.test", &password)
-            .await
-            .unwrap();
-        let upgraded: String =
-            sqlx::query_scalar("SELECT password_phc FROM accounts WHERE id = $1")
-                .bind(account_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let upgraded = PasswordPhc::parse(upgraded).unwrap();
-        assert!(!password_needs_rehash(&upgraded, &config()));
     }
 }

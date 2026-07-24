@@ -3,8 +3,8 @@
 use std::{env, path::Path, process::ExitCode};
 
 use manchester_dnd_server::{
-    CompleteRecoveryManifest, DatabaseRuntimeConfig, LOCAL_HERO_OWNER_KEY,
-    repository::PostgresRepository,
+    AppConfig, CompleteRecoveryManifest, LOCAL_HERO_OWNER_KEY, MongoStore,
+    repository::MongoRepository,
 };
 use serde_json::json;
 
@@ -23,23 +23,15 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<CompleteRecoveryManifest, String> {
-    let database_url = env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL is required for the recovery manifest".to_owned())?;
-    if database_url.trim().is_empty() {
-        return Err("DATABASE_URL is required for the recovery manifest".to_owned());
-    }
     let rng_master_key =
         env::var("RNG_MASTER_KEY_FILE").unwrap_or_else(|_| "data/rng-master.key".to_owned());
     let image_artifact_root =
         env::var("IMAGE_ARTIFACT_ROOT").unwrap_or_else(|_| "data/generated-images".to_owned());
-    let runtime = DatabaseRuntimeConfig {
-        max_connections: 1,
-        migrate_on_start: false,
-        ..DatabaseRuntimeConfig::default()
-    };
-    let repository = PostgresRepository::connect(&database_url, runtime)
+    let config = AppConfig::load().map_err(safe_error)?;
+    let store = MongoStore::connect(&config.persistence.mongodb)
         .await
         .map_err(safe_error)?;
+    let repository = MongoRepository::new(store);
     let database = repository
         .database_recovery_manifest(LOCAL_HERO_OWNER_KEY)
         .await

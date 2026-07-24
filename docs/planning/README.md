@@ -10,7 +10,7 @@ Manchester Arcana is a web-based, AI-GM fantasy role-playing game. It uses a det
 2. [System architecture](02-architecture.md) — crate boundaries, Leptos 0.8 SSR/hydration, server APIs, configuration, and errors.
 3. [Rules and gameplay](03-rules-and-gameplay.md) — SRD 5.1 coverage, authoritative resolution, rolls, actions, combat, and advancement.
 4. [AI generation](04-ai-generation.md) — provider abstraction, structured proposals, text/image flows, fallbacks, and cost controls.
-5. [Persistence](05-persistence.md) — PostgreSQL documents/audits, concurrency, save/resume, migrations, versioning, and recovery.
+5. [Persistence](05-persistence.md) — MongoDB documents/audits, transactions, save/resume, schema bundles, Dragonfly degradation, versioning, and recovery.
 6. [Consent, privacy, and safety](06-consent-privacy-safety.md) — safe use of real-life-inspired Markdown prompts and player controls.
 7. [Characters and content packs](07-characters-and-content-packs.md) — themed creation and independently versioned content.
 8. [Delivery roadmap](08-delivery-roadmap.md) — vertical slices and acceptance criteria.

@@ -37,7 +37,7 @@ impl GameApplicationService {
         let _guard = self.command_gate.lock().await;
         if self
             .repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .map_err(ApplicationError::Repository)?
             .is_none()
@@ -54,7 +54,11 @@ impl GameApplicationService {
             let character = local_character()?;
             match self
                 .repository
-                .create_campaign(&session, std::slice::from_ref(&character))
+                .create_campaign(
+                    LOCAL_HERO_OWNER_KEY,
+                    &session,
+                    std::slice::from_ref(&character),
+                )
                 .await
             {
                 Ok(_) | Err(RepositoryError::AlreadyExists { .. }) => {}
@@ -353,22 +357,71 @@ fn map_recap_repository_error(error: RepositoryError) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use sqlx::PgPool;
+    use mongodb::bson::doc;
+    use uuid::Uuid;
 
     use super::*;
-    use crate::{config::AccessMode, repository::MIGRATOR, seed::SeedVault};
+    use crate::{
+        config::{AccessMode, MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{CollectionName, MongoStore, SchemaReconciler},
+        repository::MongoRepository,
+        seed::SeedVault,
+    };
 
-    fn service(pool: PgPool, access_mode: AccessMode) -> GameApplicationService {
-        let repository = crate::repository::PostgresRepository::from_pool(pool);
-        GameApplicationService::with_sources(
+    async fn service(
+        access_mode: AccessMode,
+    ) -> Option<(GameApplicationService, MongoRepository, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping MongoDB lifecycle test: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(
+            uri.starts_with("mongodb://root:") && uri.contains("127.0.0.1"),
+            "MONGODB_TEST_URI must be the explicit local root test URI"
+        );
+        let database = format!("mdnd_lifecycle_test_{}", Uuid::new_v4().simple());
+        let store = MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 4,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 2,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("MongoDB schema must apply");
+        let repository = MongoRepository::new(store);
+        let application = GameApplicationService::with_sources(
             access_mode,
-            repository,
+            repository.clone(),
             Arc::new(SeedVault::from_key([9; 32])),
             |_| 10,
             || 1_000,
-        )
+        );
+        Some((application, repository, database))
+    }
+
+    async fn drop_database(repository: &MongoRepository, database: &str) {
+        assert!(
+            database.starts_with("mdnd_lifecycle_test_") && database != "manchester_dnd",
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
+            .await
+            .expect("test database must drop");
     }
 
     fn lifecycle(expected: u64, key: &str) -> CampaignLifecycleCommand {
@@ -380,15 +433,26 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn local_application_lists_creates_archives_deletes_and_never_recreates_implicitly(
-        pool: PgPool,
-    ) {
-        let service = service(pool.clone(), AccessMode::LocalSingleUser);
+    #[tokio::test]
+    async fn local_application_lists_creates_archives_deletes_and_never_recreates_implicitly() {
+        let Some((service, repository, database)) = service(AccessMode::LocalSingleUser).await
+        else {
+            return;
+        };
         assert!(service.list_local_campaigns().await.unwrap().is_empty());
         let created = service.create_local_campaign().await.unwrap();
         assert_eq!(created.lifecycle_revision, 1);
         assert!(service.load_local_campaign().await.is_ok());
+        let removed_legacy_character = repository
+            .store()
+            .document_collection(CollectionName::CampaignCharacterInstances)
+            .delete_one(doc! {
+                "campaign_id": LOCAL_CAMPAIGN_SESSION_ID,
+                "runtime_kind": "core_character",
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed_legacy_character.deleted_count, 1);
 
         service
             .start_local_play_session(StartPlaySessionCommand {
@@ -418,12 +482,18 @@ mod tests {
             service.load_local_campaign().await,
             Err(ApplicationError::CampaignArchived)
         ));
-        assert!(service.export_local_campaign_canonical_json().await.is_ok());
+        service
+            .export_local_campaign_canonical_json()
+            .await
+            .expect("archived campaign export should succeed");
         service
             .restore_local_campaign_from_archive(lifecycle(4, "app-restore"))
             .await
             .unwrap();
-        assert!(service.load_local_campaign().await.is_ok());
+        assert_eq!(
+            service.list_local_campaigns().await.unwrap()[0].lifecycle_state,
+            CampaignLifecycleState::Active
+        );
         service
             .archive_local_campaign(lifecycle(5, "app-rearchive"))
             .await
@@ -449,24 +519,30 @@ mod tests {
         let recreated = service.create_local_campaign().await.unwrap();
         assert_eq!(recreated.lifecycle_revision, 1);
         assert!(service.load_local_campaign().await.is_ok());
-        let old_receipts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM campaign_lifecycle_receipts
-             WHERE owner_key = $1 AND campaign_session_id = $2",
-        )
-        .bind(LOCAL_HERO_OWNER_KEY)
-        .bind(LOCAL_CAMPAIGN_SESSION_ID)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let old_receipts = repository
+            .store()
+            .document_collection(CollectionName::CommandReceipts)
+            .count_documents(doc! {
+                "scope_kind": "campaign",
+                "scope_id": LOCAL_CAMPAIGN_SESSION_ID,
+                "campaign_id": LOCAL_CAMPAIGN_SESSION_ID,
+                "actor_account_id": LOCAL_HERO_OWNER_KEY,
+                "state": "committed",
+            })
+            .await
+            .unwrap();
         assert_eq!(
             old_receipts, 0,
             "new local campaign is a fresh idempotency scope"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "MIGRATOR")]
-    async fn hosted_mode_denies_every_lifecycle_entrypoint(pool: PgPool) {
-        let service = service(pool, AccessMode::Hosted);
+    #[tokio::test]
+    async fn hosted_mode_denies_every_lifecycle_entrypoint() {
+        let Some((service, repository, database)) = service(AccessMode::Hosted).await else {
+            return;
+        };
         assert!(matches!(
             service.list_local_campaigns().await,
             Err(ApplicationError::HostedAccessDenied)
@@ -494,5 +570,6 @@ mod tests {
                 .await,
             Err(ApplicationError::HostedAccessDenied)
         ));
+        drop_database(&repository, &database).await;
     }
 }

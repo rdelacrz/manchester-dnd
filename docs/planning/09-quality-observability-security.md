@@ -13,7 +13,7 @@ Correctness is layered: mechanical outcomes must be exact and replayable; model 
 | RNG/dice | Pinned algorithm known-answer tests; parser limits/overflow; roll-record totals; non-flaky statistical smoke checks separate from exact conformance |
 | Save/history compatibility | Golden campaign/character documents and turn audits from every supported schema/rules/content version; canonical state hashes; migration semantics; event-stream fixtures only after that evolution exists |
 | Content/pack | Schema, dependency, path/digest/provenance, referential integrity, capability reachability, instantiate every offered build/entity |
-| Persistence | Real PostgreSQL migrations/foreign keys/JSONB constraints, transaction rollback, row-lock/optimistic conflicts, idempotency races, deadlock/serialization handling, backup restore, expired job leases |
+| Persistence | Real MongoDB validators/indexes/transactions, rollback, revision conflicts, idempotency races, transient-label handling, tenant isolation, backup restore, expired job leases, Dragonfly degradation |
 | Application/API | Authentication/authorization per server function, safe error mapping, size/rate limits, CSRF, hidden-field/ID forgery, cancellation/timeouts |
 | Leptos UI | SSR render, hydration with zero warnings, progressive forms, stale-revision recovery, keyboard/focus, accessible names/status updates |
 | Browser E2E | Create → play → roll → reload → level → export; provider degradation; worker restart; two-user isolation |
@@ -24,7 +24,7 @@ Correctness is layered: mechanical outcomes must be exact and replayable; model 
 
 Do not assert exact creative prose from a live model in normal CI. Model promotion evaluations run on synthetic/non-private fixtures with schema validity, factual consistency, safety/privacy, latency, and cost thresholds. Keep provider-contract smoke tests opt-in and budgeted.
 
-Current Slice 1A evidence covers strict command/result decoding, tamper rejection, deterministic injected rolls, same-key replay without reroll, concurrent in-process duplicates, PostgreSQL row-lock serialization across independent repository handles, changed-key conflicts, stale revisions, transaction rollback, exact stored-result reload, safe error mapping, and loopback Origin/Host checks. Live smoke verification also exercises both health endpoints and commit/reload over HTTP. This is not yet the browser-E2E, process-restart, cross-tenant, rate-limit, body-limit, or pinned-RNG evidence required by the target portfolio.
+Current evidence covers strict command/result decoding, tamper rejection, deterministic injected rolls, same-key replay without reroll, concurrent independent Mongo repository handles, changed-key conflicts, stale revisions, transaction rollback, exact stored-result reload, safe error mapping, account/campaign isolation, and Origin/Host/CSRF checks. Live smoke verification also exercises health and commit/reload over HTTP. This is not yet full release evidence.
 
 ### Rules traceability
 
@@ -39,7 +39,7 @@ Source locators point to licensed SRD 5.1 sections/pages without copying long pr
 
 ### Definition of done
 
-A change is done only when its observable behavior, error cases, authorization, migrations/versioning impact, telemetry/redaction, accessibility, and relevant documentation are tested. Bug fixes begin with a failing regression test. Non-deterministic flakes are defects, not retries to normalize.
+A change is done only when its observable behavior, error cases, authorization, schema/versioning impact, telemetry/redaction, accessibility, and relevant documentation are tested. Bug fixes begin with a failing regression test. Non-deterministic flakes are defects, not retries to normalize.
 
 ## Observability
 
@@ -92,9 +92,9 @@ The current local boundary is intentionally narrower than the hosted controls be
 - Build-time scans of WASM/JS/source maps and rendered bootstrap data for secret canaries/private fields.
 - Deterministic shared rendering to prevent hydration divergence; authorize before loading SSR data and avoid cross-user shared caches.
 
-**Application and PostgreSQL**
+**Application, MongoDB, and DragonflyDB**
 
-- Parameterized queries, least-privilege roles, foreign keys/JSONB constraints, deterministic row locking, expected-revision checks, immutable turn/security audits, integrity hashes, and bounded connection/transaction concurrency.
+- Typed BSON, least-privilege app/schema roles, managed validators/indexes, tenant-scoped filters, expected-revision checks, immutable turn/security audits, integrity hashes, bounded connection/transaction concurrency, and fail-safe disposable-cache behavior.
 - Centralized authorization and safe-view construction; providers never receive repository handles.
 - Treat connection URLs as credentials, require TLS across non-local boundaries, segregate environments/roles, audit privileged access, encrypt backups, and test credential rotation plus logical/point-in-time restore as required by the recovery objective.
 

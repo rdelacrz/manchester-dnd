@@ -1,24 +1,43 @@
-//! Custom-action point ledger persistence (Task 18).
+//! Campaign-character BDE persistence.
 //!
-//! The authoritative game transaction must commit the mechanical turn, point
-//! spend, turn audit, and idempotency receipt together. Points are never
-//! decremented in browser state or in a separate best-effort transaction.
+//! MongoDB is authoritative. Balance compare-and-set, ledger, turn evidence,
+//! minimized audit, and exact receipt commit in one snapshot/majority
+//! transaction. Rich turn mechanics remain in the owning gameplay turn;
+//! `bde_ledger` is the append-only point history.
 
-#![allow(dead_code)]
+use manchester_dnd_core::{
+    Sha256Digest,
+    action_points::{
+        ActionPointLedgerEntry, ActionPointReason, COST_PER_CUSTOM_ACTION, INITIAL_ACTION_POINTS,
+        MAX_ACTION_POINT_BALANCE,
+    },
+    is_valid_opaque_id,
+};
+use mongodb::{
+    bson::{Bson, DateTime, Document, doc},
+    options::ReturnDocument,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use sqlx::PgPool;
+use super::{
+    AuditEventDocument, CampaignDocument, CommandReceiptDocument, active_campaign_filter,
+    date_string, map_persistence, validate_account_id, validate_opaque,
+};
+use crate::{
+    error::{MongoFailureKind, PersistenceError, RepositoryError},
+    persistence::{CollectionName, MongoStore},
+};
 
-use manchester_dnd_core::action_points::{ActionPointLedgerEntry, ActionPointReason};
-
-use crate::repository::RepositoryError;
+const SCHEMA_VERSION: u32 = 1;
 
 pub struct ActionPointRepository;
 
 impl ActionPointRepository {
-    /// Grants the initial balance when a character joins a play session.
     #[allow(clippy::too_many_arguments)]
     pub async fn grant_initial(
-        pool: &PgPool,
+        store: &MongoStore,
         account_id: &str,
         campaign_id: &str,
         runtime_character_id: &str,
@@ -28,7 +47,7 @@ impl ActionPointRepository {
         idempotency_key: &str,
     ) -> Result<i32, RepositoryError> {
         Self::apply(
-            pool,
+            store,
             account_id,
             campaign_id,
             runtime_character_id,
@@ -41,11 +60,9 @@ impl ActionPointRepository {
         .await
     }
 
-    /// Spends points for an accepted custom action. Returns the new balance.
-    /// Returns NotFound if insufficient balance.
     #[allow(clippy::too_many_arguments)]
     pub async fn spend(
-        pool: &PgPool,
+        store: &MongoStore,
         account_id: &str,
         campaign_id: &str,
         runtime_character_id: &str,
@@ -55,7 +72,7 @@ impl ActionPointRepository {
         idempotency_key: &str,
     ) -> Result<i32, RepositoryError> {
         Self::apply(
-            pool,
+            store,
             account_id,
             campaign_id,
             runtime_character_id,
@@ -68,10 +85,9 @@ impl ActionPointRepository {
         .await
     }
 
-    /// Refunds points after a game-master cancellation.
     #[allow(clippy::too_many_arguments)]
     pub async fn refund(
-        pool: &PgPool,
+        store: &MongoStore,
         account_id: &str,
         campaign_id: &str,
         runtime_character_id: &str,
@@ -81,7 +97,7 @@ impl ActionPointRepository {
         idempotency_key: &str,
     ) -> Result<i32, RepositoryError> {
         Self::apply(
-            pool,
+            store,
             account_id,
             campaign_id,
             runtime_character_id,
@@ -94,32 +110,58 @@ impl ActionPointRepository {
         .await
     }
 
-    /// Loads the current balance for a character in a campaign.
     pub async fn load_balance(
-        pool: &PgPool,
+        store: &MongoStore,
         account_id: &str,
         campaign_id: &str,
         runtime_character_id: &str,
     ) -> Result<i32, RepositoryError> {
-        let row: Option<(i32,)> = sqlx::query_as(
-            "SELECT balance FROM custom_action_point_balances
-             WHERE account_id = $1 AND campaign_id = $2 AND runtime_character_id = $3",
-        )
-        .bind(account_id)
-        .bind(campaign_id)
-        .bind(runtime_character_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e))?;
-
-        Ok(row.map(|(b,)| b).unwrap_or(0))
+        validate_scope(account_id, campaign_id, runtime_character_id, None, None)?;
+        let campaigns = store.collection::<CampaignDocument>(CollectionName::Campaigns);
+        let instances = store.document_collection(CollectionName::CampaignCharacterInstances);
+        let account = account_id.to_owned();
+        let campaign = campaign_id.to_owned();
+        let character = runtime_character_id.to_owned();
+        let stored = store
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let instances = instances.clone();
+                let account = account.clone();
+                let campaign = campaign.clone();
+                let character = character.clone();
+                Box::pin(async move {
+                    campaigns
+                        .find_one(active_campaign_filter(&account, &campaign))
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("authorize BDE balance", error))?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "campaign",
+                            id: campaign.clone(),
+                        })?;
+                    instances
+                        .find_one(doc! {
+                            "_id": &character,
+                            "campaign_id": &campaign,
+                            "account_id": &account,
+                            "state": "active",
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("load BDE balance", error))
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        let Some(stored) = stored else {
+            return Ok(0);
+        };
+        optional_i32_path(&stored, "runtime.bde.balance")?.map_or(Ok(0), Ok)
     }
 
-    /// Core apply function: inserts a ledger entry and updates the balance
-    /// atomically in a single transaction with row-level locking.
-    #[allow(clippy::too_many_arguments, clippy::redundant_closure)]
+    #[allow(clippy::too_many_arguments)]
     async fn apply(
-        pool: &PgPool,
+        store: &MongoStore,
         account_id: &str,
         campaign_id: &str,
         runtime_character_id: &str,
@@ -129,398 +171,647 @@ impl ActionPointRepository {
         reason: ActionPointReason,
         idempotency_key: &str,
     ) -> Result<i32, RepositoryError> {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| RepositoryError::Database(e))?;
-
-        let ledger_id = format!("capl:{}", idempotency_key);
-
-        // Insert ledger entry — idempotent on (idempotency_key, reason) conflict
-        let ledger_result = sqlx::query(
-            "INSERT INTO custom_action_point_ledger
-             (id, account_id, campaign_id, runtime_character_id, play_session_id,
-              turn_revision, amount, reason, idempotency_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (idempotency_key, reason) DO NOTHING",
-        )
-        .bind(&ledger_id)
-        .bind(account_id)
-        .bind(campaign_id)
-        .bind(runtime_character_id)
-        .bind(play_session_id)
-        .bind(turn_revision as i64)
-        .bind(amount)
-        .bind(reason.as_str())
-        .bind(idempotency_key)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| RepositoryError::Database(e))?;
-
-        if ledger_result.rows_affected() == 0 {
-            // Idempotent replay — return current balance without charging again
-            let balance: (i32,) = sqlx::query_as(
-                "SELECT balance FROM custom_action_point_balances
-                 WHERE account_id = $1 AND campaign_id = $2 AND runtime_character_id = $3
-                 FOR UPDATE",
-            )
-            .bind(account_id)
-            .bind(campaign_id)
-            .bind(runtime_character_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| RepositoryError::Database(e))?;
-
-            tx.commit()
-                .await
-                .map_err(|e| RepositoryError::Database(e))?;
-            return Ok(balance.0);
+        validate_scope(
+            account_id,
+            campaign_id,
+            runtime_character_id,
+            Some(play_session_id),
+            Some(idempotency_key),
+        )?;
+        if amount <= 0 || turn_revision == 0 {
+            return invalid(
+                runtime_character_id,
+                "amount and turn revision must be positive",
+            );
         }
-
-        // Lock and update balance
-        let delta = reason.delta(amount);
-
-        let new_balance: i32 = match reason {
-            ActionPointReason::CustomActionSpent => {
-                // For spending, lock the row and verify sufficient balance
-                let row: Option<(i32,)> = sqlx::query_as(
-                    "SELECT balance FROM custom_action_point_balances
-                     WHERE account_id = $1 AND campaign_id = $2 AND runtime_character_id = $3
-                     FOR UPDATE",
-                )
-                .bind(account_id)
-                .bind(campaign_id)
-                .bind(runtime_character_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| RepositoryError::Database(e))?;
-
-                let current = row.map(|(b,)| b).unwrap_or(0);
-                if current < amount {
-                    // Roll back the ledger insert by aborting the transaction
-                    return Err(RepositoryError::NotFound {
-                        entity: "action_point_balance",
-                        id: format!("{account_id}/{campaign_id}/{runtime_character_id}"),
-                    });
-                }
-                let new_val = current - amount;
-
-                sqlx::query(
-                    "UPDATE custom_action_point_balances
-                     SET balance = $4, updated_at = CURRENT_TIMESTAMP
-                     WHERE account_id = $1 AND campaign_id = $2 AND runtime_character_id = $3",
-                )
-                .bind(account_id)
-                .bind(campaign_id)
-                .bind(runtime_character_id)
-                .bind(new_val)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| RepositoryError::Database(e))?;
-
-                new_val
+        match reason {
+            ActionPointReason::InitialGrant if amount != INITIAL_ACTION_POINTS => {
+                return invalid(
+                    runtime_character_id,
+                    "initial BDE grant must use the server policy amount",
+                );
             }
-            _ => {
-                // For grants/refunds, upsert the balance
-                let row: (i32,) = sqlx::query_as(
-                    "INSERT INTO custom_action_point_balances
-                     (account_id, campaign_id, runtime_character_id, play_session_id, balance)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (account_id, campaign_id, runtime_character_id)
-                     DO UPDATE SET balance = custom_action_point_balances.balance + EXCLUDED.balance,
-                                   updated_at = CURRENT_TIMESTAMP
-                     RETURNING balance",
-                )
-                .bind(account_id)
-                .bind(campaign_id)
-                .bind(runtime_character_id)
-                .bind(play_session_id)
-                .bind(delta)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| RepositoryError::Database(e))?;
-
-                row.0
+            ActionPointReason::CustomActionSpent if amount != COST_PER_CUSTOM_ACTION => {
+                return invalid(
+                    runtime_character_id,
+                    "custom actions must use the server policy cost",
+                );
             }
+            _ if amount > MAX_ACTION_POINT_BALANCE => {
+                return invalid(runtime_character_id, "BDE amount exceeds the server policy");
+            }
+            _ => {}
+        }
+        let request = ActionPointRequest {
+            account_id,
+            campaign_id,
+            runtime_character_id,
+            play_session_id,
+            turn_revision,
+            amount,
+            reason: reason.as_str(),
         };
+        let request_fingerprint = fingerprint(&request)?;
+        let delta = reason.delta(amount);
+        let turn_revision_i64 =
+            i64::try_from(turn_revision).map_err(|_| RepositoryError::NumericRange {
+                field: "turn revision",
+            })?;
+        let result_revision =
+            turn_revision
+                .checked_add(1)
+                .ok_or(RepositoryError::NumericRange {
+                    field: "turn revision",
+                })?;
+        let now = DateTime::now();
+        let ledger_id = format!("bde-ledger:{}", Uuid::new_v4().simple());
+        let audit_event_id = format!("audit:{}", Uuid::new_v4().simple());
+        let receipt_id = format!("receipt:{}", Uuid::new_v4().simple());
 
-        tx.commit()
-            .await
-            .map_err(|e| RepositoryError::Database(e))?;
+        let campaigns = store.collection::<CampaignDocument>(CollectionName::Campaigns);
+        let instances = store.document_collection(CollectionName::CampaignCharacterInstances);
+        let play_sessions = store.document_collection(CollectionName::PlaySessions);
+        let ledgers = store.collection::<BdeLedgerDocument>(CollectionName::BdeLedger);
+        let audits = store.collection::<AuditEventDocument>(CollectionName::AuditEvents);
+        let receipts = store.collection::<CommandReceiptDocument>(CollectionName::CommandReceipts);
+        let account = account_id.to_owned();
+        let campaign = campaign_id.to_owned();
+        let character = runtime_character_id.to_owned();
+        let play_session = play_session_id.to_owned();
+        let key = idempotency_key.to_owned();
+        let reason_name = reason.as_str().to_owned();
+        let fingerprint_text = request_fingerprint.as_str().to_owned();
+        let ledger_id_for_write = ledger_id.clone();
+        let audit_event_id_for_write = audit_event_id.clone();
+        let receipt_id_for_write = receipt_id.clone();
+        let transaction = store
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let instances = instances.clone();
+                let play_sessions = play_sessions.clone();
+                let ledgers = ledgers.clone();
+                let audits = audits.clone();
+                let receipts = receipts.clone();
+                let account = account.clone();
+                let campaign = campaign.clone();
+                let character = character.clone();
+                let play_session = play_session.clone();
+                let key = key.clone();
+                let reason_name = reason_name.clone();
+                let fingerprint = fingerprint_text.clone();
+                let ledger_id = ledger_id_for_write.clone();
+                let audit_event_id = audit_event_id_for_write.clone();
+                let receipt_id = receipt_id_for_write.clone();
+                Box::pin(async move {
+                    campaigns
+                        .find_one(active_campaign_filter(&account, &campaign))
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("authorize BDE mutation", error))?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "campaign",
+                            id: campaign.clone(),
+                        })?;
+                    play_sessions
+                        .find_one(doc! {
+                            "_id": &play_session,
+                            "campaign_id": &campaign,
+                            "state": "active",
+                            "$or": [
+                                { "gm_account_id": &account },
+                                {
+                                    "participants": {
+                                        "$elemMatch": {
+                                            "account_id": &account,
+                                            "state": {
+                                                "$in": ["active", "human_active", "ai_active"],
+                                            },
+                                        }
+                                    }
+                                }
+                            ],
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("authorize BDE play session", error)
+                        })?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "active play session",
+                            id: play_session.clone(),
+                        })?;
+                    if let Some(existing) = ledgers
+                        .find_one(doc! {
+                            "campaign_character_instance_id": &character,
+                            "idempotency_key": &key,
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("check BDE replay", error))?
+                    {
+                        if existing.account_id != account
+                            || existing.campaign_id != campaign
+                            || existing.play_session_id.as_deref() != Some(play_session.as_str())
+                            || existing.turn_revision != turn_revision
+                            || existing.amount != amount
+                            || existing.delta != delta
+                            || existing.reason != reason_name
+                            || existing.request_fingerprint != fingerprint
+                        {
+                            return Err(PersistenceError::IdempotencyConflict {
+                                scope_kind: "campaign_character_instance".to_owned(),
+                                scope_id: character,
+                                idempotency_key: key,
+                            });
+                        }
+                        return Ok(existing.balance_after);
+                    }
 
-        Ok(new_balance)
+                    let mut instance_filter = doc! {
+                        "_id": &character,
+                        "campaign_id": &campaign,
+                        "account_id": &account,
+                        "state": "active",
+                    };
+                    let mut increments = doc! {
+                        "runtime.bde.balance": delta,
+                        "revision": 1_i64,
+                    };
+                    match reason_name.as_str() {
+                        "custom_action_spent" => {
+                            instance_filter.insert("runtime.bde.balance", doc! { "$gte": amount });
+                            increments.insert("runtime.bde.lifetime_spent", amount);
+                        }
+                        "administrative_refund" => {
+                            instance_filter.insert(
+                                "runtime.bde.balance",
+                                doc! { "$lte": MAX_ACTION_POINT_BALANCE - amount },
+                            );
+                            instance_filter
+                                .insert("runtime.bde.lifetime_spent", doc! { "$gte": amount });
+                            increments.insert("runtime.bde.lifetime_spent", -amount);
+                        }
+                        _ => {
+                            instance_filter.insert(
+                                "runtime.bde.balance",
+                                doc! { "$lte": MAX_ACTION_POINT_BALANCE - amount },
+                            );
+                            increments.insert("runtime.bde.lifetime_earned", amount);
+                        }
+                    }
+                    let updated = instances
+                        .find_one_and_update(
+                            instance_filter,
+                            doc! {
+                                "$inc": increments,
+                                "$set": { "updated_at": now },
+                            },
+                        )
+                        .return_document(ReturnDocument::After)
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("apply BDE mutation", error))?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "action point balance",
+                            id: character.clone(),
+                        })?;
+                    let balance = required_i32_path(&updated, "runtime.bde.balance", "BDE balance")
+                        .map_err(|detail| PersistenceError::SchemaDrift {
+                            collection: CollectionName::CampaignCharacterInstances
+                                .as_str()
+                                .to_owned(),
+                            detail,
+                        })?;
+
+                    ledgers
+                        .insert_one(BdeLedgerDocument {
+                            id: ledger_id.clone(),
+                            schema_version: SCHEMA_VERSION,
+                            campaign_character_instance_id: character.clone(),
+                            account_id: account.clone(),
+                            campaign_id: campaign.clone(),
+                            play_session_id: Some(play_session.clone()),
+                            turn_revision,
+                            idempotency_key: key.clone(),
+                            request_fingerprint: fingerprint.clone(),
+                            amount,
+                            delta,
+                            reason: reason_name.clone(),
+                            balance_after: balance,
+                            created_at: now,
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert BDE ledger", error))?;
+                    audits
+                        .insert_one(AuditEventDocument {
+                            id: audit_event_id,
+                            schema_version: SCHEMA_VERSION,
+                            category: "bde".to_owned(),
+                            action: reason_name.clone(),
+                            outcome: "committed".to_owned(),
+                            actor_account_id: Some(account.clone()),
+                            scope_kind: "campaign_character_instance".to_owned(),
+                            scope_id: character.clone(),
+                            correlation_id: Some(ledger_id.clone()),
+                            metadata: doc! {
+                                "delta": delta,
+                                "balance_after": balance,
+                                "turn_revision": turn_revision_i64,
+                            },
+                            created_at: now,
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert BDE audit", error))?;
+                    receipts
+                        .insert_one(CommandReceiptDocument {
+                            id: receipt_id,
+                            schema_version: SCHEMA_VERSION,
+                            scope_kind: "campaign_character_instance".to_owned(),
+                            scope_id: character,
+                            campaign_id: Some(campaign),
+                            actor_account_id: account,
+                            command_kind: reason_name,
+                            idempotency_key: key,
+                            request_fingerprint: fingerprint,
+                            state: "committed".to_owned(),
+                            expected_revision: turn_revision,
+                            result_revision,
+                            audit_id: ledger_id,
+                            response_json: format!(r#"{{"balance":{balance}}}"#),
+                            created_at: now,
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("insert BDE receipt", error))?;
+                    Ok(balance)
+                })
+            })
+            .await;
+        match transaction {
+            Ok(balance) => Ok(balance),
+            Err(error) if error.mongo_failure_kind() == Some(MongoFailureKind::DuplicateKey) => {
+                replay_after_duplicate(
+                    store,
+                    account_id,
+                    campaign_id,
+                    runtime_character_id,
+                    play_session_id,
+                    idempotency_key,
+                    &request_fingerprint,
+                )
+                .await
+            }
+            Err(error) => Err(map_persistence(error)),
+        }
     }
 
-    /// Loads the full ledger for a play session.
     pub async fn list_ledger(
-        pool: &PgPool,
+        store: &MongoStore,
+        account_id: &str,
+        campaign_id: &str,
         play_session_id: &str,
     ) -> Result<Vec<ActionPointLedgerEntry>, RepositoryError> {
-        let rows = sqlx::query_as(
-            "SELECT account_id, campaign_id, runtime_character_id, play_session_id,
-                    turn_revision, amount, reason, idempotency_key, created_at::text
-             FROM custom_action_point_ledger
-             WHERE play_session_id = $1
-             ORDER BY created_at ASC",
-        )
-        .bind(play_session_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e))?;
-
-        Ok(rows
-            .into_iter()
-            .map(
-                |row: (
-                    String,
-                    String,
-                    String,
-                    String,
-                    i64,
-                    i32,
-                    String,
-                    String,
-                    String,
-                )| {
-                    ActionPointLedgerEntry {
-                        account_id: row.0,
-                        campaign_id: row.1,
-                        runtime_character_id: row.2,
-                        play_session_id: row.3,
-                        turn_revision: row.4 as u64,
-                        amount: row.5,
-                        reason: ActionPointReason::parse(&row.6)
-                            .unwrap_or(ActionPointReason::Earned),
-                        idempotency_key: row.7,
-                        created_at: row.8,
+        validate_scope(
+            account_id,
+            campaign_id,
+            campaign_id,
+            Some(play_session_id),
+            None,
+        )?;
+        let campaigns = store.collection::<CampaignDocument>(CollectionName::Campaigns);
+        let play_sessions = store.document_collection(CollectionName::PlaySessions);
+        let ledgers = store.collection::<BdeLedgerDocument>(CollectionName::BdeLedger);
+        let account = account_id.to_owned();
+        let campaign = campaign_id.to_owned();
+        let play_session = play_session_id.to_owned();
+        let documents = store
+            .with_transaction(move |client_session| {
+                let campaigns = campaigns.clone();
+                let play_sessions = play_sessions.clone();
+                let ledgers = ledgers.clone();
+                let account = account.clone();
+                let campaign = campaign.clone();
+                let play_session = play_session.clone();
+                Box::pin(async move {
+                    campaigns
+                        .find_one(active_campaign_filter(&account, &campaign))
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("authorize BDE ledger", error))?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "campaign",
+                            id: campaign.clone(),
+                        })?;
+                    play_sessions
+                        .find_one(doc! {
+                            "_id": &play_session,
+                            "campaign_id": &campaign,
+                            "$or": [
+                                { "gm_account_id": &account },
+                                { "participants.account_id": &account },
+                            ],
+                        })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| {
+                            PersistenceError::mongo("authorize BDE ledger play session", error)
+                        })?
+                        .ok_or_else(|| PersistenceError::NotFound {
+                            entity: "play session",
+                            id: play_session.clone(),
+                        })?;
+                    let mut cursor = ledgers
+                        .find(doc! {
+                            "campaign_id": &campaign,
+                            "play_session_id": &play_session,
+                        })
+                        .sort(doc! { "created_at": 1_i64, "_id": 1_i64 })
+                        .session(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("list BDE ledger", error))?;
+                    let mut output = Vec::new();
+                    while cursor
+                        .advance(&mut *client_session)
+                        .await
+                        .map_err(|error| PersistenceError::mongo("read BDE ledger", error))?
+                    {
+                        output.push(cursor.deserialize_current().map_err(|error| {
+                            PersistenceError::mongo("decode BDE ledger", error)
+                        })?);
                     }
-                },
-            )
-            .collect())
+                    Ok(output)
+                })
+            })
+            .await
+            .map_err(map_persistence)?;
+        documents.into_iter().map(domain_ledger_entry).collect()
     }
+}
+
+#[derive(Serialize)]
+struct ActionPointRequest<'a> {
+    account_id: &'a str,
+    campaign_id: &'a str,
+    runtime_character_id: &'a str,
+    play_session_id: &'a str,
+    turn_revision: u64,
+    amount: i32,
+    reason: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BdeLedgerDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    schema_version: u32,
+    campaign_character_instance_id: String,
+    account_id: String,
+    campaign_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    play_session_id: Option<String>,
+    turn_revision: u64,
+    idempotency_key: String,
+    request_fingerprint: String,
+    amount: i32,
+    delta: i32,
+    reason: String,
+    balance_after: i32,
+    created_at: DateTime,
+}
+
+fn fingerprint(value: &ActionPointRequest<'_>) -> Result<Sha256Digest, RepositoryError> {
+    let bytes = serde_json::to_vec(value).map_err(|source| RepositoryError::Serialize {
+        entity: "BDE request fingerprint",
+        source,
+    })?;
+    Ok(Sha256Digest::from_bytes(Sha256::digest(bytes).into()))
+}
+
+async fn replay_after_duplicate(
+    store: &MongoStore,
+    account_id: &str,
+    campaign_id: &str,
+    character_id: &str,
+    play_session_id: &str,
+    idempotency_key: &str,
+    request_fingerprint: &Sha256Digest,
+) -> Result<i32, RepositoryError> {
+    let campaigns = store.collection::<CampaignDocument>(CollectionName::Campaigns);
+    let play_sessions = store.document_collection(CollectionName::PlaySessions);
+    let ledgers = store.collection::<BdeLedgerDocument>(CollectionName::BdeLedger);
+    let account = account_id.to_owned();
+    let campaign = campaign_id.to_owned();
+    let character = character_id.to_owned();
+    let play_session = play_session_id.to_owned();
+    let key = idempotency_key.to_owned();
+    let stored = store
+        .with_transaction(move |client_session| {
+            let campaigns = campaigns.clone();
+            let play_sessions = play_sessions.clone();
+            let ledgers = ledgers.clone();
+            let account = account.clone();
+            let campaign = campaign.clone();
+            let character = character.clone();
+            let play_session = play_session.clone();
+            let key = key.clone();
+            Box::pin(async move {
+                campaigns
+                    .find_one(active_campaign_filter(&account, &campaign))
+                    .session(&mut *client_session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("authorize concurrent BDE replay", error)
+                    })?
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "campaign",
+                        id: campaign.clone(),
+                    })?;
+                play_sessions
+                    .find_one(doc! {
+                        "_id": &play_session,
+                        "campaign_id": &campaign,
+                        "state": "active",
+                        "$or": [
+                            { "gm_account_id": &account },
+                            {
+                                "participants": {
+                                    "$elemMatch": {
+                                        "account_id": &account,
+                                        "state": {
+                                            "$in": ["active", "human_active", "ai_active"],
+                                        },
+                                    }
+                                }
+                            }
+                        ],
+                    })
+                    .session(&mut *client_session)
+                    .await
+                    .map_err(|error| {
+                        PersistenceError::mongo("authorize concurrent BDE play session", error)
+                    })?
+                    .ok_or_else(|| PersistenceError::NotFound {
+                        entity: "active play session",
+                        id: play_session.clone(),
+                    })?;
+                ledgers
+                    .find_one(doc! {
+                        "campaign_character_instance_id": &character,
+                        "account_id": &account,
+                        "campaign_id": &campaign,
+                        "play_session_id": &play_session,
+                        "idempotency_key": &key,
+                    })
+                    .session(&mut *client_session)
+                    .await
+                    .map_err(|error| PersistenceError::mongo("load concurrent BDE replay", error))
+            })
+        })
+        .await
+        .map_err(map_persistence)?
+        .ok_or_else(|| RepositoryError::AlreadyExists {
+            entity: "BDE command",
+            id: idempotency_key.to_owned(),
+        })?;
+    if stored.request_fingerprint != request_fingerprint.as_str() {
+        return Err(RepositoryError::IdempotencyConflict {
+            scope_kind: "campaign_character_instance".to_owned(),
+            scope_id: character_id.to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+        });
+    }
+    Ok(stored.balance_after)
+}
+
+fn domain_ledger_entry(
+    stored: BdeLedgerDocument,
+) -> Result<ActionPointLedgerEntry, RepositoryError> {
+    let reason = ActionPointReason::parse(&stored.reason).ok_or_else(|| {
+        RepositoryError::InvalidDomainState {
+            entity: "BDE ledger",
+            id: stored.id.clone(),
+            reason: "stored BDE reason is unsupported",
+        }
+    })?;
+    Ok(ActionPointLedgerEntry {
+        account_id: stored.account_id,
+        campaign_id: stored.campaign_id,
+        runtime_character_id: stored.campaign_character_instance_id,
+        play_session_id: stored.play_session_id.unwrap_or_default(),
+        turn_revision: stored.turn_revision,
+        amount: stored.amount,
+        reason,
+        idempotency_key: stored.idempotency_key,
+        created_at: date_string(stored.created_at),
+    })
+}
+
+fn optional_i32_path(document: &Document, path: &str) -> Result<Option<i32>, RepositoryError> {
+    let mut current = document;
+    let mut components = path.split('.').peekable();
+    while let Some(component) = components.next() {
+        let value = match current.get(component) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        if components.peek().is_none() {
+            return integer_value(value)
+                .map(|number| {
+                    i32::try_from(number).map_err(|_| RepositoryError::NumericRange {
+                        field: "BDE balance",
+                    })
+                })
+                .transpose();
+        }
+        current = value
+            .as_document()
+            .ok_or_else(|| RepositoryError::InvalidDomainState {
+                entity: "campaign character instance",
+                id: "runtime".to_owned(),
+                reason: "stored BDE runtime has an invalid shape",
+            })?;
+    }
+    Ok(None)
+}
+
+fn required_i32_path(document: &Document, path: &str, field: &str) -> Result<i32, String> {
+    let mut current = document;
+    let mut components = path.split('.').peekable();
+    while let Some(component) = components.next() {
+        let value = current
+            .get(component)
+            .ok_or_else(|| format!("{field} is missing"))?;
+        if components.peek().is_none() {
+            let value = integer_value(value).ok_or_else(|| format!("{field} is not an integer"))?;
+            return i32::try_from(value).map_err(|_| format!("{field} is outside i32"));
+        }
+        current = value
+            .as_document()
+            .ok_or_else(|| format!("{field} parent is not a document"))?;
+    }
+    Err(format!("{field} is missing"))
+}
+
+fn integer_value(value: &Bson) -> Option<i64> {
+    match value {
+        Bson::Int32(value) => Some(i64::from(*value)),
+        Bson::Int64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn validate_scope(
+    account_id: &str,
+    campaign_id: &str,
+    runtime_character_id: &str,
+    play_session_id: Option<&str>,
+    idempotency_key: Option<&str>,
+) -> Result<(), RepositoryError> {
+    validate_account_id(account_id)?;
+    validate_opaque("campaign", campaign_id)?;
+    validate_opaque("campaign character instance", runtime_character_id)?;
+    if play_session_id.is_some_and(|id| !is_valid_opaque_id(id))
+        || idempotency_key.is_some_and(|id| !is_valid_opaque_id(id))
+    {
+        return invalid(
+            runtime_character_id,
+            "play-session and idempotency identifiers must be valid",
+        );
+    }
+    Ok(())
+}
+
+fn invalid<T>(id: &str, reason: &'static str) -> Result<T, RepositoryError> {
+    Err(RepositoryError::InvalidDomainState {
+        entity: "BDE",
+        id: id.to_owned(),
+        reason,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::PgPool;
 
-    fn account_id(n: u8) -> String {
-        format!("account:test-{n:04x}")
-    }
-
-    fn character_id(n: u8) -> String {
-        format!("hero:test-{n:04x}")
-    }
-
-    fn campaign_id() -> &'static str {
-        "campaign:lobby-test-0001"
-    }
-
-    async fn seed(pool: &PgPool, account: &str) {
-        sqlx::query("INSERT INTO accounts (id, normalized_email, display_name, login_enabled) VALUES ($1, $2, $3, false) ON CONFLICT DO NOTHING")
-            .bind(account)
-            .bind(format!("{account}@test.local"))
-            .bind("Test Account")
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    async fn seed_campaign(pool: &PgPool, campaign: &str, owner: &str) {
-        sqlx::query("INSERT INTO campaign_sessions (id, title, owner_key, owner_account_id) VALUES ($1, 'Test Campaign', 'local-owner', $2) ON CONFLICT DO NOTHING")
-            .bind(campaign)
-            .bind(owner)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    async fn seed_hero(pool: &PgPool, hero: &str, owner: &str) {
-        sqlx::query("INSERT INTO hero_characters (id, owner_key, schema_version, campaign_session_id, character_json) VALUES ($1, $2, 1, 'campaign:lobby-test-0001', '{}') ON CONFLICT DO NOTHING")
-            .bind(hero)
-            .bind(owner)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn grant_initial_creates_balance(pool: PgPool) {
-        let acct = account_id(1);
-        let hero = character_id(1);
-        seed(&pool, &acct).await;
-        seed_campaign(&pool, campaign_id(), &acct).await;
-        seed_hero(&pool, &hero, &acct).await;
-
-        let balance = ActionPointRepository::grant_initial(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:1",
-            1,
-            3,
-            "key-1",
-        )
-        .await
-        .unwrap();
-        assert_eq!(balance, 3);
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn spend_reduces_balance(pool: PgPool) {
-        let acct = account_id(2);
-        let hero = character_id(2);
-        seed(&pool, &acct).await;
-        seed_campaign(&pool, campaign_id(), &acct).await;
-        seed_hero(&pool, &hero, &acct).await;
-
-        ActionPointRepository::grant_initial(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:2",
-            1,
-            3,
-            "key-2",
-        )
-        .await
-        .unwrap();
-        let balance = ActionPointRepository::spend(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:2",
-            2,
-            1,
-            "key-3",
-        )
-        .await
-        .unwrap();
-        assert_eq!(balance, 2);
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn insufficient_balance_returns_not_found(pool: PgPool) {
-        let acct = account_id(3);
-        let hero = character_id(3);
-        seed(&pool, &acct).await;
-        seed_campaign(&pool, campaign_id(), &acct).await;
-        seed_hero(&pool, &hero, &acct).await;
-
-        let result = ActionPointRepository::spend(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:3",
-            1,
-            1,
-            "key-4",
-        )
-        .await;
-        assert!(matches!(result, Err(RepositoryError::NotFound { .. })));
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn idempotent_replay_returns_same_balance(pool: PgPool) {
-        let acct = account_id(4);
-        let hero = character_id(4);
-        seed(&pool, &acct).await;
-        seed_campaign(&pool, campaign_id(), &acct).await;
-        seed_hero(&pool, &hero, &acct).await;
-
-        ActionPointRepository::grant_initial(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:4",
-            1,
-            3,
-            "key-5",
-        )
-        .await
-        .unwrap();
-        let b1 = ActionPointRepository::spend(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:4",
-            2,
-            1,
-            "key-6",
-        )
-        .await
-        .unwrap();
-        let b2 = ActionPointRepository::spend(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:4",
-            2,
-            1,
-            "key-6",
-        )
-        .await
-        .unwrap();
-        assert_eq!(b1, b2);
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn refund_restores_balance(pool: PgPool) {
-        let acct = account_id(5);
-        let hero = character_id(5);
-        seed(&pool, &acct).await;
-        seed_campaign(&pool, campaign_id(), &acct).await;
-        seed_hero(&pool, &hero, &acct).await;
-
-        ActionPointRepository::grant_initial(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:5",
-            1,
-            3,
-            "key-7",
-        )
-        .await
-        .unwrap();
-        ActionPointRepository::spend(&pool, &acct, campaign_id(), &hero, "play:5", 2, 1, "key-8")
-            .await
-            .unwrap();
-        let balance = ActionPointRepository::refund(
-            &pool,
-            &acct,
-            campaign_id(),
-            &hero,
-            "play:5",
-            3,
-            1,
-            "key-9",
-        )
-        .await
-        .unwrap();
-        assert_eq!(balance, 3);
-    }
-
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn load_balance_returns_zero_for_nothing(pool: PgPool) {
-        let acct = account_id(6);
-        let hero = character_id(6);
-        seed(&pool, &acct).await;
-        seed_campaign(&pool, campaign_id(), &acct).await;
-        seed_hero(&pool, &hero, &acct).await;
-
-        let balance = ActionPointRepository::load_balance(&pool, &acct, campaign_id(), &hero)
-            .await
-            .unwrap();
-        assert_eq!(balance, 0);
+    #[test]
+    fn canonical_fingerprint_changes_with_amount_or_reason() {
+        let request = ActionPointRequest {
+            account_id: "account:test",
+            campaign_id: "campaign:test",
+            runtime_character_id: "campaign-character:test",
+            play_session_id: "play-session:test",
+            turn_revision: 4,
+            amount: 1,
+            reason: "custom_action_spent",
+        };
+        let first = fingerprint(&request).unwrap();
+        let changed = ActionPointRequest {
+            amount: 2,
+            ..request
+        };
+        assert_ne!(first, fingerprint(&changed).unwrap());
     }
 }

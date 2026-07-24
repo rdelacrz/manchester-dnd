@@ -253,7 +253,7 @@ impl GameApplicationService {
         self.require_local_mode()?;
         if let Some(session) = self
             .repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .map_err(ApplicationError::Repository)?
         {
@@ -311,7 +311,7 @@ impl GameApplicationService {
         )
         .map_err(ApplicationError::Hero)?;
         self.repository
-            .create_hero_draft(&draft, retention_delete_after)
+            .create_hero_draft(LOCAL_HERO_OWNER_KEY, &draft, retention_delete_after)
             .await
             .map_err(ApplicationError::Repository)?;
         Ok(draft)
@@ -324,7 +324,7 @@ impl GameApplicationService {
         self.require_local_mode()?;
         let stored = self
             .repository
-            .load_hero_draft(draft_id)
+            .load_hero_draft(LOCAL_HERO_OWNER_KEY, draft_id)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::HeroNotFound)?;
@@ -348,6 +348,7 @@ impl GameApplicationService {
         if let Some(receipt) = self
             .repository
             .load_hero_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
                 HeroReceiptScope::Draft,
                 &command.draft_id,
                 &command.idempotency_key,
@@ -360,7 +361,7 @@ impl GameApplicationService {
 
         let session = self
             .repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::InvalidStoredState)?;
@@ -376,7 +377,7 @@ impl GameApplicationService {
 
         let stored = self
             .repository
-            .load_hero_draft(&command.draft_id)
+            .load_hero_draft(LOCAL_HERO_OWNER_KEY, &command.draft_id)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::HeroNotFound)?;
@@ -412,6 +413,7 @@ impl GameApplicationService {
         let response_json =
             serde_json::to_string(&outcome).map_err(ApplicationError::Serialization)?;
         let receipt = NewHeroCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             scope: HeroReceiptScope::Draft,
             scope_id: command.draft_id.clone(),
             campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
@@ -449,6 +451,7 @@ impl GameApplicationService {
                 if let Some(stored_receipt) = self
                     .repository
                     .load_hero_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
                         HeroReceiptScope::Draft,
                         &command.draft_id,
                         &command.idempotency_key,
@@ -471,6 +474,7 @@ impl GameApplicationService {
                 let stored_receipt = self
                     .repository
                     .load_hero_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
                         HeroReceiptScope::Draft,
                         &command.draft_id,
                         &command.idempotency_key,
@@ -504,14 +508,14 @@ impl GameApplicationService {
         self.require_local_mode()?;
         let session = self
             .repository
-            .load_campaign_session(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::InvalidStoredState)?;
         self.require_sealed_campaign_pins(&session).await?;
         let stored = self
             .repository
-            .load_hero_character(character_id)
+            .load_hero_character(LOCAL_HERO_OWNER_KEY, character_id)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::HeroNotFound)?;
@@ -534,6 +538,7 @@ impl GameApplicationService {
         if let Some(receipt) = self
             .repository
             .load_hero_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
                 HeroReceiptScope::Character,
                 &command.character_id,
                 &command.idempotency_key,
@@ -546,7 +551,7 @@ impl GameApplicationService {
 
         let stored = self
             .repository
-            .load_hero_character(&command.character_id)
+            .load_hero_character(LOCAL_HERO_OWNER_KEY, &command.character_id)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::HeroNotFound)?;
@@ -580,6 +585,7 @@ impl GameApplicationService {
             reward: outcome.audit.clone(),
         };
         let receipt = NewHeroCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             scope: HeroReceiptScope::Character,
             scope_id: command.character_id.clone(),
             campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
@@ -633,6 +639,7 @@ impl GameApplicationService {
         if let Some(receipt) = self
             .repository
             .load_hero_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
                 HeroReceiptScope::Character,
                 &command.character_id,
                 &command.idempotency_key,
@@ -659,7 +666,7 @@ impl GameApplicationService {
         let current_profile = encounter_profile_from_hero(&stored_hero.value)?;
         let events = self
             .repository
-            .list_session_events(&session.id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, &session.id)
             .await
             .map_err(ApplicationError::Repository)?;
         validate_event_stream(&session, &events)?;
@@ -698,7 +705,11 @@ impl GameApplicationService {
         }
         if self
             .repository
-            .load_encounter_reward_claim(&command.campaign_session_id, SOOT_WIGHT_ENCOUNTER_ID)
+            .load_encounter_reward_claim(
+                LOCAL_HERO_OWNER_KEY,
+                &command.campaign_session_id,
+                SOOT_WIGHT_ENCOUNTER_ID,
+            )
             .await
             .map_err(ApplicationError::Repository)?
             .is_some()
@@ -706,6 +717,7 @@ impl GameApplicationService {
             if let Some(receipt) = self
                 .repository
                 .load_hero_command_receipt(
+                    LOCAL_HERO_OWNER_KEY,
                     HeroReceiptScope::Character,
                     &command.character_id,
                     &command.idempotency_key,
@@ -774,6 +786,7 @@ impl GameApplicationService {
             hero_audit_id: audit_id.clone(),
         };
         let receipt = NewHeroCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             scope: HeroReceiptScope::Character,
             scope_id: command.character_id.clone(),
             campaign_session_id: command.campaign_session_id.clone(),
@@ -809,6 +822,7 @@ impl GameApplicationService {
                 if let Some(stored) = self
                     .repository
                     .load_hero_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
                         HeroReceiptScope::Character,
                         &command.character_id,
                         &command.idempotency_key,
@@ -820,6 +834,7 @@ impl GameApplicationService {
                 } else if self
                     .repository
                     .load_encounter_reward_claim(
+                        LOCAL_HERO_OWNER_KEY,
                         &command.campaign_session_id,
                         SOOT_WIGHT_ENCOUNTER_ID,
                     )
@@ -842,6 +857,7 @@ impl GameApplicationService {
                 let stored = self
                     .repository
                     .load_hero_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
                         HeroReceiptScope::Character,
                         &command.character_id,
                         &command.idempotency_key,
@@ -862,6 +878,7 @@ impl GameApplicationService {
                 let stored = self
                     .repository
                     .load_hero_command_receipt(
+                        LOCAL_HERO_OWNER_KEY,
                         HeroReceiptScope::Character,
                         &command.character_id,
                         &command.idempotency_key,
@@ -896,6 +913,7 @@ impl GameApplicationService {
         if let Some(receipt) = self
             .repository
             .load_hero_command_receipt(
+                LOCAL_HERO_OWNER_KEY,
                 HeroReceiptScope::Character,
                 &command.character_id,
                 &command.idempotency_key,
@@ -907,7 +925,7 @@ impl GameApplicationService {
         }
         let stored = self
             .repository
-            .load_hero_character(&command.character_id)
+            .load_hero_character(LOCAL_HERO_OWNER_KEY, &command.character_id)
             .await
             .map_err(ApplicationError::Repository)?
             .ok_or(ApplicationError::HeroNotFound)?;
@@ -940,6 +958,7 @@ impl GameApplicationService {
             level_up: outcome.audit.clone(),
         };
         let receipt = NewHeroCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             scope: HeroReceiptScope::Character,
             scope_id: command.character_id.clone(),
             campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
@@ -1014,6 +1033,7 @@ where
             if let Some(stored) = service
                 .repository
                 .load_hero_command_receipt(
+                    LOCAL_HERO_OWNER_KEY,
                     HeroReceiptScope::Character,
                     request.character_id,
                     request.idempotency_key,
@@ -1039,6 +1059,7 @@ where
             let stored = service
                 .repository
                 .load_hero_command_receipt(
+                    LOCAL_HERO_OWNER_KEY,
                     HeroReceiptScope::Character,
                     request.character_id,
                     request.idempotency_key,
@@ -1331,9 +1352,12 @@ fn map_hero_error(error: HeroError) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
     };
 
     use manchester_dnd_core::{
@@ -1348,17 +1372,52 @@ mod tests {
             WizardSpellSelection,
         },
     };
-    use sqlx::PgPool;
+    use mongodb::bson::doc;
+    use uuid::Uuid;
 
-    use crate::{config::AccessMode, repository::PostgresRepository, seed::SeedVault};
+    use crate::{
+        config::{AccessMode, MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{CollectionName, MongoStore, SchemaReconciler},
+        repository::{
+            CAMPAIGN_LIFECYCLE_SCHEMA_VERSION, CampaignLifecycleCommand, MongoRepository,
+            StartPlaySessionCommand,
+        },
+        seed::SeedVault,
+    };
 
     use super::*;
 
-    fn test_service(
-        pool: PgPool,
+    async fn test_service(
         clock: Arc<AtomicU64>,
-    ) -> (GameApplicationService, PostgresRepository) {
-        let repository = PostgresRepository::from_pool(pool);
+    ) -> Option<(GameApplicationService, MongoRepository, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping MongoDB hero test: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(
+            uri.starts_with("mongodb://root:") && uri.contains("127.0.0.1"),
+            "MONGODB_TEST_URI must be the explicit local root test URI"
+        );
+        let database = format!("mdnd_hero_test_{}", Uuid::new_v4().simple());
+        let store = MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 4,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 2,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("MongoDB schema must apply");
+        let repository = MongoRepository::new(store);
         let observed_clock = clock;
         let service = GameApplicationService::with_sources(
             AccessMode::LocalSingleUser,
@@ -1367,7 +1426,20 @@ mod tests {
             |_| 12,
             move || observed_clock.load(Ordering::SeqCst),
         );
-        (service, repository)
+        Some((service, repository, database))
+    }
+
+    async fn drop_database(repository: &MongoRepository, database: &str) {
+        assert!(
+            database.starts_with("mdnd_hero_test_") && database != "manchester_dnd",
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
+            .await
+            .expect("test database must drop");
     }
 
     fn creation_command(
@@ -1485,6 +1557,25 @@ mod tests {
             .unwrap()
     }
 
+    async fn isolate_initial_core_character(service: &GameApplicationService) {
+        let updated = service
+            .repository
+            .store()
+            .document_collection(CollectionName::CampaignCharacterInstances)
+            .update_one(
+                doc! {
+                    "campaign_id": LOCAL_CAMPAIGN_SESSION_ID,
+                    "account_id": LOCAL_HERO_OWNER_KEY,
+                    "runtime_kind": "core_character",
+                    "state": "active",
+                },
+                doc! { "$set": { "account_id": "local-core-owner" } },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.modified_count, 1);
+    }
+
     async fn ready_to_commit(service: &GameApplicationService) -> HeroCreationDraft {
         let mut draft = service.start_local_hero_creation().await.unwrap();
         draft = apply_and_reload(
@@ -1554,13 +1645,15 @@ mod tests {
             },
         )
         .await;
-        apply_and_reload(
+        let draft = apply_and_reload(
             service,
             &draft,
             "creation-review",
             HeroCreationIntent::Review,
         )
-        .await
+        .await;
+        isolate_initial_core_character(service).await;
+        draft
     }
 
     async fn create_fighter(
@@ -1658,6 +1751,7 @@ mod tests {
         .await;
         draft =
             apply_and_reload(service, &draft, "wizard-review", HeroCreationIntent::Review).await;
+        isolate_initial_core_character(service).await;
         service
             .finalize_hero_creation(creation_command(
                 &draft,
@@ -1704,12 +1798,38 @@ mod tests {
         service: &GameApplicationService,
         key: &str,
     ) -> manchester_dnd_core::LocalCampaignViewDto {
+        ensure_active_play_session(service).await;
         let view = service.load_local_campaign().await.unwrap();
         service
             .attempt_exploration_check(exploration_command(&view, key))
             .await
             .unwrap();
         service.load_local_campaign().await.unwrap()
+    }
+
+    async fn ensure_active_play_session(service: &GameApplicationService) {
+        let summary = service
+            .list_local_campaigns()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|campaign| campaign.campaign_session_id == LOCAL_CAMPAIGN_SESSION_ID)
+            .unwrap();
+        if summary.open_play_session_id.is_some() {
+            return;
+        }
+        service
+            .start_local_play_session(StartPlaySessionCommand {
+                lifecycle: CampaignLifecycleCommand {
+                    schema_version: CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
+                    expected_lifecycle_revision: summary.lifecycle_revision,
+                    idempotency_key: "hero-test-play-start".to_owned(),
+                },
+                play_session_id: "play-session:hero-tests".to_owned(),
+            })
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1834,26 +1954,32 @@ mod tests {
         panic!("encounter did not complete within the bounded test script")
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn pre_creation_campaign_cannot_start_the_legacy_encounter_fallback(pool: PgPool) {
+    #[tokio::test]
+    async fn pre_creation_campaign_cannot_start_encounter_before_pins_are_sealed() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, _) = test_service(pool, clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let view = service.load_local_campaign().await.unwrap();
         assert!(view.content_pins.sealed().is_none());
         assert!(matches!(
             service
-                .attempt_exploration_check(exploration_command(&view, "legacy-exploration"))
+                .attempt_exploration_check(exploration_command(&view, "unsealed-exploration"))
                 .await,
             Err(ApplicationError::CampaignPinsUnsealed)
         ));
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn fighter_sheet_drives_perception_and_the_ready_encounter(pool: PgPool) {
+    #[tokio::test]
+    async fn fighter_sheet_drives_perception_and_the_ready_encounter() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, _) = test_service(pool, clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let (_, _, created) = create_fighter(&service, "encounter-fighter").await;
         let hero = created.character.unwrap();
+        ensure_active_play_session(&service).await;
         let initial = service.load_local_campaign().await.unwrap();
         assert_eq!(initial.character_name, "Mara Vale");
         let check = service
@@ -1912,14 +2038,15 @@ mod tests {
         );
         assert_eq!(live_resources.second_wind.as_ref().unwrap().current, 1);
         assert!(live_resources.action_surge.is_none());
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn wizard_live_spells_persist_slots_rolls_and_replay_without_client_mechanics(
-        pool: PgPool,
-    ) {
+    #[tokio::test]
+    async fn wizard_live_spells_persist_slots_rolls_and_replay_without_client_mechanics() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, _) = test_service(pool, clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let hero = create_wizard(&service, "encounter-wizard").await;
         let ready = ready_encounter(&service, "wizard-perception").await;
         let state = &ready.encounter.as_ref().unwrap().state;
@@ -2077,12 +2204,15 @@ mod tests {
             reloaded_encounter.latest_outcome.unwrap().resolution,
             committed.resolution
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn started_encounter_keeps_its_original_hero_snapshot_after_advancement(pool: PgPool) {
+    #[tokio::test]
+    async fn started_encounter_keeps_its_original_hero_snapshot_after_advancement() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, _) = test_service(pool, clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let (_, _, created) = create_fighter(&service, "snapshot-fighter").await;
         let hero = created.character.unwrap();
         let ready = ready_encounter(&service, "snapshot-perception").await;
@@ -2120,12 +2250,15 @@ mod tests {
 
         let reloaded = service.load_local_campaign().await.unwrap();
         assert_eq!(reloaded.encounter.unwrap().state, started.resolution.state,);
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn encounter_reward_is_victory_bound_trusted_idempotent_and_reloadable(pool: PgPool) {
+    #[tokio::test]
+    async fn encounter_reward_is_victory_bound_trusted_idempotent_and_reloadable() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, repository) = test_service(pool, clock.clone());
+        let Some((service, repository, database)) = test_service(clock.clone()).await else {
+            return;
+        };
         let (_, _, created) = create_fighter(&service, "reward-fighter").await;
         let hero = created.character.unwrap();
         let initial = service.load_local_campaign().await.unwrap();
@@ -2223,7 +2356,11 @@ mod tests {
             Err(ApplicationError::EncounterRewardAlreadyClaimed)
         ));
         let stored_claim = repository
-            .load_encounter_reward_claim(LOCAL_CAMPAIGN_SESSION_ID, SOOT_WIGHT_ENCOUNTER_ID)
+            .load_encounter_reward_claim(
+                LOCAL_HERO_OWNER_KEY,
+                LOCAL_CAMPAIGN_SESSION_ID,
+                SOOT_WIGHT_ENCOUNTER_ID,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2232,7 +2369,7 @@ mod tests {
 
         let resumed = GameApplicationService::with_sources(
             AccessMode::LocalSingleUser,
-            repository,
+            repository.clone(),
             Arc::new(SeedVault::from_key([9; 32])),
             |_| 1,
             move || clock.load(Ordering::SeqCst),
@@ -2241,12 +2378,15 @@ mod tests {
             resumed.claim_local_encounter_reward(command).await.unwrap(),
             claimed
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn concurrent_reward_claims_across_service_instances_commit_once(pool: PgPool) {
+    #[tokio::test]
+    async fn concurrent_reward_claims_across_service_instances_commit_once() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (setup, repository) = test_service(pool, clock.clone());
+        let Some((setup, repository, database)) = test_service(clock.clone()).await else {
+            return;
+        };
         let (_, _, created) = create_fighter(&setup, "concurrent-reward-fighter").await;
         let hero = created.character.unwrap();
         let ready = ready_encounter(&setup, "concurrent-reward-perception").await;
@@ -2270,7 +2410,7 @@ mod tests {
             expected_character_revision: encounter_hero_revision,
             idempotency_key: "concurrent-victory-claim".to_owned(),
         };
-        let service = |repository: PostgresRepository, clock: Arc<AtomicU64>| {
+        let service = |repository: MongoRepository, clock: Arc<AtomicU64>| {
             GameApplicationService::with_sources(
                 AccessMode::LocalSingleUser,
                 repository,
@@ -2289,7 +2429,11 @@ mod tests {
         assert_eq!(left.unwrap(), right.unwrap());
         assert_eq!(
             repository
-                .list_hero_audits(LOCAL_CAMPAIGN_SESSION_ID, &hero.character_id)
+                .list_hero_audits(
+                    LOCAL_HERO_OWNER_KEY,
+                    LOCAL_CAMPAIGN_SESSION_ID,
+                    &hero.character_id
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -2297,7 +2441,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .load_hero_character(&hero.character_id)
+                .load_hero_character(LOCAL_HERO_OWNER_KEY, &hero.character_id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2305,12 +2449,16 @@ mod tests {
                 .experience_points,
             300
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn draft_resumes_and_enforces_exact_expiry_and_retention_boundaries(pool: PgPool) {
+    #[tokio::test]
+    async fn draft_resumes_and_enforces_exact_expiry_and_retention_boundaries() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, repository) = test_service(pool, clock.clone());
+        let Some((service, repository, database)) = test_service(clock.clone()).await else {
+            return;
+        };
+        service.load_local_campaign().await.unwrap();
         assert_eq!(
             service.load_local_hero_workspace().await.unwrap(),
             LocalHeroWorkspaceDto {
@@ -2384,7 +2532,7 @@ mod tests {
         );
         assert!(
             repository
-                .load_hero_draft(&draft.draft_id)
+                .load_hero_draft(LOCAL_HERO_OWNER_KEY, &draft.draft_id)
                 .await
                 .unwrap()
                 .is_some()
@@ -2397,17 +2545,20 @@ mod tests {
         resumed_service.start_local_hero_creation().await.unwrap();
         assert!(
             repository
-                .load_hero_draft(&draft.draft_id)
+                .load_hero_draft(LOCAL_HERO_OWNER_KEY, &draft.draft_id)
                 .await
                 .unwrap()
                 .is_none()
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn duplicate_stale_forged_and_rewritten_creation_transitions_fail_closed(pool: PgPool) {
+    #[tokio::test]
+    async fn duplicate_stale_forged_and_rewritten_creation_transitions_fail_closed() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, repository) = test_service(pool.clone(), clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let draft = service.start_local_hero_creation().await.unwrap();
         let command = creation_command(
             &draft,
@@ -2427,14 +2578,18 @@ mod tests {
         assert_eq!(replay, first);
         assert_eq!(
             repository
-                .list_hero_audits(LOCAL_CAMPAIGN_SESSION_ID, &draft.draft_id)
+                .list_hero_audits(
+                    LOCAL_HERO_OWNER_KEY,
+                    LOCAL_CAMPAIGN_SESSION_ID,
+                    &draft.draft_id
+                )
                 .await
                 .unwrap()
                 .len(),
             1
         );
         let sealed = repository
-            .load_campaign_pins(LOCAL_CAMPAIGN_SESSION_ID)
+            .load_campaign_pins(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
             .await
             .unwrap()
             .unwrap();
@@ -2496,7 +2651,7 @@ mod tests {
         // Bypass the application to prove the repository cannot rewrite a prior
         // selection while presenting a valid next-step audit.
         let stored = repository
-            .load_hero_draft(&draft.draft_id)
+            .load_hero_draft(LOCAL_HERO_OWNER_KEY, &draft.draft_id)
             .await
             .unwrap()
             .unwrap();
@@ -2526,6 +2681,7 @@ mod tests {
             character_created: None,
         };
         let receipt = NewHeroCommandReceipt {
+            actor_account_id: LOCAL_HERO_OWNER_KEY.to_owned(),
             scope: HeroReceiptScope::Draft,
             scope_id: draft.draft_id.clone(),
             campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
@@ -2555,7 +2711,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .load_hero_draft(&draft.draft_id)
+                .load_hero_draft(LOCAL_HERO_OWNER_KEY, &draft.draft_id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2579,7 +2735,7 @@ mod tests {
         ));
         assert_eq!(
             repository
-                .load_campaign_pins(LOCAL_CAMPAIGN_SESSION_ID)
+                .load_campaign_pins(LOCAL_HERO_OWNER_KEY, LOCAL_CAMPAIGN_SESSION_ID)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2590,21 +2746,37 @@ mod tests {
             ThemeId::RainboundBorough
         );
 
-        sqlx::query("DELETE FROM campaign_content_pins WHERE campaign_session_id = $1")
-            .bind(LOCAL_CAMPAIGN_SESSION_ID)
-            .execute(&pool)
+        let removed_pins = repository
+            .store()
+            .document_collection(CollectionName::Campaigns)
+            .update_one(
+                doc! {
+                    "_id": LOCAL_CAMPAIGN_SESSION_ID,
+                    "owner_account_id": LOCAL_HERO_OWNER_KEY,
+                },
+                doc! {
+                    "$unset": {
+                        "rules_snapshot.campaign_pins": "",
+                        "rules_snapshot.sealed_at": "",
+                    }
+                },
+            )
             .await
             .unwrap();
+        assert_eq!(removed_pins.modified_count, 1);
         assert!(matches!(
             service.load_local_campaign().await,
             Err(ApplicationError::CampaignPinsQuarantined)
         ));
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn finalize_is_atomic_replayable_and_bridges_the_slice_one_view(pool: PgPool) {
+    #[tokio::test]
+    async fn finalize_is_atomic_replayable_and_bridges_the_slice_one_view() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, repository) = test_service(pool, clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let (draft, command, outcome) = create_fighter(&service, "created-hero-1").await;
         assert_eq!(draft.step, CreationStep::Committed);
         assert_eq!(draft.revision, 9);
@@ -2624,19 +2796,23 @@ mod tests {
         assert_eq!(workspace.character, Some(hero.clone()));
 
         let stored_draft = repository
-            .load_hero_draft(&draft.draft_id)
+            .load_hero_draft(LOCAL_HERO_OWNER_KEY, &draft.draft_id)
             .await
             .unwrap()
             .unwrap();
         let stored_hero = repository
-            .load_hero_character("created-hero-1")
+            .load_hero_character(LOCAL_HERO_OWNER_KEY, "created-hero-1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored_draft.revision, 10);
         assert_eq!(stored_hero.revision, 1);
         let audits = repository
-            .list_hero_audits(LOCAL_CAMPAIGN_SESSION_ID, &draft.draft_id)
+            .list_hero_audits(
+                LOCAL_HERO_OWNER_KEY,
+                LOCAL_CAMPAIGN_SESSION_ID,
+                &draft.draft_id,
+            )
             .await
             .unwrap();
         assert_eq!(audits.len(), 9);
@@ -2662,12 +2838,15 @@ mod tests {
             pin_evidence.pins.prompt.template_id,
             manchester_dnd_core::CAMPAIGN_PROMPT_TEMPLATE_ID
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn trusted_reward_and_level_up_replay_and_reload_exactly(pool: PgPool) {
+    #[tokio::test]
+    async fn trusted_reward_and_level_up_replay_and_reload_exactly() {
         let clock = Arc::new(AtomicU64::new(1_000_000));
-        let (service, repository) = test_service(pool, clock);
+        let Some((service, repository, database)) = test_service(clock).await else {
+            return;
+        };
         let (_, _, created) = create_fighter(&service, "advancing-hero").await;
         let hero = created.character.unwrap();
         let reward_command = RewardAwardCommand {
@@ -2743,12 +2922,17 @@ mod tests {
             level_up.character
         );
         let audits = repository
-            .list_hero_audits(LOCAL_CAMPAIGN_SESSION_ID, "advancing-hero")
+            .list_hero_audits(
+                LOCAL_HERO_OWNER_KEY,
+                LOCAL_CAMPAIGN_SESSION_ID,
+                "advancing-hero",
+            )
             .await
             .unwrap();
         assert_eq!(audits.len(), 2);
         assert_eq!(audits[0].subject_revision, 1);
         assert_eq!(audits[1].subject_revision, 2);
+        drop_database(&repository, &database).await;
     }
 
     #[test]

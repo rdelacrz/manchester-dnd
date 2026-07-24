@@ -24,13 +24,14 @@ use tokio::{fs, io::AsyncWriteExt, time};
 use uuid::Uuid;
 
 use crate::{
+    application::LOCAL_HERO_OWNER_KEY,
     config::{GenerationGovernanceConfig, LlmBackend, LlmProfile},
     error::{GenerationError, RepositoryError},
     generation::{ImageGenerationRequest, ImageGenerator},
     repository::{
-        AuthorizedSceneImageVariant, NewGenerationGovernanceReceipt, NewSceneImageArtifact,
-        NewSceneImageQuarantine, PostgresRepository, SceneImageArtifact, SceneImageRequestCounts,
-        SceneImageVariant,
+        AuthorizedSceneImageVariant, MongoRepository, NewGenerationGovernanceReceipt,
+        NewSceneImageArtifact, NewSceneImageQuarantine, SceneImageArtifact,
+        SceneImageRequestCounts, SceneImageVariant,
         jobs::{
             ClaimedGenerationJob, EnqueueGenerationJobOutcome, GenerationAttemptFailure,
             GenerationAttemptFinishOutcome, GenerationClaim, GenerationFailureCode, GenerationJob,
@@ -333,7 +334,7 @@ struct CircuitState {
 
 #[derive(Clone)]
 pub struct SceneImageService {
-    repository: PostgresRepository,
+    repository: MongoRepository,
     provider: Arc<dyn ImageGenerator>,
     profile: LlmProfile,
     governance: GenerationGovernanceConfig,
@@ -345,7 +346,7 @@ pub struct SceneImageService {
 
 impl SceneImageService {
     pub fn new(
-        repository: PostgresRepository,
+        repository: MongoRepository,
         provider: Arc<dyn ImageGenerator>,
         profile: &LlmProfile,
         governance: &GenerationGovernanceConfig,
@@ -384,7 +385,7 @@ impl SceneImageService {
         }
         let campaign = self
             .repository
-            .load_campaign_session(campaign_session_id)
+            .load_campaign_session(LOCAL_HERO_OWNER_KEY, campaign_session_id)
             .await?
             .ok_or(SceneImageError::WrongCampaign)?;
         if campaign.revision != expected_revision {
@@ -816,7 +817,7 @@ impl SceneImageService {
     ) -> Result<(String, u64, ImageBrief), SceneImageError> {
         let events = self
             .repository
-            .list_session_events(campaign_session_id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, campaign_session_id)
             .await?;
         let event = events
             .into_iter()
@@ -852,7 +853,7 @@ impl SceneImageService {
             .ok_or(SceneImageError::NoCommittedScene)?;
         let events = self
             .repository
-            .list_session_events(&claimed.job.campaign_session_id)
+            .list_session_events(LOCAL_HERO_OWNER_KEY, &claimed.job.campaign_session_id)
             .await?;
         let event = events
             .into_iter()
@@ -1384,10 +1385,14 @@ mod tests {
         encounter::{EncounterCommand, EncounterIntent},
         hero::ThemeId,
     };
-    use sqlx::PgPool;
+    use mongodb::bson::{DateTime, doc};
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::{
+        config::{MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{CollectionName, MongoStore, SchemaReconciler},
+    };
 
     fn fake_profile() -> LlmProfile {
         LlmProfile {
@@ -1418,8 +1423,44 @@ mod tests {
         }
     }
 
+    async fn isolated_mongo_repository() -> Option<(MongoRepository, MongoStore, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping scene-image MongoDB test: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(
+            uri.starts_with("mongodb://root:") && uri.contains("127.0.0.1"),
+            "MONGODB_TEST_URI must be the explicit local root test URI"
+        );
+        let database = format!("mdnd_scene_images_test_{}", Uuid::new_v4().simple());
+        let store = MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 8,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 4,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .unwrap();
+        SchemaReconciler::new(store.clone()).apply().await.unwrap();
+        Some((MongoRepository::new(store.clone()), store, database))
+    }
+
+    async fn drop_test_database(store: &MongoStore, database: &str) {
+        assert!(
+            database.starts_with("mdnd_scene_images_test_") && database != "manchester_dnd",
+            "cleanup safeguard"
+        );
+        store.database().drop().await.unwrap();
+    }
+
     async fn committed_scene(
-        repository: PostgresRepository,
+        repository: MongoRepository,
     ) -> manchester_dnd_core::LocalCampaignViewDto {
         use crate::{
             application::{
@@ -1440,6 +1481,7 @@ mod tests {
         application.load_local_campaign().await.unwrap();
         repository
             .seal_campaign_pins_for_test(
+                LOCAL_HERO_OWNER_KEY,
                 LOCAL_CAMPAIGN_SESSION_ID,
                 &SealedCampaignPins {
                     seal_reason: CampaignPinSealReason::SelectedTheme,
@@ -1447,6 +1489,25 @@ mod tests {
                     legacy_source: None,
                 },
             )
+            .await
+            .unwrap();
+        let summary = application
+            .list_local_campaigns()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|campaign| campaign.campaign_session_id == LOCAL_CAMPAIGN_SESSION_ID)
+            .expect("local campaign fixture should exist");
+        application
+            .start_local_play_session(crate::repository::StartPlaySessionCommand {
+                lifecycle: crate::repository::CampaignLifecycleCommand {
+                    schema_version: crate::repository::CAMPAIGN_LIFECYCLE_SCHEMA_VERSION,
+                    campaign_session_id: LOCAL_CAMPAIGN_SESSION_ID.to_owned(),
+                    expected_lifecycle_revision: summary.lifecycle_revision,
+                    idempotency_key: "scene-image-play-start".to_owned(),
+                },
+                play_session_id: "play-session:scene-image".to_owned(),
+            })
             .await
             .unwrap();
         let initial = application.load_local_campaign().await.unwrap();
@@ -1551,9 +1612,11 @@ mod tests {
         assert_eq!(IMAGE_REQUESTS_PER_TURN, 2);
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn durable_image_request_replays_publishes_authorizes_and_replaces_once(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool.clone());
+    #[tokio::test]
+    async fn durable_image_request_replays_publishes_authorizes_and_replaces_once() {
+        let Some((repository, store, database)) = isolated_mongo_repository().await else {
+            return;
+        };
         let campaign = committed_scene(repository.clone()).await;
         let storage = tempfile::tempdir().unwrap();
         let profile = fake_profile();
@@ -1627,7 +1690,7 @@ mod tests {
                 .is_none()
         );
 
-        // A fresh service reconstructs the brief and status from PostgreSQL and
+        // A fresh service reconstructs the brief and status from MongoDB and
         // the protected root; no in-memory request body is required after restart.
         let restarted = SceneImageService::new(
             repository.clone(),
@@ -1693,41 +1756,56 @@ mod tests {
             Err(SceneImageError::ReplacementLimit)
         ));
 
-        sqlx::query(
-            "UPDATE generation_jobs
-             SET retention_delete_after = CURRENT_TIMESTAMP - INTERVAL '1 second'
-             WHERE id = $1",
-        )
-        .bind(&first.job.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let expired = DateTime::from_millis(1);
+        store
+            .document_collection(CollectionName::GenerationJobs)
+            .update_one(
+                doc! { "_id": &first.job.id },
+                doc! { "$set": { "purge_at": expired } },
+            )
+            .await
+            .unwrap();
+        store
+            .document_collection(CollectionName::GeneratedAssets)
+            .update_one(
+                doc! { "_id": &artifact.artifact_id },
+                doc! { "$set": { "purge_at": expired } },
+            )
+            .await
+            .unwrap();
+        let first_attempt = repository
+            .list_generation_attempts(&campaign.campaign_session_id, &first.job.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("completed image job should retain its attempt");
         let quarantine_key = restarted
             .storage
-            .quarantine("image-attempt:expired", b"invalid-provider-bytes")
+            .quarantine(&first_attempt.id, b"invalid-provider-bytes")
             .await
             .unwrap();
         repository
             .record_scene_image_quarantine(&NewSceneImageQuarantine {
                 id: "image-quarantine:expired".to_owned(),
-                job_id: "image-job:expired".to_owned(),
-                attempt_id: "image-attempt:expired".to_owned(),
+                job_id: first.job.id.clone(),
+                attempt_id: first_attempt.id,
                 campaign_session_id: campaign.campaign_session_id.clone(),
                 byte_digest: Some(digest(b"invalid-provider-bytes")),
-                byte_length: Some(22),
+                byte_length: Some(u64::try_from(b"invalid-provider-bytes".len()).unwrap()),
                 storage_key: Some(quarantine_key),
                 reason_code: "format_invalid",
             })
             .await
             .unwrap();
-        sqlx::query(
-            "UPDATE scene_image_quarantines
-             SET delete_after = CURRENT_TIMESTAMP - INTERVAL '1 second'
-             WHERE id = 'image-quarantine:expired'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        store
+            .document_collection(CollectionName::QuarantinedAssets)
+            .update_one(
+                doc! { "_id": "image-quarantine:expired" },
+                doc! { "$set": { "purge_at": expired } },
+            )
+            .await
+            .unwrap();
         let cleaned = restarted.cleanup_expired(10).await.unwrap();
         assert_eq!(cleaned.records_deleted, 2);
         assert_eq!(cleaned.files_deleted, 4);
@@ -1753,6 +1831,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        drop_test_database(&store, &database).await;
     }
 
     #[derive(Debug)]
@@ -1774,13 +1853,15 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn provider_urls_are_never_fetched_and_are_quarantined(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool.clone());
-        let campaign = committed_scene(repository).await;
+    #[tokio::test]
+    async fn provider_urls_are_never_fetched_and_are_quarantined() {
+        let Some((repository, store, database)) = isolated_mongo_repository().await else {
+            return;
+        };
+        let campaign = committed_scene(repository.clone()).await;
         let storage = tempfile::tempdir().unwrap();
         let service = SceneImageService::new(
-            PostgresRepository::from_pool(pool.clone()),
+            repository,
             Arc::new(UrlOnlyImageGenerator),
             &fake_profile(),
             &image_governance(),
@@ -1810,14 +1891,13 @@ mod tests {
             Some(GenerationFailureCode::InvalidArtifact)
         );
         assert!(status.artifact.is_none());
-        let quarantine_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scene_image_quarantines
-             WHERE reason_code = 'provider_url_rejected'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let quarantine_count = store
+            .document_collection(CollectionName::QuarantinedAssets)
+            .count_documents(doc! { "reason_code": "provider_url_rejected" })
+            .await
+            .unwrap();
         assert_eq!(quarantine_count, 1);
+        drop_test_database(&store, &database).await;
     }
 
     #[derive(Debug)]
@@ -1840,9 +1920,11 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn cancellation_wins_a_running_provider_race_without_an_artifact(pool: PgPool) {
-        let repository = PostgresRepository::from_pool(pool);
+    #[tokio::test]
+    async fn cancellation_wins_a_running_provider_race_without_an_artifact() {
+        let Some((repository, store, database)) = isolated_mongo_repository().await else {
+            return;
+        };
         let campaign = committed_scene(repository.clone()).await;
         let storage = tempfile::tempdir().unwrap();
         let started = Arc::new(Notify::new());
@@ -1889,5 +1971,6 @@ mod tests {
             Some(GenerationJobState::Cancelled)
         );
         assert!(status.artifact.is_none());
+        drop_test_database(&store, &database).await;
     }
 }

@@ -704,42 +704,97 @@ fn fingerprint(value: &impl Serialize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use manchester_dnd_core::hero::{
         AncestryId, BackgroundId, BackgroundSelection, ClassSelection, EquipmentId,
         EquipmentSelection, FightingStyleId, HeroChoices, HeroConceptId, HeroPins,
         HeroPresentation, SkillId, StandardArrayAssignment, ThemeId,
     };
-    use sqlx::PgPool;
+    use mongodb::bson::{DateTime, doc};
     use uuid::Uuid;
 
     use super::*;
-    use crate::{config::AccessMode, repository::PostgresRepository, seed::SeedVault};
+    use crate::{
+        config::{AccessMode, MongoConfig, MongoSchemaPolicy, SecretString},
+        persistence::{CollectionName, MongoStore, SchemaReconciler},
+        repository::MongoRepository,
+        seed::SeedVault,
+    };
 
     const ACCOUNT_A: &str = "account:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const ACCOUNT_B: &str = "account:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-    fn service(pool: PgPool) -> GameApplicationService {
-        let repository = PostgresRepository::from_pool(pool);
-        GameApplicationService::with_sources(
+    async fn service() -> Option<(GameApplicationService, MongoRepository, String)> {
+        let Ok(uri) = std::env::var("MONGODB_TEST_URI") else {
+            eprintln!("skipping MongoDB player-character test: MONGODB_TEST_URI is not set");
+            return None;
+        };
+        assert!(
+            uri.starts_with("mongodb://root:") && uri.contains("127.0.0.1"),
+            "MONGODB_TEST_URI must be the explicit local root test URI"
+        );
+        let database = format!("mdnd_player_characters_test_{}", Uuid::new_v4().simple());
+        let store = MongoStore::connect(&MongoConfig {
+            uri: SecretString::new(uri),
+            database: database.clone(),
+            max_pool_size: 4,
+            min_pool_size: 0,
+            connect_timeout: Duration::from_secs(5),
+            server_selection_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(15),
+            transaction_timeout: Duration::from_secs(10),
+            transaction_max_retries: 2,
+            schema_policy: MongoSchemaPolicy::ApplyAndVerify,
+        })
+        .await
+        .expect("test MongoDB must connect");
+        SchemaReconciler::new(store.clone())
+            .apply()
+            .await
+            .expect("MongoDB schema must apply");
+        let repository = MongoRepository::new(store);
+        let application = GameApplicationService::with_sources(
             AccessMode::LocalSingleUser,
-            repository,
+            repository.clone(),
             Arc::new(SeedVault::from_key([9; 32])),
             |_| 12,
             || 1_700_000_000_000,
-        )
+        );
+        Some((application, repository, database))
     }
 
-    async fn insert_account(pool: &PgPool, account_id: &str) {
-        sqlx::query(
-            "INSERT INTO accounts (id, display_name, login_enabled) VALUES ($1, $2, FALSE)",
-        )
-        .bind(account_id)
-        .bind("Test Account")
-        .execute(pool)
-        .await
-        .expect("test account should insert");
+    async fn insert_account(repository: &MongoRepository, account_id: &str) {
+        repository
+            .store()
+            .document_collection(CollectionName::Accounts)
+            .insert_one(doc! {
+                "_id": account_id,
+                "schema_version": 1_i64,
+                "revision": 1_i64,
+                "role": "user",
+                "username_normalized": format!("user-{}", Uuid::new_v4()),
+                "email_lookup_hmac": format!("hmac-sha256:{}", Uuid::new_v4().simple()),
+                "password_phc": "$argon2id$test",
+                "login_enabled": false,
+                "created_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            })
+            .await
+            .expect("test account should insert");
+    }
+
+    async fn drop_database(repository: &MongoRepository, database: &str) {
+        assert!(
+            database.starts_with("mdnd_player_characters_test_") && database != "manchester_dnd",
+            "cleanup safeguard"
+        );
+        repository
+            .store()
+            .database()
+            .drop()
+            .await
+            .expect("test database must drop");
     }
 
     fn test_choices(theme: ThemeId) -> HeroChoices {
@@ -798,11 +853,13 @@ mod tests {
 
     // ── Two-account isolation tests ──
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn account_a_cannot_list_load_or_mutate_account_b_character(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        insert_account(&pool, ACCOUNT_B).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn account_a_cannot_list_load_or_mutate_account_b_character() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
+        insert_account(&repository, ACCOUNT_B).await;
 
         // Account A creates a character.
         let character = new_character(ACCOUNT_A, "Account A Hero");
@@ -860,13 +917,16 @@ mod tests {
             .await
             .expect("account A load should succeed");
         assert_eq!(loaded.display_name, "Account A Hero");
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn account_a_cannot_list_load_or_mutate_account_b_draft(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        insert_account(&pool, ACCOUNT_B).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn account_a_cannot_list_load_or_mutate_account_b_draft() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
+        insert_account(&repository, ACCOUNT_B).await;
 
         // Account A creates a draft.
         let draft = service
@@ -926,14 +986,17 @@ mod tests {
             .await
             .expect("account A draft load should succeed");
         assert_eq!(loaded.id, draft.id);
+        drop_database(&repository, &database).await;
     }
 
     // ── Audit + idempotency receipt tests ──
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn update_display_name_writes_audit_and_receipt(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn update_display_name_writes_audit_and_receipt() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Original Name");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -952,34 +1015,46 @@ mod tests {
             .expect("update should succeed");
         assert_eq!(new_revision, 1);
 
-        // An audit row was written.
-        let audit_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM player_character_audits
-             WHERE character_id = $1 AND action = 'update_display_name'",
-        )
-        .bind(&created.character_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        // An audit event was written.
+        let audit_count = repository
+            .store()
+            .document_collection(CollectionName::AuditEvents)
+            .count_documents(doc! {
+                "category": "player_character",
+                "action": "update_display_name",
+                "scope_kind": "player_character",
+                "scope_id": &created.character_id,
+                "actor_account_id": ACCOUNT_A,
+                "outcome": "committed",
+            })
+            .await
+            .unwrap();
         assert_eq!(audit_count, 1, "one update audit row should exist");
 
-        // A receipt was written.
-        let receipt_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM player_character_command_receipts
-             WHERE character_id = $1 AND idempotency_key = $2",
-        )
-        .bind(&created.character_id)
-        .bind("key-update-1")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        // A committed command receipt was written.
+        let receipt_count = repository
+            .store()
+            .document_collection(CollectionName::CommandReceipts)
+            .count_documents(doc! {
+                "scope_kind": "player_character",
+                "scope_id": &created.character_id,
+                "actor_account_id": ACCOUNT_A,
+                "command_kind": UPDATE_DISPLAY_NAME_COMMAND_KIND,
+                "idempotency_key": "key-update-1",
+                "state": "committed",
+            })
+            .await
+            .unwrap();
         assert_eq!(receipt_count, 1, "one receipt row should exist");
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn duplicate_update_with_same_key_returns_stored_revision(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn duplicate_update_with_same_key_returns_stored_revision() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Original Name");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1011,26 +1086,33 @@ mod tests {
             .expect("duplicate update should return stored revision");
         assert_eq!(second, 1, "duplicate should return stored revision");
 
-        // Only one receipt exists.
-        let receipt_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM player_character_command_receipts
-             WHERE character_id = $1 AND idempotency_key = $2",
-        )
-        .bind(&created.character_id)
-        .bind("key-dup-update")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        // Only one committed receipt exists.
+        let receipt_count = repository
+            .store()
+            .document_collection(CollectionName::CommandReceipts)
+            .count_documents(doc! {
+                "scope_kind": "player_character",
+                "scope_id": &created.character_id,
+                "actor_account_id": ACCOUNT_A,
+                "command_kind": UPDATE_DISPLAY_NAME_COMMAND_KIND,
+                "idempotency_key": "key-dup-update",
+                "state": "committed",
+            })
+            .await
+            .unwrap();
         assert_eq!(
             receipt_count, 1,
             "duplicate must not write a second receipt"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn duplicate_update_with_different_body_is_idempotency_conflict(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn duplicate_update_with_different_body_is_idempotency_conflict() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Original Name");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1062,12 +1144,15 @@ mod tests {
             matches!(result, Err(ApplicationError::IdempotencyConflict)),
             "same key with different body must be IdempotencyConflict, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn stale_revision_fails_with_revision_conflict(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn stale_revision_fails_with_revision_conflict() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Original Name");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1100,12 +1185,15 @@ mod tests {
             matches!(result, Err(ApplicationError::RevisionConflict { .. })),
             "stale revision must fail with RevisionConflict, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn delete_writes_audit_and_returns_true(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn delete_writes_audit_and_returns_true() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Doomed Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1118,26 +1206,32 @@ mod tests {
             .expect("delete should succeed");
         assert!(deleted, "owned character delete should return true");
 
-        // A delete audit row was written (before the row was deleted).
-        // After deletion, the FK sets character_id to NULL, so we query by
-        // owner_account_id and action instead.
-        let audit_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM player_character_audits
-             WHERE owner_account_id = $1 AND action = 'delete'",
-        )
-        .bind(ACCOUNT_A)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        // The delete audit event survives deletion of the character document.
+        let audit_count = repository
+            .store()
+            .document_collection(CollectionName::AuditEvents)
+            .count_documents(doc! {
+                "category": "player_character",
+                "action": "delete",
+                "scope_kind": "player_character",
+                "scope_id": &created.character_id,
+                "actor_account_id": ACCOUNT_A,
+                "outcome": "committed",
+            })
+            .await
+            .unwrap();
         assert_eq!(audit_count, 1, "one delete audit row should exist");
+        drop_database(&repository, &database).await;
     }
 
     // ── Campaign-bound runtime stub tests ──
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn list_authorized_campaign_instances_returns_empty_for_owned_character(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn list_authorized_campaign_instances_returns_empty_for_owned_character() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Library Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1152,15 +1246,16 @@ mod tests {
             instances.is_empty(),
             "stub should return empty vec for owned character"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn list_authorized_campaign_instances_returns_not_found_for_foreign_character(
-        pool: PgPool,
-    ) {
-        insert_account(&pool, ACCOUNT_A).await;
-        insert_account(&pool, ACCOUNT_B).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn list_authorized_campaign_instances_returns_not_found_for_foreign_character() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
+        insert_account(&repository, ACCOUNT_B).await;
         let character = new_character(ACCOUNT_A, "Account A Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1185,14 +1280,15 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "missing character must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn load_authorized_campaign_character_stats_returns_not_found_for_owned_character(
-        pool: PgPool,
-    ) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn load_authorized_campaign_character_stats_returns_not_found_for_owned_character() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Library Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1211,15 +1307,16 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "stub should return character_not_found for owned character, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn load_authorized_campaign_character_stats_returns_not_found_for_foreign_character(
-        pool: PgPool,
-    ) {
-        insert_account(&pool, ACCOUNT_A).await;
-        insert_account(&pool, ACCOUNT_B).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn load_authorized_campaign_character_stats_returns_not_found_for_foreign_character() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
+        insert_account(&repository, ACCOUNT_B).await;
         let character = new_character(ACCOUNT_A, "Account A Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1238,15 +1335,18 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "foreign character must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn mismatched_character_campaign_pair_returns_not_found(pool: PgPool) {
+    #[tokio::test]
+    async fn mismatched_character_campaign_pair_returns_not_found() {
         // Even if a campaign existed, a mismatched character/campaign pair must
         // return not_found. Until campaign memberships exist, this is the stub
         // behavior for any pairing.
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Library Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1265,14 +1365,17 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "mismatched campaign must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn foreign_campaign_returns_not_found(pool: PgPool) {
+    #[tokio::test]
+    async fn foreign_campaign_returns_not_found() {
         // A campaign owned by another account must not leak stats. Until
         // campaign memberships exist, this is the stub behavior.
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Library Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1291,14 +1394,17 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "foreign campaign must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn removed_membership_returns_not_found(pool: PgPool) {
+    #[tokio::test]
+    async fn removed_membership_returns_not_found() {
         // A removed membership must return not_found. Until campaign
         // memberships exist, this is the stub behavior for any campaign.
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let character = new_character(ACCOUNT_A, "Library Hero");
         let created = service
             .create_player_character(ACCOUNT_A, character)
@@ -1317,14 +1423,17 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "removed/absent membership must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
     // ── Draft lifecycle tests ──
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn draft_create_load_save_commit_delete_round_trip(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn draft_create_load_save_commit_delete_round_trip() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
 
         let draft = service
             .create_player_character_draft(ACCOUNT_A)
@@ -1400,12 +1509,15 @@ mod tests {
             .await
             .expect("draft delete should succeed");
         assert!(deleted);
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn missing_character_load_returns_not_found(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn missing_character_load_returns_not_found() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let missing_id = format!("character:{}", Uuid::new_v4());
         let result = service
             .load_owned_player_character(ACCOUNT_A, &missing_id)
@@ -1414,12 +1526,15 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "missing character must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn missing_draft_load_returns_not_found(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn missing_draft_load_returns_not_found() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         let missing_id = format!("draft:{}", Uuid::new_v4());
         let result = service
             .load_player_character_draft(ACCOUNT_A, &missing_id)
@@ -1428,12 +1543,15 @@ mod tests {
             matches!(result, Err(ApplicationError::WrongCharacter)),
             "missing draft must return character_not_found, got {result:?}"
         );
+        drop_database(&repository, &database).await;
     }
 
-    #[sqlx::test(migrator = "crate::repository::MIGRATOR")]
-    async fn create_player_character_rejects_owner_mismatch(pool: PgPool) {
-        insert_account(&pool, ACCOUNT_A).await;
-        let service = service(pool.clone());
+    #[tokio::test]
+    async fn create_player_character_rejects_owner_mismatch() {
+        let Some((service, repository, database)) = service().await else {
+            return;
+        };
+        insert_account(&repository, ACCOUNT_A).await;
         // The character's owner_account_id does not match the server-derived
         // account_id. This must fail before any write.
         let mut character = new_character(ACCOUNT_A, "Mismatched Hero");
@@ -1443,5 +1561,6 @@ mod tests {
             result.is_err(),
             "owner mismatch must be rejected before any write"
         );
+        drop_database(&repository, &database).await;
     }
 }

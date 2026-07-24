@@ -73,7 +73,7 @@
       "class": "pack_manifest",
       "source_ids": ["manchester-arcana-private"],
       "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
-      "sha256": "6817f0b38eaa3c369e4d76c8c19e29302e65d4ae2b801f54e77a2632137d15f6",
+      "sha256": "9b23fe647e8a986fbe38bd0f9d4d2292ecf4879ff105338626c984621be0f728",
       "transformations": ["Original machine-readable pack inventory, compatibility contract, dependency pins, capability declaration, and content digests."],
       "campaign_pack_references": ["pack:dev.manchester-arcana.core-mvp@1.0.0"],
       "public_distribution_allowed": false
@@ -113,7 +113,7 @@
       "class": "pack_manifest",
       "source_ids": ["manchester-arcana-private"],
       "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
-      "sha256": "d423b07d4cba57fd5763074ce199ee91780280bc5f0ba082fd6d0be27250d199",
+      "sha256": "bf8c25ff1fa835950b7f89f967ffdd3e99c3213a01a1a2fe2c310f11dc080e84",
       "transformations": ["Original machine-readable theme-pack inventory, compatibility contract, capability declaration, and content digests."],
       "campaign_pack_references": ["pack:dev.manchester-arcana.emberline-archive@1.0.0"],
       "public_distribution_allowed": false
@@ -153,7 +153,7 @@
       "class": "pack_manifest",
       "source_ids": ["manchester-arcana-private"],
       "license_ids": ["LicenseRef-Manchester-Arcana-Private-Evaluation"],
-      "sha256": "147e333c2a9fd88a28e68bc1977907c92627851c07b1d6fb13878590bd36af37",
+      "sha256": "9110c962251b710d917240eebc673dc20465cba215ebf0ae8093ead744efe0aa",
       "transformations": ["Original machine-readable theme-pack inventory, compatibility contract, capability declaration, and content digests."],
       "campaign_pack_references": ["pack:dev.manchester-arcana.rainbound-borough@1.0.0"],
       "public_distribution_allowed": false

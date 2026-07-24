@@ -1,19 +1,115 @@
+# Development-only defaults below are intentionally public and must be
+# overridden by secret-managed values in Coolify or any hosted deployment.
 services:
-  postgres:
-    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+  mongodb:
+    image: mongo:8.0.26-noble@sha256:ffa440e8d62533e24a67696ae1bbb46e610ebb3167d65abd122b496ae06d28e6
     environment:
-      POSTGRES_DB: manchester_arcana
-      POSTGRES_USER: manchester_arcana
-      POSTGRES_PASSWORD: manchester_arcana
+      MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-manchester_dnd}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-dev-root-password}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-manchester_app}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-dev-app-password}
+      MONGO_SCHEMA_USERNAME: ${MONGO_SCHEMA_USERNAME:-manchester_schema}
+      MONGO_SCHEMA_PASSWORD: ${MONGO_SCHEMA_PASSWORD:-dev-schema-password}
+      MONGO_REPLICA_SET_KEY: ${MONGO_REPLICA_SET_KEY:-bWFuY2hlc3Rlci1kbmQtZGV2ZWxvcG1lbnQtcmVwbGljYS1zZXQta2V5}
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        install -d -m 700 -o mongodb -g mongodb /run/mongodb
+        install -m 400 -o mongodb -g mongodb /dev/null /run/mongodb/keyfile
+        printf '%s' "$$MONGO_REPLICA_SET_KEY" > /run/mongodb/keyfile
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - --
+    command:
+      - mongod
+      - --replSet
+      - rs0
+      - --keyFile
+      - /run/mongodb/keyfile
+      - --bind_ip_all
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:27017:27017"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U manchester_arcana -d manchester_arcana"]
-      interval: 2s
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --host 127.0.0.1
+          --username "$$MONGO_INITDB_ROOT_USERNAME"
+          --password "$$MONGO_INITDB_ROOT_PASSWORD"
+          --authenticationDatabase admin
+          --eval 'const h=db.hello(); quit(h.ok===1 && h.isWritablePrimary===true ? 0 : 1)'
+      interval: 5s
       timeout: 5s
-      retries: 15
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - mongo-data:/data/db
+
+  mongo-init:
+    image: mongo:8.0.26-noble@sha256:ffa440e8d62533e24a67696ae1bbb46e610ebb3167d65abd122b496ae06d28e6
+    depends_on:
+      mongodb:
+        condition: service_started
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-manchester_dnd}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-dev-root-password}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-manchester_app}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-dev-app-password}
+      MONGO_SCHEMA_USERNAME: ${MONGO_SCHEMA_USERNAME:-manchester_schema}
+      MONGO_SCHEMA_PASSWORD: ${MONGO_SCHEMA_PASSWORD:-dev-schema-password}
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        uri="mongodb://$${MONGO_INITDB_ROOT_USERNAME}:$${MONGO_INITDB_ROOT_PASSWORD}@mongodb:27017/admin?directConnection=true"
+        for attempt in $$(seq 1 120); do
+          if mongosh "$$uri" --quiet --eval 'quit(db.runCommand({ping: 1}).ok === 1 ? 0 : 1)'; then
+            exec mongosh "$$uri" --quiet /opt/manchester/mongo-rs-init.js
+          fi
+          sleep 1
+        done
+        echo "MongoDB did not become reachable for replica-set bootstrap" >&2
+        exit 1
+    restart: "no"
+    volumes:
+      - ./scripts/mongo-rs-init.js:/opt/manchester/mongo-rs-init.js:ro
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.39.0
+    environment:
+      DRAGONFLY_PASSWORD: ${DRAGONFLY_PASSWORD:-dev-cache-password}
+      DRAGONFLY_MAX_MEMORY: ${DRAGONFLY_MAX_MEMORY:-512mb}
+      DRAGONFLY_THREADS: ${DRAGONFLY_THREADS:-1}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        exec dragonfly \
+          --requirepass="$$DRAGONFLY_PASSWORD" \
+          --maxmemory="$$DRAGONFLY_MAX_MEMORY" \
+          --proactor_threads="$$DRAGONFLY_THREADS" \
+          --cache_mode=true \
+          --dir=/data \
+          --snapshot_cron='*/5 * * * *'
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-cli --no-auth-warning -a "$$DRAGONFLY_PASSWORD" ping
+          2>/dev/null | grep -q PONG
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    volumes:
+      - dragonfly-data:/data
 
 volumes:
-  postgres-data:
+  mongo-data:
+  dragonfly-data:

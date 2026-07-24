@@ -28,8 +28,8 @@ fi
 cargo deny --locked check
 cargo deny --manifest-path tests/fuzz/Cargo.toml --config tests/fuzz/deny.toml --locked check
 
-# cargo-audit scans every Cargo.lock record, including inactive optional SQLx
-# drivers. Keep its sole vulnerability exception conditional on proof that no
+# cargo-audit scans every Cargo.lock record, including inactive optional
+# dependencies. Keep its sole vulnerability exception conditional on proof that no
 # workspace feature/target has a path to the affected rsa crate.
 rsa_path=$(cargo tree --locked --all-features --target all -i rsa --prefix none 2>/dev/null)
 if [[ -n "$rsa_path" ]]; then

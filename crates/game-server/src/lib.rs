@@ -7,6 +7,7 @@
 
 pub mod application;
 pub mod auth;
+pub mod cache;
 pub mod campaign_pins;
 pub mod config;
 pub mod content;
@@ -17,6 +18,7 @@ pub mod generation;
 pub mod generation_ledger;
 pub mod gm;
 pub mod inspiration;
+pub mod persistence;
 pub mod recovery_vault;
 pub mod repository;
 pub mod scene_images;
@@ -34,19 +36,22 @@ pub use application::{
 pub use auth::{
     AccountPrincipal, AccountSummary, AuthService, AuthenticatedSession, AuthenticationActionKind,
     AuthenticationAudit, AuthenticationInputError, AuthenticationSecret,
-    AuthenticationThrottleBucket, IssuedSession, LOCAL_ACCOUNT_ID, PasswordPhc,
+    AuthenticationThrottleBucket, IssuedSession, IssuedSignupAccessToken, IssuedSignupSession,
+    LOCAL_ACCOUNT_ID, PasswordPhc,
 };
+pub use cache::{CacheHealth, CacheService, SessionCacheEntry};
 pub use campaign_pins::{CampaignPinRuntime, CampaignPinValidationError};
 pub use config::{
-    AccessMode, AppConfig, AuthenticationConfig, ContentPackConfig, DatabaseRuntimeConfig,
-    GenerationConfigFingerprints, LlmBackend, LlmProfile, SecretString,
+    AccessMode, AppConfig, AuthenticationConfig, ContentPackConfig, DragonflyConfig,
+    GenerationConfigFingerprints, LlmBackend, LlmProfile, MongoConfig, MongoSchemaPolicy,
+    PersistenceConfig, SecretString,
 };
 pub use content::{ActiveContentCatalog, ActiveContentPack, ContentCatalogError};
 pub use context::ServerContext;
 pub use error::{
-    ApplicationError, AuthenticationError, BootstrapError, ConfigError, EventPromptError,
-    GameMasterError, GenerationError, PrivateInspirationError, RepositoryError,
-    TransientPostgresFailure, classify_postgres_sqlstate,
+    ApplicationError, AuthenticationError, BootstrapError, CacheError, ConfigError,
+    EventPromptError, GameMasterError, GenerationError, MongoFailureKind, PersistenceError,
+    PrivateInspirationError, RepositoryError, classify_mongo_error,
 };
 pub use generation_ledger::{
     GenerationLedgerError, InlineGenerationAttempt, InlineGenerationLedger, InlineGenerationRequest,
@@ -54,6 +59,11 @@ pub use generation_ledger::{
 pub use inspiration::{
     CampaignInspirationSettingsProjection, CampaignInspirationStatus,
     DisableCampaignInspirationCommand, OpaqueInspirationId, SetCampaignInspirationPauseCommand,
+};
+pub use persistence::{
+    CollectionName, EmailCiphertext, EmailCrypto, EmailCryptoError, MongoAccountRepository,
+    MongoStore, SCHEMA_BUNDLE_VERSION, SchemaApplyReport, SchemaReconciler,
+    SchemaVerificationReport, collection_catalog, schema_bundle_digest,
 };
 pub use repository::{
     CAMPAIGN_EXPORT_SCHEMA_VERSION, CAMPAIGN_HISTORY_DEFAULT_LIMIT, CAMPAIGN_HISTORY_MAX_LIMIT,
@@ -65,18 +75,14 @@ pub use repository::{
     EndPlaySessionCommand, GeneratePrivateRecapCommand, GenerationBudgetDenialCount,
     GenerationQueueStateCount, OperationalOutcomeCount, PRIVATE_RECAP_SCHEMA_VERSION,
     PreparedCampaignDeletion, RecoveryArtifactFileEntry, RecoveryCampaignManifestEntry,
-    RecoveryManifestError, RecoveryMigrationManifestEntry, RestoreCampaignExportCommand,
+    RecoveryManifestError, RecoverySchemaManifestEntry, RestoreCampaignExportCommand,
     StartPlaySessionCommand, VerifiedRecoveryFile,
 };
 pub use repository::{
     CampaignMembershipRow, CreateCampaignWithOwnerOutcome, MembershipCampaignSummary,
     MembershipRole, MembershipState,
 };
-#[cfg(feature = "legacy-import")]
-pub use repository::{
-    LEGACY_IMPORT_SCHEMA_VERSION, LegacyImportCounts, LegacyImportError, LegacyImportReport,
-    import_legacy_sqlite,
-};
+
 pub use scene_images::{
     DeliveredSceneImage, ImageBrief, SceneImageCleanupOutcome, SceneImageEnqueueOutcome,
     SceneImageError, SceneImageService, SceneImageServiceStatus, SceneImageWorkerOutcome,

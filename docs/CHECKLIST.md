@@ -4,14 +4,14 @@ Status snapshot: 2026-07-15. This is the implementation backlog for the current 
 
 The planning documents remain authoritative for design intent. When an item here conflicts with a resolved architecture or policy decision, update both this checklist and the relevant planning document rather than silently changing behavior.
 
-This snapshot was reconciled against the current source, migrations, content manifests, CI configuration, automated test inventory, and the acceptance records in [`docs/evidence`](evidence/). A checked item is implemented for the private loopback MVP profile; it does not imply that the separate hosted/public-release gates have passed.
+This snapshot was reconciled against the current source, MongoDB schema catalog, content manifests, CI configuration, automated test inventory, and the acceptance records in [`docs/evidence`](evidence/). A checked item is implemented for the private loopback MVP profile; it does not imply that every hosted/public-release gate has passed.
 
 ## How to use this checklist
 
 - Every unchecked item is remaining work. Existing foundations are summarized below and are not repeated as tasks to rebuild.
 - Complete work in slice order unless a later task is an isolated prerequisite or risk proof.
 - A checkbox is complete only when the path is wired through the real Leptos UI, server/application boundary, deterministic engine, persistence where applicable, and proportionate tests. A type or adapter that no playable path uses is not complete.
-- Link implementation, automated tests, manual evidence, migrations, and decision records from the checkbox or its pull request as work lands.
+- Link implementation, automated tests, manual evidence, schema-bundle changes, and decision records from the checkbox or its pull request as work lands.
 - Never expose a character option, action, spell, creature, content pack, or AI capability until every mechanic it can reach is implemented and capability-tested.
 - Preserve the architectural invariants in the [planning index](planning/README.md): Rust owns mechanics, campaigns pin semantic versions, generated content has deterministic fallbacks, private inspiration is revocable, and every distributable asset has provenance.
 
@@ -35,7 +35,7 @@ The following is already present and should be extended rather than recreated:
 - Leptos 0.8/Axum SSR workspace with `app`, `frontend`, `server`, `game-core`, and `game-server` boundaries.
 - `dotenvy`-loaded, secret-redacting `TEXT_LLM_*` and `IMAGE_LLM_*` profiles; disabled and OpenAI-compatible provider adapters; `thiserror` error families.
 - Explicit loopback-only local mode, Host/Origin checks, anti-framing headers, hosted-mode fail-closed behavior, and liveness/readiness endpoints.
-- PostgreSQL campaign, character, turn-audit, generated-asset, and command-receipt storage with JSONB, row locks, revision checks, and transactional writes.
+- MongoDB campaign, character, turn-audit, generated-asset, account/session, and command-receipt storage with managed validators/indexes, tenant filters, revision checks, and transactional writes; DragonflyDB is optional cache/pub-sub only.
 - Slice 1A's fixed level-1 hero and persisted `inspect-viaduct-runes` Wisdom check, including server-owned mechanics/dice/time, visible outcome, atomic audit, idempotent replay, conflict handling, and exact reload.
 - Domain foundations for ability scores, d20 checks, attack rolls, action resources, XP thresholds/awards, strict AI GM proposals, provider-independent generation, and Markdown event loading/weighted eligibility.
 
@@ -318,21 +318,21 @@ References: [roadmap Slice 4](planning/08-delivery-roadmap.md), [persistence/ver
 - [ ] Implement explicit archive, restore-from-archive, delete, and derived-artifact cleanup behavior according to Q13/Q14.
 - [x] Treat a future public/shareable recap as a separately authorized, redacted post-MVP projection.
 
-### PostgreSQL reliability and recovery
+### MongoDB reliability and recovery
 
-- [x] Before retiring any legacy embedded-database file, back it up and run the versioned one-time export/import from the persistence plan; verify IDs, counts, revisions, ordered audits, links, canonical state hashes, representative load/resume flows, and rollback evidence.
-- [x] Configure and document least-privilege application/migration/backup roles, TLS policy, pool/connection budgets, transaction isolation, deterministic row-lock order, statement timeouts, and bounded retry classification.
-- [x] Classify only proven transient PostgreSQL SQLSTATEs; retries must preserve the original expected revision/idempotency key and never reroll or duplicate an audit.
+- [x] Use a greenfield MongoDB replica-set schema with no embedded-database/import compatibility path; verify all managed collections, validators, indexes, tenant filters, and current pins.
+- [x] Configure and document separate least-privilege application/schema-admin credentials, authentication/TLS policy, pool budgets, short transaction boundaries, and bounded retry classification.
+- [x] Retry only explicit transient MongoDB transaction labels; retries preserve expected revision/idempotency key and never reroll, repeat providers, or duplicate an audit.
 - [x] Keep generated files outside public/static roots and keep database credentials in the deployment secret system with tested rotation.
-- [x] Implement encrypted logical backup/restore plus physical/base-backup and WAL/PITR procedures when required by the recovery objective, with retention/expiry and operator runbooks.
-- [x] Monitor migration version, database/index/WAL size, pool waits, write latency, long transactions, row-lock waits, deadlocks, autovacuum/analyze health, replication lag where applicable, disk capacity, backup age, and last restore-test result.
-- [ ] Test concurrent writers, abrupt termination around commits, corrupt/unknown JSON, constraint failures, deadlock/serialization handling, disk full, migration failure, expired job lease reclamation, and backup restoration.
+- [x] Implement encrypted MongoDB archive/restore plus provider snapshot/PITR procedures when required by the recovery objective, with retention/expiry and operator runbooks; Dragonfly is excluded.
+- [x] Monitor schema-bundle version, database/index size, pool waits, write latency, transaction abort/retry rate, replication health/lag, disk capacity, backup age, and last restore-test result.
+- [ ] Test concurrent writers, abrupt termination around commits, invalid BSON/schema validation, transaction conflicts, disk full, schema-apply failure, expired job lease reclamation, and backup restoration.
 - [x] Prove restored sampled campaigns have matching canonical state hashes, complete histories, valid pins, and readable protected assets.
 
 ### Slice 4 acceptance evidence
 
 - [ ] Complete cross-user authorization/ID-enumeration tests at every route and server function.
-- [x] Load every supported old fixture after migrations with unchanged mechanical meaning.
+- [x] Load every supported current MongoDB fixture with unchanged mechanical meaning after schema reconciliation.
 - [x] Export and restore a representative advanced campaign, verifying revisions, rolls, provenance, and exclusions.
 - [x] Run and document archive/delete/backup-expiry behavior against the Q13 retention policy.
 - [ ] Demonstrate durable text job recovery/idempotency across process restart without blocking deterministic play.
@@ -456,7 +456,7 @@ References: [roadmap Slice 7](planning/08-delivery-roadmap.md), [quality/observa
 - [x] Produce a threat model covering browser/server trust, local versus hosted mode, authentication/object authorization, CSRF/XSS, prompt injection, private sources, provider egress, jobs, artifacts, exports, and backups.
 - [x] Finish CSP, anti-framing, output sanitization, request/upload/response limits, rate limits, secure-cookie/TLS settings, and cache controls for private responses/artifacts.
 - [x] Verify WASM, source maps, hydration payloads, service-worker/browser caches if any, errors, and diagnostics contain no secrets, hidden state, or private source material.
-- [x] Review PostgreSQL roles/TLS/credentials, generated-file permissions, backup encryption, key separation/rotation, outbound host allowlists, redirect behavior, provider credentials, and least-privilege worker access.
+- [x] Review MongoDB/Dragonfly roles, TLS, credentials, generated-file permissions, backup encryption, key separation/rotation, outbound host allowlists, redirect behavior, provider credentials, and least-privilege worker access.
 - [x] Run penetration-focused authorization, ID enumeration, CSRF, XSS, SSRF, upload/parser, prompt-injection, and artifact access tests.
 - [ ] Run incident, provider outage, backup restore, credential rotation, pack/source quarantine, consent revocation, and user deletion drills.
 - [x] Publish a security/privacy reporting contact and private-test data-handling/retention documentation.
@@ -494,7 +494,7 @@ Reference: [post-MVP roadmap](planning/08-delivery-roadmap.md) and [later ambiti
 - [ ] Implement SRD 5.2.1 as a separate rules adapter, compendium, tests, campaign-creation option, and explicit conversion report/workflow.
 - [ ] Add more provider adapters, local models, routing, and optional hot configuration only with equivalent safety/evaluation/fingerprint behavior.
 - [ ] Design a separately authorized and redacted public-share projection; never expose the private canonical campaign/export directly.
-- [ ] Evolve PostgreSQL topology and add object storage only after measured pool, lock, database-size, artifact, or multi-instance limits, with repository contract tests, verified export/import, and rehearsed rollback.
+- [ ] Evolve MongoDB topology and add object storage only after measured transaction, replication, database-size, artifact, or multi-instance limits, with repository contract tests, verified export/restore, and rehearsed rollback; keep Dragonfly disposable.
 
 ## Completion rule for every implementation checkbox
 

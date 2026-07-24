@@ -1,8 +1,8 @@
-//! Runs embedded PostgreSQL migrations with the deployment migration role.
+//! Applies the managed MongoDB schema bundle.
 
-use std::{env, process::ExitCode};
+use std::process::ExitCode;
 
-use manchester_dnd_server::{DatabaseRuntimeConfig, repository::PostgresRepository};
+use manchester_dnd_server::{AppConfig, MongoStore, SchemaReconciler};
 use serde_json::json;
 
 #[tokio::main]
@@ -17,17 +17,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    let database_url = env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL is required for database migration".to_owned())?;
-    if database_url.trim().is_empty() {
-        return Err("DATABASE_URL is required for database migration".to_owned());
-    }
-    let runtime = DatabaseRuntimeConfig {
-        max_connections: 1,
-        migrate_on_start: true,
-        ..DatabaseRuntimeConfig::default()
-    };
-    PostgresRepository::connect(&database_url, runtime)
+    let config = AppConfig::load().map_err(|error| error.to_string())?;
+    let store = MongoStore::connect(&config.persistence.mongodb)
+        .await
+        .map_err(|error| error.to_string())?;
+    SchemaReconciler::new(store)
+        .apply()
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())

@@ -13,6 +13,7 @@ use manchester_dnd_core::{
     rules_matrix::{D20TestOutcome, NpcAttitude, ProgressStatus},
 };
 
+use crate::app::FirstRunStep;
 use crate::components::campaign::{
     CampaignLoadResponse, EncounterCommandResponse, ExplorationCheckResponse,
     LOCAL_EXPLORATION_ACTION_ID, LOCAL_SOCIAL_ACTION_ID, PublicGameError,
@@ -230,12 +231,12 @@ pub fn Home() -> impl IntoView {
                     <p>"Create or resume the campaign, forge a hero, speak with the lockkeeper, inspect the runes, finish the encounter, then review and export the saved history."</p>
                 </div>
                 <ol>
-                    <li><a href="#campaigns">"Campaign"</a></li>
-                    <li><a href="#themes">"Hero"</a></li>
-                    <li><a href="#social">"Social scene"</a></li>
-                    <li><a href="#play">"Exploration"</a></li>
-                    <li><a href="#encounter">"Encounter"</a></li>
-                    <li><a href="#campaigns">"History and export"</a></li>
+                    <FirstRunStep><a href="#campaigns">"Campaign"</a></FirstRunStep>
+                    <FirstRunStep><a href="#themes">"Hero"</a></FirstRunStep>
+                    <FirstRunStep><a href="#social">"Social scene"</a></FirstRunStep>
+                    <FirstRunStep><a href="#play">"Exploration"</a></FirstRunStep>
+                    <FirstRunStep><a href="#encounter">"Encounter"</a></FirstRunStep>
+                    <FirstRunStep><a href="#campaigns">"History and export"</a></FirstRunStep>
                 </ol>
                 <p><a class="text-link" href="/guide">"Read safe setup, supported features, and known limits →"</a></p>
             </section>

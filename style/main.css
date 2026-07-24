@@ -241,6 +241,28 @@ button {
     color: var(--ink);
 }
 
+.public-auth-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    margin-right: 1.25rem;
+}
+
+.public-auth-actions a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-underline-offset: 0.3rem;
+}
+
+.public-auth-actions a:hover,
+.public-auth-actions a:focus-visible {
+    color: var(--ink);
+}
+
 .brand {
     display: inline-flex;
     align-items: center;
@@ -366,6 +388,25 @@ h2 {
 .primary-button:hover {
     background: var(--gold-bright);
     transform: translateY(-2px);
+}
+
+.secondary-button {
+    padding: 0.55rem 0.85rem;
+    border: 1px solid var(--line);
+    color: var(--ink);
+    text-decoration: none;
+}
+
+.secondary-button:hover,
+.secondary-button:focus-visible {
+    border-color: var(--gold);
+    background: rgba(215, 173, 98, 0.08);
+}
+
+.hero-actions .text-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 48px;
 }
 
 .text-link {
@@ -1314,13 +1355,15 @@ footer a {
 .first-run-panel li {
     counter-increment: first-run;
     min-width: 0;
+    padding: 0.65rem;
     border: 1px solid var(--line);
     background: rgba(9, 11, 12, 0.48);
+    overflow-wrap: anywhere;
 }
 
 .first-run-panel li::before {
     display: block;
-    padding: 0.65rem 0.65rem 0;
+    padding-bottom: 0.35rem;
     color: var(--gold-bright);
     content: counter(first-run, decimal-leading-zero);
     font-size: 0.72rem;
@@ -1330,7 +1373,6 @@ footer a {
 .first-run-panel li a {
     display: flex;
     align-items: center;
-    padding: 0.35rem 0.65rem 0.65rem;
     color: var(--ink);
     overflow-wrap: anywhere;
 }

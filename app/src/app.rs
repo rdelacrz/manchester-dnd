@@ -77,6 +77,13 @@ pub fn App() -> impl IntoView {
 /// Introduction-only home page. Contains marketing/introductory content only.
 /// No campaign, character, encounter, or side navigation UI.
 #[component]
+pub(crate) fn FirstRunStep(children: Children) -> impl IntoView {
+    view! {
+        <li>{children()}</li>
+    }
+}
+
+#[component]
 fn HomePage() -> impl IntoView {
     view! {
         <Title text="Manchester Arcana · AI-guided tabletop adventure"/>
@@ -114,12 +121,12 @@ fn HomePage() -> impl IntoView {
                     <p>"Create an account, then build a hero, gather your party, explore the world, resolve encounters, and export your saved history."</p>
                 </div>
                 <ol>
-                    <li><a href="/signup">"Create your account"</a></li>
-                    <li><a href="/play">"Build a hero"</a></li>
-                    <li>"Gather your party"</li>
-                    <li>"Explore the world"</li>
-                    <li>"Resolve encounters"</li>
-                    <li>"Review and export history"</li>
+                    <FirstRunStep><a href="/signup">"Create your account"</a></FirstRunStep>
+                    <FirstRunStep><a href="/play">"Build a hero"</a></FirstRunStep>
+                    <FirstRunStep>"Gather your party"</FirstRunStep>
+                    <FirstRunStep>"Explore the world"</FirstRunStep>
+                    <FirstRunStep>"Resolve encounters"</FirstRunStep>
+                    <FirstRunStep>"Review and export history"</FirstRunStep>
                 </ol>
                 <p><a class="text-link" href="/guide">"Read safe setup, supported features, and known limits →"</a></p>
             </section>

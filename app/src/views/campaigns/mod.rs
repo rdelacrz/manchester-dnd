@@ -1,7 +1,9 @@
 use leptos::prelude::*;
 use leptos_meta::Title;
 
-use crate::components::campaign_library::{
+pub(crate) mod library;
+
+use self::library::{
     CampaignLibraryResponse, CampaignSummaryView, InvitationView, list_account_campaigns,
 };
 use crate::components::protected_layout::ProtectedLayout;

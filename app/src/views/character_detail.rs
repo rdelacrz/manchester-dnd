@@ -10,10 +10,10 @@ use leptos_meta::Title;
 use leptos_router::hooks::use_params;
 use leptos_router::params::Params;
 
-use crate::components::character_library::{
+use crate::components::protected_layout::ProtectedLayout;
+use crate::views::characters::library::{
     CharacterDetailResponse, CharacterUpdateResponse, load_character, update_character_name,
 };
-use crate::components::protected_layout::ProtectedLayout;
 
 #[component]
 pub fn CharacterDetailPage() -> impl IntoView {

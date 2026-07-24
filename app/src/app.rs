@@ -5,7 +5,6 @@ use leptos_router::{
     components::{Route, Router, Routes},
 };
 
-use crate::components::info::{GuidePage, LegalPage, PrivacyAndSafetyPage};
 use crate::components::layout::PublicLayout;
 use crate::views::campaign_lobby::CampaignLobbyPage;
 use crate::views::campaign_new::CampaignNewPage;
@@ -16,6 +15,7 @@ use crate::views::character_detail::CharacterDetailPage;
 use crate::views::character_new::CharacterNewPage;
 use crate::views::characters::CharactersPage;
 use crate::views::home::Home as LocalGame;
+use crate::views::info::{GuidePage, LegalPage, PrivacyAndSafetyPage};
 use crate::views::login::LoginPage;
 use crate::views::signup::SignUpPage;
 use leptos_router::ParamSegment;

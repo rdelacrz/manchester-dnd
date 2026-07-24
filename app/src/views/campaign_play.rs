@@ -12,9 +12,9 @@ struct PlayPageParams {
     id: String,
 }
 
-/// Lobby view data — populated from the campaign_lobby server function.
-/// This type mirrors the one in campaign_lobby.rs and will be replaced
-/// once the lobby component is fully wired.
+/// Lobby view data — populated from the campaign lobby server function.
+/// This type mirrors the view API in `views/campaign_lobby/api.rs` and will be
+/// replaced once that API is fully wired into campaign play.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct PlayLobbyView {

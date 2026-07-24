@@ -1,9 +1,11 @@
+mod api;
+
 use leptos::prelude::*;
 use leptos_meta::Title;
 use leptos_router::hooks::use_params;
 use leptos_router::params::Params;
 
-use crate::components::campaign_lobby::{LobbyResponse, load_lobby};
+use self::api::{LobbyCharacterOption, LobbyMemberView, LobbyResponse, load_lobby};
 use crate::components::protected_layout::ProtectedLayout;
 
 #[derive(Params, PartialEq, Eq, Clone)]
@@ -116,8 +118,8 @@ fn LobbyContent(
     is_gm: bool,
     play_session_state: String,
     start_policy: Option<String>,
-    members: Vec<crate::components::campaign_lobby::LobbyMemberView>,
-    available_characters: Vec<crate::components::campaign_lobby::LobbyCharacterOption>,
+    members: Vec<LobbyMemberView>,
+    available_characters: Vec<LobbyCharacterOption>,
     assigned_character_id: Option<String>,
     is_ready: bool,
     not_ready_members: Vec<String>,

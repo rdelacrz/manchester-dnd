@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_location;
 
-use crate::components::auth::logout;
+use crate::views::login::auth::logout;
 
 #[component]
 #[allow(dead_code)]

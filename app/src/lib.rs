@@ -7,9 +7,10 @@ pub(crate) mod components;
 pub(crate) mod views;
 
 pub use app::{App, shell};
-pub(crate) use components::{campaign, freeform};
+pub(crate) use components::freeform;
 #[cfg(feature = "ssr")]
 pub(crate) use views::home::authored_object_label;
+pub(crate) use views::home::campaign;
 pub(crate) use views::home::load_campaign_into;
 
 #[cfg(feature = "hydrate")]

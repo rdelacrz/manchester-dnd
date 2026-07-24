@@ -7,7 +7,9 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_meta::Title;
 
-use crate::components::character_library::{
+pub(crate) mod library;
+
+use self::library::{
     CharacterDeleteResponse, CharacterListResponse, delete_character, list_characters,
 };
 use crate::components::protected_layout::ProtectedLayout;

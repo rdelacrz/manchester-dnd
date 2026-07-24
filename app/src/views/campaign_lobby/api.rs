@@ -586,13 +586,12 @@ pub async fn start_play_session(
                 if !matches!(m.state, manchester_dnd_server::MembershipState::Active) {
                     continue;
                 }
-                if matches!(m.role, manchester_dnd_server::MembershipRole::Player) {
-                    if let Ok(None) | Err(_) = repo
+                if matches!(m.role, manchester_dnd_server::MembershipRole::Player)
+                    && let Ok(None) | Err(_) = repo
                         .load_active_character_instance(&m.account_id, &campaign_id)
                         .await
-                    {
-                        not_ready.push(m.account_id.clone());
-                    }
+                {
+                    not_ready.push(m.account_id.clone());
                 }
             }
             if !not_ready.is_empty() {

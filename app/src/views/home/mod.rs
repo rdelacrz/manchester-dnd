@@ -1,3 +1,5 @@
+pub(crate) mod campaign;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use manchester_dnd_core::{
@@ -13,13 +15,13 @@ use manchester_dnd_core::{
     rules_matrix::{D20TestOutcome, NpcAttitude, ProgressStatus},
 };
 
-use crate::app::FirstRunStep;
-use crate::components::campaign::{
+use self::campaign::{
     CampaignLoadResponse, EncounterCommandResponse, ExplorationCheckResponse,
     LOCAL_EXPLORATION_ACTION_ID, LOCAL_SOCIAL_ACTION_ID, PublicGameError,
     SocialInteractionResponse, advance_npc_turn, attempt_exploration_check,
     attempt_social_interaction, load_local_campaign, submit_encounter_action,
 };
+use crate::app::FirstRunStep;
 use crate::components::freeform::{FreeformIntent, FreeformIntentState};
 use crate::components::hero::HeroCreator;
 use crate::components::images::SceneImagePanel;

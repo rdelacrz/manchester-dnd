@@ -3,10 +3,10 @@ use leptos::task::spawn_local;
 use leptos_meta::Title;
 use leptos_router::hooks::use_query_map;
 
-use crate::components::campaign_library::{
+use crate::components::protected_layout::ProtectedLayout;
+use crate::views::campaigns::library::{
     CampaignLibraryResponse, CreateCampaignInput, create_campaign,
 };
-use crate::components::protected_layout::ProtectedLayout;
 
 #[component]
 pub fn CampaignNewPage() -> impl IntoView {

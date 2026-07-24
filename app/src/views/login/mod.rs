@@ -1,9 +1,11 @@
+pub(crate) mod auth;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_meta::Title;
 use leptos_router::hooks::use_query_map;
 
-use crate::components::auth::{AuthResponse, LoginInput, login};
+use self::auth::{AuthResponse, LoginInput, login};
 use crate::components::layout::PublicLayout;
 
 #[component]

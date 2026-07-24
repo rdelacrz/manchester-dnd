@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 
-use crate::components::auth::{AuthStateView, current_auth_state};
 use crate::components::layout::AuthenticatedLayout;
+use crate::views::login::auth::{AuthStateView, current_auth_state};
 
 /// Protected layout that enforces authentication on the client side.
 /// Server-side authorization remains mandatory even if this guard is bypassed.
